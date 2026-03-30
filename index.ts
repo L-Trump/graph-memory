@@ -21,9 +21,9 @@ import {
 } from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
-import { Recaller } from "./src/recaller/recall.ts";
+import { Recaller, type TieredNode } from "./src/recaller/recall.ts";
 import { Extractor } from "./src/extractor/extract.ts";
-import { assembleContext } from "./src/format/assemble.ts";
+import { assembleContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
@@ -153,7 +153,7 @@ const graphMemoryPlugin = {
 
     // ── Session 运行时状态 ──────────────────────────────────
     const msgSeq = new Map<string, number>();
-    const recalled = new Map<string, { nodes: any[]; edges: any[] }>();
+    const recalled = new Map<string, { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }>();
     const turnCounter = new Map<string, number>(); // 社区维护计数器
 
     // ── 提取串行化（同 session Promise chain，不同 session 并行）────
@@ -185,12 +185,18 @@ const graphMemoryPlugin = {
           const msgs = getUnextracted(db, sessionId, 50);
           if (!msgs.length) return;
 
-          const existing = getBySession(db, sessionId).map((n) => n.name);
+          const sessionNodes = getBySession(db, sessionId);
+          const recalledData = recalled.get(sessionId) as any;
+          const recalledNodes = recalledData?.nodes ?? [];
+          const recalledEdges = recalledData?.edges ?? [];
+          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, recalledEdges);
+
           const result = await extractor.extract({
             messages: msgs,
-            existingNames: existing,
+            knowledgeGraph,
           });
 
+          // ── 存储结果 ───────────────────────────────────────
           const nameToId = new Map<string, string>();
           for (const nc of result.nodes) {
             const { node } = upsertNode(db, {
@@ -206,8 +212,10 @@ const graphMemoryPlugin = {
             const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
             if (fromId && toId) {
               upsertEdge(db, {
-                fromId, toId, type: ec.type,
-                instruction: ec.instruction, condition: ec.condition, sessionId,
+                fromId, toId,
+                name: ec.name,
+                description: ec.description,
+                sessionId,
               });
             }
           }
@@ -218,7 +226,7 @@ const graphMemoryPlugin = {
           if (result.nodes.length || result.edges.length) {
             invalidateGraphCache();
             const nodeDetails = result.nodes.map((n: any) => `${n.type}:${n.name}`).join(", ");
-            const edgeDetails = result.edges.map((e: any) => `${e.from}→[${e.type}]→${e.to}`).join(", ");
+            const edgeDetails = result.edges.map((e: any) => `${e.from}→[${e.name}]→${e.to}`).join(", ");
             api.logger.info(
               `[graph-memory] extracted ${result.nodes.length} nodes [${nodeDetails}], ${result.edges.length} edges [${edgeDetails}]`,
             );
@@ -245,11 +253,12 @@ const graphMemoryPlugin = {
 
         api.logger.info(`[graph-memory] recall query: "${prompt.slice(0, 80)}"`);
 
-        const res = await recaller.recall(prompt);
+        const res = await recaller.recallV2(prompt);
         if (res.nodes.length) {
-          if (ctx?.sessionId) recalled.set(ctx.sessionId, res);
+          const stored = { nodes: res.nodes, edges: res.edges, pprScores: res.pprScores };
+          if (ctx?.sessionId) recalled.set(ctx.sessionId, stored);
           if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) {
-            recalled.set(ctx.sessionKey, res);
+            recalled.set(ctx.sessionKey, stored);
           }
           api.logger.info(
             `[graph-memory] recalled ${res.nodes.length} nodes, ${res.edges.length} edges`,
@@ -302,7 +311,7 @@ const graphMemoryPlugin = {
           ...edgesTo(db, n.id),
         ]);
 
-        const rec = recalled.get(sessionId) ?? { nodes: [], edges: [] };
+        const rec = recalled.get(sessionId) ?? { nodes: [], edges: [], pprScores: {} };
         const totalGmNodes = activeNodes.length + rec.nodes.length;
 
         if (totalGmNodes === 0) {
@@ -314,12 +323,14 @@ const graphMemoryPlugin = {
         const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
 
         // ── 2. 图谱 + 溯源 ─────────────────────────────
-        const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, {
+        const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, cfg, {
           tokenBudget: 0,
           activeNodes,
           activeEdges,
           recalledNodes: rec.nodes,
           recalledEdges: rec.edges,
+          pprScores: rec.pprScores,
+          graphWalkDepth: cfg.recallMaxDepth,
         });
 
         if (lastTurn.dropped > 0 || episodicTokens > 0) {
@@ -363,10 +374,15 @@ const graphMemoryPlugin = {
         }
 
         try {
-          const existing = getBySession(db, sessionId).map((n) => n.name);
+          const sessionNodes = getBySession(db, sessionId);
+          const recalledData = recalled.get(sessionId) as any;
+          const recalledNodes = recalledData?.nodes ?? [];
+          const recalledEdges = recalledData?.edges ?? [];
+          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, recalledEdges);
+
           const result = await extractor.extract({
             messages: msgs,
-            existingNames: existing,
+            knowledgeGraph,
           });
 
           const nameToId = new Map<string, string>();
@@ -384,8 +400,10 @@ const graphMemoryPlugin = {
             const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
             if (fromId && toId) {
               upsertEdge(db, {
-                fromId, toId, type: ec.type,
-                instruction: ec.instruction, condition: ec.condition, sessionId,
+                fromId, toId,
+                name: ec.name,
+                description: ec.description,
+                sessionId,
               });
             }
           }
@@ -540,8 +558,10 @@ const graphMemoryPlugin = {
             const toId = findByName(db, ec.to)?.id;
             if (fromId && toId) {
               upsertEdge(db, {
-                fromId, toId, type: ec.type,
-                instruction: ec.instruction, sessionId: sid,
+                fromId, toId,
+                name: ec.name,
+                description: ec.description,
+                sessionId: sid,
               });
             }
           }
@@ -579,7 +599,7 @@ const graphMemoryPlugin = {
         }),
         async execute(_toolCallId: string, params: { query: string }) {
           const { query } = params;
-          const res = await recaller.recall(query);
+          const res = await recaller.recallV2(query);
           if (!res.nodes.length) {
             return {
               content: [{ type: "text", text: "图谱中未找到相关记录。" }],
@@ -587,13 +607,20 @@ const graphMemoryPlugin = {
             };
           }
 
-          const lines = res.nodes.map(
-            (n) => `[${n.type}] ${n.name} (pr:${n.pagerank.toFixed(3)})\n${n.description}\n${n.content.slice(0, 400)}`,
-          );
-          const edgeLines = res.edges.map((e) => {
-            const from = res.nodes.find((n) => n.id === e.fromId)?.name ?? e.fromId;
-            const to = res.nodes.find((n) => n.id === e.toId)?.name ?? e.toId;
-            return `  ${from} --[${e.type}]--> ${to}: ${e.instruction}`;
+          const lines = res.nodes.map((n: any) => {
+            const tierLabel = n.tier === "L1" ? "【L1-完整】" : n.tier === "L2" ? "【L2-描述】" : n.tier === "L3" ? "【L3-名称】" : "【过滤】";
+            const scores = [];
+            if (n.semanticScore != null) scores.push(`语义=${n.semanticScore.toFixed(3)}`);
+            if (n.pprScore != null) scores.push(`PPR=${n.pprScore.toFixed(3)}`);
+            if (n.combinedScore != null) scores.push(`综合=${n.combinedScore.toFixed(3)}`);
+            const scoreStr = scores.length ? ` (${scores.join(", ")})` : "";
+            return `${tierLabel} [${n.type}] ${n.name}${scoreStr}\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
+          });
+
+          const edgeLines = res.edges.map((e: any) => {
+            const from = res.nodes.find((n: any) => n.id === e.fromId)?.name ?? e.fromId;
+            const to = res.nodes.find((n: any) => n.id === e.toId)?.name ?? e.toId;
+            return `  ${from} --[${e.name}]--> ${to}: ${e.description}`;
           });
 
           const text = [
@@ -604,7 +631,7 @@ const graphMemoryPlugin = {
 
           return {
             content: [{ type: "text", text }],
-            details: { count: res.nodes.length, query },
+            details: { count: res.nodes.length, query, tiers: res.nodes.filter((n: any) => n.tier) },
           };
         },
       }),
@@ -617,36 +644,73 @@ const graphMemoryPlugin = {
         label: "Record to Graph Memory",
         description: "手动记录经验到知识图谱。发现重要解法、踩坑经验或工作流程时调用。",
         parameters: Type.Object({
-          name: Type.String({ description: "节点名称（全小写连字符）" }),
-          type: Type.String({ description: "实体类型：TASK、SKILL 或 EVENT" }),
-          description: Type.String({ description: "一句话说明" }),
-          content: Type.String({ description: "纯文本格式的知识内容" }),
-          relatedSkill: Type.Optional(
-            Type.String({ description: "可选：关联的已有技能名（建立 SOLVED_BY 关系）" }),
-          ),
+          content: Type.String({ description: "用自然语言描述需要记忆的内容（会被当作待提取对话）" }),
         }),
         async execute(
           _toolCallId: string,
-          p: { name: string; type: string; description: string; content: string; relatedSkill?: string },
+          p: { content: string },
         ) {
           const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
-          const { node } = upsertNode(db, {
-            type: p.type as any, name: p.name,
-            description: p.description, content: p.content,
-          }, sid);
-          if (p.relatedSkill) {
-            const rel = findByName(db, p.relatedSkill);
-            if (rel) {
+
+          // ── 1. 获取本 session 已有的节点 ─────────────────────
+          const sessionNodes = getBySession(db, sid);
+
+          // ── 2. recallV2 召回相关节点 ────────────────────────
+          const recalledResult = await recaller.recallV2(p.content);
+          const recalledNodes = recalledResult.nodes;
+          const recalledEdges = recalledResult.edges;
+
+          // ── 3. 构建知识图谱（组合评分三级格式）───────────────
+          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, recalledEdges);
+
+          // ── 4. 模拟一条用户消息，触发提取 ───────────────────
+          const simulatedMsg = {
+            role: "user",
+            turn_index: 0,
+            content: p.content,
+          };
+          const result = await extractor.extract({
+            messages: [simulatedMsg],
+            knowledgeGraph,
+          });
+
+          // ── 5. 存储提取结果 ────────────────────────────────
+          const nameToId = new Map<string, string>();
+          for (const nc of result.nodes) {
+            const { node } = upsertNode(db, {
+              type: nc.type, name: nc.name,
+              description: nc.description, content: nc.content,
+            }, sid);
+            nameToId.set(node.name, node.id);
+            recaller.syncEmbed(node).catch(() => {});
+          }
+
+          for (const ec of result.edges) {
+            const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
+            const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
+            if (fromId && toId) {
               upsertEdge(db, {
-                fromId: node.id, toId: rel.id, type: "SOLVED_BY",
-                instruction: `关联 ${p.relatedSkill}`, sessionId: sid,
+                fromId, toId,
+                name: ec.name,
+                description: ec.description,
+                sessionId: sid,
               });
             }
           }
-          recaller.syncEmbed(node).catch(() => {});
+
+          if (result.nodes.length || result.edges.length) {
+            invalidateGraphCache();
+          }
+
+          const nodeNames = result.nodes.map((n: any) => `${n.type}:${n.name}`).join(", ");
+          const edgeNames = result.edges.map((e: any) => `${e.from}→[${e.name}]→${e.to}`).join(", ");
+
           return {
-            content: [{ type: "text", text: `已记录：${node.name} (${node.type})` }],
-            details: { name: node.name, type: node.type },
+            content: [{
+              type: "text",
+              text: `提取完成：${result.nodes.length} 个节点 [${nodeNames}]，${result.edges.length} 条边 [${edgeNames}]`,
+            }],
+            details: { nodes: result.nodes.length, edges: result.edges.length },
           };
         },
       }),

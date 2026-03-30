@@ -51,7 +51,7 @@ export function closeDb(): void {
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible];
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
@@ -64,7 +64,7 @@ function m1_core(db: DatabaseSyncInstance): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS gm_nodes (
       id              TEXT PRIMARY KEY,
-      type            TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT')),
+      type            TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT','KNOWLEDGE')),
       name            TEXT NOT NULL,
       description     TEXT NOT NULL DEFAULT '',
       content         TEXT NOT NULL,
@@ -187,5 +187,58 @@ function m6_communities(db: DatabaseSyncInstance): void {
       created_at  INTEGER NOT NULL,
       updated_at  INTEGER NOT NULL
     );
+  `);
+}
+
+// ─── 边灵活性迁移：type → name，instruction → description ────
+
+function m7_edge_flexible(db: DatabaseSyncInstance): void {
+  // 检查是否已有 name 列（幂等）
+  try {
+    db.prepare("SELECT name FROM gm_edges LIMIT 1").get();
+    return; // 已迁移
+  } catch { /* 列不存在，继续 */ }
+
+  // 重建表：保留数据，改为新 schema（name + description）
+  db.exec(`
+    -- 处理可能的残留旧表
+    DROP TABLE IF EXISTS gm_edges_old;
+    -- 备份旧表数据
+    ALTER TABLE gm_edges RENAME TO gm_edges_old;
+
+    -- 创建新表（无 type 列，新增 name + description）
+    CREATE TABLE gm_edges (
+      id          TEXT PRIMARY KEY,
+      from_id     TEXT NOT NULL REFERENCES gm_nodes(id),
+      to_id       TEXT NOT NULL REFERENCES gm_nodes(id),
+      name        TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      session_id  TEXT NOT NULL,
+      created_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_edges_from ON gm_edges(from_id);
+    CREATE INDEX IF NOT EXISTS ix_gm_edges_to   ON gm_edges(to_id);
+
+    -- 迁移旧数据：type → name，instruction → description
+    INSERT INTO gm_edges (id, from_id, to_id, name, description, session_id, created_at)
+    SELECT
+      id,
+      from_id,
+      to_id,
+      CASE type
+        WHEN 'USED_SKILL'     THEN '使用'
+        WHEN 'SOLVED_BY'      THEN '解决'
+        WHEN 'REQUIRES'       THEN '依赖'
+        WHEN 'PATCHES'        THEN '扩展'
+        WHEN 'CONFLICTS_WITH' THEN '冲突'
+        ELSE type
+      END,
+      COALESCE(instruction, ''),
+      session_id,
+      created_at
+    FROM gm_edges_old;
+
+    -- 删除旧表
+    DROP TABLE gm_edges_old;
   `);
 }

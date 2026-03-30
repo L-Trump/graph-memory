@@ -29,9 +29,14 @@ function toNode(r: any): GmNode {
 
 function toEdge(r: any): GmEdge {
   return {
-    id: r.id, fromId: r.from_id, toId: r.to_id, type: r.type,
-    instruction: r.instruction, condition: r.condition ?? undefined,
-    sessionId: r.session_id, createdAt: r.created_at,
+    id: r.id,
+    fromId: r.from_id,
+    toId: r.to_id,
+    // 新字段优先，instruction 仅为向后兼容旧数据
+    name: r.name ?? r.type ?? "",
+    description: r.description ?? r.instruction ?? "",
+    sessionId: r.session_id,
+    createdAt: r.created_at,
   };
 }
 
@@ -121,10 +126,10 @@ export function mergeNodes(db: DatabaseSyncInstance, keepId: string, mergeId: st
   // 删除自环（合并后可能出现 keepId → keepId）
   db.prepare("DELETE FROM gm_edges WHERE from_id = to_id").run();
 
-  // 删除重复边（同 from+to+type 只保留一条）
+  // 删除重复边（同 from+to+name 只保留一条）
   db.prepare(`
     DELETE FROM gm_edges WHERE id NOT IN (
-      SELECT MIN(id) FROM gm_edges GROUP BY from_id, to_id, type
+      SELECT MIN(id) FROM gm_edges GROUP BY from_id, to_id, name
     )
   `).run();
 
@@ -165,18 +170,19 @@ export function updateCommunities(db: DatabaseSyncInstance, labels: Map<string, 
 
 export function upsertEdge(
   db: DatabaseSyncInstance,
-  e: { fromId: string; toId: string; type: EdgeType; instruction: string; condition?: string; sessionId: string },
+  e: { fromId: string; toId: string; name: string; description: string; sessionId: string },
 ): void {
-  const ex = db.prepare("SELECT id FROM gm_edges WHERE from_id=? AND to_id=? AND type=?")
-    .get(e.fromId, e.toId, e.type) as any;
+  // 灵活边：同 from+to+name 即视为重复（不用 type 列）
+  const ex = db.prepare("SELECT id FROM gm_edges WHERE from_id=? AND to_id=? AND name=?")
+    .get(e.fromId, e.toId, e.name) as any;
   if (ex) {
-    db.prepare("UPDATE gm_edges SET instruction=? WHERE id=?")
-      .run(e.instruction, ex.id);
+    db.prepare("UPDATE gm_edges SET description=? WHERE id=?")
+      .run(e.description, ex.id);
     return;
   }
-  db.prepare(`INSERT INTO gm_edges (id, from_id, to_id, type, instruction, condition, session_id, created_at)
-    VALUES (?,?,?,?,?,?,?,?)`)
-    .run(uid("e"), e.fromId, e.toId, e.type, e.instruction, e.condition ?? null, e.sessionId, Date.now());
+  db.prepare(`INSERT INTO gm_edges (id, from_id, to_id, name, description, session_id, created_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run(uid("e"), e.fromId, e.toId, e.name, e.description, e.sessionId, Date.now());
 }
 
 export function edgesFrom(db: DatabaseSyncInstance, id: string): GmEdge[] {
@@ -414,8 +420,15 @@ export function getStats(db: DatabaseSyncInstance): {
   }
   const totalEdges = (db.prepare("SELECT COUNT(*) as c FROM gm_edges").get() as any).c;
   const byEdgeType: Record<string, number> = {};
-  for (const r of db.prepare("SELECT type, COUNT(*) as c FROM gm_edges GROUP BY type").all() as any[]) {
-    byEdgeType[r.type] = r.c;
+  // 兼容旧列名：新表用 name（旧数据仍在 type 列）
+  try {
+    for (const r of db.prepare("SELECT name, COUNT(*) as c FROM gm_edges GROUP BY name").all() as any[]) {
+      byEdgeType[r.name] = r.c;
+    }
+  } catch {
+    for (const r of db.prepare("SELECT type, COUNT(*) as c FROM gm_edges GROUP BY type").all() as any[]) {
+      byEdgeType[r.type] = r.c;
+    }
   }
   const communities = (db.prepare(
     "SELECT COUNT(DISTINCT community_id) as c FROM gm_nodes WHERE status='active' AND community_id IS NOT NULL"

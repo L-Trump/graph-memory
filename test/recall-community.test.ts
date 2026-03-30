@@ -22,7 +22,7 @@ import {
 } from "../src/store/store.ts";
 import { detectCommunities, getCommunityPeers } from "../src/graph/community.ts";
 import { assembleContext } from "../src/format/assemble.ts";
-import type { GmNode } from "../src/types.ts";
+import type { GmNode, GmEdge } from "../src/types.ts";
 
 let db: DatabaseSyncInstance;
 
@@ -192,12 +192,13 @@ describe("assemble 社区分组", () => {
     const nodeB = findById(db, b)!;
     const nodeC = findById(db, c)!;
 
-    const { xml } = assembleContext(db, {
+    const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
       activeNodes: [nodeA, nodeB, nodeC],
       activeEdges: [],
       recalledNodes: [],
       recalledEdges: [],
+      pprScores: {} as Record<string, number>,
     });
 
     expect(xml).toContain('<community id="c-1" desc="Docker容器构建与推送">');
@@ -209,12 +210,13 @@ describe("assemble 社区分组", () => {
     const a = insertNode(db, { name: "test-skill", type: "SKILL" });
     const node = findById(db, a)!;
 
-    const { xml } = assembleContext(db, {
+    const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
       activeNodes: [node],
       activeEdges: [],
       recalledNodes: [],
       recalledEdges: [],
+      pprScores: {} as Record<string, number>,
     });
 
     // 应该包含 updated="YYYY-MM-DD" 格式
@@ -226,12 +228,13 @@ describe("assemble 社区分组", () => {
     // 不分配 community_id
     const node = findById(db, a)!;
 
-    const { xml } = assembleContext(db, {
+    const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
       activeNodes: [node],
       activeEdges: [],
       recalledNodes: [],
       recalledEdges: [],
+      pprScores: {} as Record<string, number>,
     });
 
     expect(xml).toContain('name="no-community-node"');
@@ -244,12 +247,13 @@ describe("assemble 社区分组", () => {
     // 不创建 gm_communities 记录
     const node = findById(db, a)!;
 
-    const { xml } = assembleContext(db, {
+    const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
       activeNodes: [node],
       activeEdges: [],
       recalledNodes: [],
       recalledEdges: [],
+      pprScores: {} as Record<string, number>,
     });
 
     expect(xml).toContain('id="c-99" desc="c-99"');
@@ -269,9 +273,9 @@ describe("双路径合并逻辑", () => {
     const p2 = insertNode(db, { name: "venv-create", type: "SKILL" });
     const t1 = insertNode(db, { name: "deploy-app", type: "TASK" });
 
-    insertEdge(db, { fromId: d1, toId: d2, type: "REQUIRES" });
-    insertEdge(db, { fromId: p1, toId: p2, type: "REQUIRES" });
-    insertEdge(db, { fromId: t1, toId: d1, type: "USED_SKILL" });
+    insertEdge(db, { fromId: d1, toId: d2, name: "REQUIRES" });
+    insertEdge(db, { fromId: p1, toId: p2, name: "REQUIRES" });
+    insertEdge(db, { fromId: t1, toId: d1, name: "USED_SKILL" });
 
     detectCommunities(db);
 

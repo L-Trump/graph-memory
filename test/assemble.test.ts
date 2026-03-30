@@ -30,8 +30,8 @@ describe("buildSystemPromptAddition", () => {
   it("有节点返回引导文字", () => {
     const result = buildSystemPromptAddition({
       selectedNodes: [
-        { type: "SKILL", src: "active" },
-        { type: "EVENT", src: "recalled" },
+        { type: "SKILL", src: "active", tier: "active" },
+        { type: "EVENT", src: "recalled", tier: "high" },
       ],
       edgeCount: 2,
     });
@@ -43,16 +43,16 @@ describe("buildSystemPromptAddition", () => {
   it("丰富图谱包含导航说明", () => {
     const result = buildSystemPromptAddition({
       selectedNodes: [
-        { type: "SKILL", src: "active" },
-        { type: "SKILL", src: "active" },
-        { type: "TASK", src: "active" },
-        { type: "EVENT", src: "recalled" },
+        { type: "SKILL", src: "active", tier: "active" },
+        { type: "SKILL", src: "active", tier: "active" },
+        { type: "TASK", src: "active", tier: "active" },
+        { type: "EVENT", src: "recalled", tier: "L1" },
       ],
       edgeCount: 5,
     });
 
-    expect(result).toContain("SOLVED_BY");
-    expect(result).toContain("PATCHES");
+    expect(result).toContain("解决");
+    expect(result).toContain("扩展");
   });
 });
 
@@ -65,12 +65,13 @@ describe("assembleContext", () => {
     const id = insertNode(db, { name: "test-skill", type: "SKILL", content: "## test\nsome content" });
     const node = findById(db, id)!;
 
-    const { xml, systemPrompt, tokens } = assembleContext(db, {
+    const { xml, systemPrompt, tokens } = assembleContext(db, null!, {
       tokenBudget: 128_000,
       activeNodes: [node],
-      activeEdges: [],
-      recalledNodes: [],
-      recalledEdges: [],
+      activeEdges: [] as GmEdge[],
+      recalledNodes: [] as any[],
+      recalledEdges: [] as GmEdge[],
+      pprScores: {} as Record<string, number>,
     });
 
     expect(xml).toContain("<knowledge_graph>");
@@ -81,12 +82,13 @@ describe("assembleContext", () => {
   });
 
   it("空节点返回 null", () => {
-    const { xml, systemPrompt } = assembleContext(db, {
+    const { xml, systemPrompt } = assembleContext(db, null!, {
       tokenBudget: 128_000,
-      activeNodes: [],
-      activeEdges: [],
-      recalledNodes: [],
-      recalledEdges: [],
+      activeNodes: [] as GmNode[],
+      activeEdges: [] as GmEdge[],
+      recalledNodes: [] as any[],
+      recalledEdges: [] as GmEdge[],
+      pprScores: {} as Record<string, number>,
     });
 
     expect(xml).toBeNull();
@@ -97,12 +99,13 @@ describe("assembleContext", () => {
     const id = insertNode(db, { name: "recalled-skill", type: "SKILL" });
     const node = findById(db, id)!;
 
-    const { xml } = assembleContext(db, {
+    const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
-      activeNodes: [],
-      activeEdges: [],
-      recalledNodes: [node],
-      recalledEdges: [],
+      activeNodes: [] as GmNode[],
+      activeEdges: [] as GmEdge[],
+      recalledNodes: [{ ...node, tier: "L1" as const, semanticScore: 0.8, pprScore: 0.1, pagerankScore: 0.3, combinedScore: 0.5 }],
+      recalledEdges: [] as GmEdge[],
+      pprScores: {} as Record<string, number>,
     });
 
     expect(xml).toContain('source="recalled"');
@@ -120,12 +123,13 @@ describe("assembleContext", () => {
     }
 
     // 很小的 token 预算
-    const { xml } = assembleContext(db, {
+    const { xml } = assembleContext(db, null!, {
       tokenBudget: 1000, // 1000 * 0.15 * 3 = 450 字符
       activeNodes: nodes,
-      activeEdges: [],
-      recalledNodes: [],
-      recalledEdges: [],
+      activeEdges: [] as GmEdge[],
+      recalledNodes: [] as any[],
+      recalledEdges: [] as GmEdge[],
+      pprScores: {} as Record<string, number>,
     });
 
     // 不应该包含所有 20 个节点

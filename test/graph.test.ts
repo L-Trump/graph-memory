@@ -49,10 +49,10 @@ describe("Personalized PageRank", () => {
     const condaCreate = insertNode(db, { name: "conda-env-create", type: "SKILL" });
     const pipInstall = insertNode(db, { name: "pip-install", type: "SKILL" });
 
-    insertEdge(db, { fromId: dockerDeploy, toId: composeUp, type: "USED_SKILL" });
-    insertEdge(db, { fromId: composeUp, toId: portExpose, type: "REQUIRES" });
-    insertEdge(db, { fromId: composeUp, toId: nginx, type: "USED_SKILL" });
-    insertEdge(db, { fromId: condaCreate, toId: pipInstall, type: "REQUIRES" });
+    insertEdge(db, { fromId: dockerDeploy, toId: composeUp, name: "USED_SKILL" });
+    insertEdge(db, { fromId: composeUp, toId: portExpose, name: "REQUIRES" });
+    insertEdge(db, { fromId: composeUp, toId: nginx, name: "USED_SKILL" });
+    insertEdge(db, { fromId: condaCreate, toId: pipInstall, name: "REQUIRES" });
 
     const all = [dockerDeploy, composeUp, portExpose, nginx, condaCreate, pipInstall];
 
@@ -282,8 +282,8 @@ describe("runMaintenance", () => {
     const a = insertNode(db, { name: "skill-a" });
     const b = insertNode(db, { name: "skill-b" });
     const c = insertNode(db, { name: "task-c", type: "TASK" });
-    insertEdge(db, { fromId: c, toId: a, type: "USED_SKILL" });
-    insertEdge(db, { fromId: c, toId: b, type: "USED_SKILL" });
+    insertEdge(db, { fromId: c, toId: a, name: "USED_SKILL" });
+    insertEdge(db, { fromId: c, toId: b, name: "USED_SKILL" });
 
     const result = await runMaintenance(db, cfg);
 

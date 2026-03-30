@@ -8,13 +8,13 @@
 /**
  * graph-memory 类型定义
  *
- * 节点：TASK / SKILL / EVENT
+ * 节点：TASK / SKILL / EVENT / KNOWLEDGE
  * 边：USED_SKILL / SOLVED_BY / REQUIRES / PATCHES / CONFLICTS_WITH
  */
 
 // ─── 节点 ─────────────────────────────────────────────────────
 
-export type NodeType = "TASK" | "SKILL" | "EVENT";
+export type NodeType = "TASK" | "SKILL" | "EVENT" | "KNOWLEDGE";
 export type NodeStatus = "active" | "deprecated";
 
 export interface GmNode {
@@ -32,25 +32,22 @@ export interface GmNode {
   updatedAt: number;
 }
 
-// ─── 边 ───────────────────────────────────────────────────────
-
-export type EdgeType =
-  | "USED_SKILL"
-  | "SOLVED_BY"
-  | "REQUIRES"
-  | "PATCHES"
-  | "CONFLICTS_WITH";
+// ─── 边（两层：name自由命名 + description一句话描述）───────────
 
 export interface GmEdge {
   id: string;
   fromId: string;
   toId: string;
-  type: EdgeType;
-  instruction: string;
-  condition?: string;
+  /** 边类型名称，由LLM自由生成短字符串（如"使用"、"依赖"、"扩展"） */
+  name: string;
+  /** 一句话描述这段关系 */
+  description: string;
   sessionId: string;
   createdAt: number;
 }
+
+/** 向后兼容别名（内部过渡用） */
+export type EdgeType = string;
 
 // ─── 信号 ─────────────────────────────────────────────────────
 
@@ -80,9 +77,8 @@ export interface ExtractionResult {
   edges: Array<{
     from: string;
     to: string;
-    type: EdgeType;
-    instruction: string;
-    condition?: string;
+    name: string;
+    description: string;
   }>;
 }
 
@@ -96,8 +92,8 @@ export interface FinalizeResult {
   newEdges: Array<{
     from: string;
     to: string;
-    type: EdgeType;
-    instruction: string;
+    name: string;
+    description: string;
   }>;
   invalidations: string[];
 }
@@ -107,6 +103,8 @@ export interface FinalizeResult {
 export interface RecallResult {
   nodes: GmNode[];
   edges: GmEdge[];
+  /** nodeId → PPR分数（个性化PageRank，从查询种子节点传播得到）*/
+  pprScores: Record<string, number>;
   tokenEstimate: number;
 }
 

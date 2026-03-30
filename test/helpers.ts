@@ -22,7 +22,7 @@ export function createTestDb(): DatabaseSyncInstance {
   db.exec(`
     CREATE TABLE IF NOT EXISTS gm_nodes (
       id              TEXT PRIMARY KEY,
-      type            TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT')),
+      type            TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT','KNOWLEDGE')),
       name            TEXT NOT NULL,
       description     TEXT NOT NULL DEFAULT '',
       content         TEXT NOT NULL,
@@ -42,9 +42,8 @@ export function createTestDb(): DatabaseSyncInstance {
       id          TEXT PRIMARY KEY,
       from_id     TEXT NOT NULL REFERENCES gm_nodes(id),
       to_id       TEXT NOT NULL REFERENCES gm_nodes(id),
-      type        TEXT NOT NULL CHECK(type IN ('USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
-      instruction TEXT NOT NULL,
-      condition   TEXT,
+      name        TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
       session_id  TEXT NOT NULL,
       created_at  INTEGER NOT NULL
     );
@@ -159,20 +158,20 @@ export function insertEdge(
   opts: {
     fromId: string;
     toId: string;
-    type?: string;
-    instruction?: string;
+    name?: string;
+    description?: string;
   },
 ): void {
   const id = `e-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   db.prepare(`
-    INSERT INTO gm_edges (id, from_id, to_id, type, instruction, session_id, created_at)
+    INSERT INTO gm_edges (id, from_id, to_id, name, description, session_id, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     opts.fromId,
     opts.toId,
-    opts.type ?? "USED_SKILL",
-    opts.instruction ?? "test instruction",
+    opts.name ?? "使用",
+    opts.description ?? "test description",
     "test-session",
     Date.now(),
   );

@@ -95,27 +95,28 @@ describe("edge CRUD", () => {
     const b = insertNode(db, { name: "skill-b", type: "SKILL" });
 
     upsertEdge(db, {
-      fromId: a, toId: b, type: "USED_SKILL",
-      instruction: "第 1 步使用", sessionId: "s1",
+      fromId: a, toId: b,
+      name: "使用",
+      description: "第 1 步使用", sessionId: "s1",
     });
 
     const from = edgesFrom(db, a);
     const to = edgesTo(db, b);
     expect(from).toHaveLength(1);
     expect(to).toHaveLength(1);
-    expect(from[0].type).toBe("USED_SKILL");
+    expect(from[0].name).toBe("使用");
   });
 
-  it("upsertEdge 同 from+to+type 更新 instruction 而非重复", () => {
+  it("upsertEdge 同 from+to+name 更新 description 而非重复", () => {
     const a = insertNode(db, { name: "task-a", type: "TASK" });
     const b = insertNode(db, { name: "skill-b", type: "SKILL" });
 
-    upsertEdge(db, { fromId: a, toId: b, type: "USED_SKILL", instruction: "v1", sessionId: "s1" });
-    upsertEdge(db, { fromId: a, toId: b, type: "USED_SKILL", instruction: "v2", sessionId: "s2" });
+    upsertEdge(db, { fromId: a, toId: b, name: "使用", description: "v1", sessionId: "s1" });
+    upsertEdge(db, { fromId: a, toId: b, name: "使用", description: "v2", sessionId: "s2" });
 
     const edges = edgesFrom(db, a);
     expect(edges).toHaveLength(1);
-    expect(edges[0].instruction).toBe("v2");
+    expect(edges[0].description).toBe("v2");
   });
 });
 
@@ -129,7 +130,7 @@ describe("mergeNodes", () => {
     const b = insertNode(db, { name: "merge-node", validatedCount: 3 });
     const c = insertNode(db, { name: "other-node" });
 
-    insertEdge(db, { fromId: b, toId: c, type: "SOLVED_BY" });
+    insertEdge(db, { fromId: b, toId: c, name: "SOLVED_BY" });
 
     mergeNodes(db, a, b);
 
@@ -264,7 +265,7 @@ describe("getStats", () => {
   it("正确统计节点和边", () => {
     const a = insertNode(db, { name: "skill-1", type: "SKILL" });
     const b = insertNode(db, { name: "task-1", type: "TASK" });
-    insertEdge(db, { fromId: b, toId: a, type: "USED_SKILL" });
+    insertEdge(db, { fromId: b, toId: a, name: "USED_SKILL" });
 
     const stats = getStats(db);
     expect(stats.totalNodes).toBe(2);
