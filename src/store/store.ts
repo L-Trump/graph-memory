@@ -79,8 +79,9 @@ export function upsertNode(
 
   if (ex) {
     const sessions = JSON.stringify(Array.from(new Set([...ex.sourceSessions, sessionId])));
-    const content = c.content.length > ex.content.length ? c.content : ex.content;
-    const desc = c.description.length > ex.description.length ? c.description : ex.description;
+    // 新内容优先：LLM 在合并/纠正场景下写的是完整合并内容，应直接覆盖旧内容
+    const content = c.content;
+    const desc = c.description;
     const count = ex.validatedCount + 1;
     db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
       source_sessions=?, updated_at=? WHERE id=?`)

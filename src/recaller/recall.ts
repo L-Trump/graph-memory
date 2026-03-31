@@ -388,7 +388,7 @@ export class Recaller {
   }
 
   /** 异步同步 embedding，不阻塞主流程 */
-  async syncEmbed(node: GmNode): Promise<void> {
+  async syncEmbed(node: GmNode, force = false): Promise<void> {
     if (!this.embed) {
       // embedFn 尚未初始化，加入积压队列等待
       this.pendingEmbedNodes.push(node);
@@ -396,13 +396,15 @@ export class Recaller {
       logger?.call(console, `[graph-memory] syncEmbed: embed not ready, queued node ${node.id} (pending=${this.pendingEmbedNodes.length})`);
       return;
     }
-    return this._doSyncEmbed(node);
+    return this._doSyncEmbed(node, force);
   }
 
   /** 实际执行 embedding 写入 */
-  private async _doSyncEmbed(node: GmNode): Promise<void> {
-    const hash = createHash("md5").update(node.content).digest("hex");
-    if (getVectorHash(this.db, node.id) === hash) return;
+  private async _doSyncEmbed(node: GmNode, force = false): Promise<void> {
+    if (!force) {
+      const hash = createHash("md5").update(node.content).digest("hex");
+      if (getVectorHash(this.db, node.id) === hash) return;
+    }
     try {
       const text = `${node.name}: ${node.description}\n${node.content.slice(0, 500)}`;
       const vec = await this.embed!(text);

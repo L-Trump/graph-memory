@@ -613,6 +613,7 @@ const graphMemoryPlugin = {
             const scores = [];
             if (n.semanticScore != null) scores.push(`语义=${n.semanticScore.toFixed(3)}`);
             if (n.pprScore != null) scores.push(`PPR=${n.pprScore.toFixed(3)}`);
+            if (n.pagerankScore != null) scores.push(`PR=${n.pagerankScore.toFixed(3)}`);
             if (n.combinedScore != null) scores.push(`综合=${n.combinedScore.toFixed(3)}`);
             const scoreStr = scores.length ? ` (${scores.join(", ")})` : "";
             return `${tierLabel} [${n.type}] ${n.name}${scoreStr}\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
@@ -630,9 +631,29 @@ const graphMemoryPlugin = {
             ...(edgeLines.length ? ["\n关系：", ...edgeLines] : []),
           ].join("\n\n");
 
+          // 返回完整 TieredNode 信息（含层级、评分、原始字段）
+          const tieredInfo = res.nodes.map((n: any) => ({
+            id: n.id,
+            type: n.type,
+            name: n.name,
+            description: n.description,
+            content: n.content,
+            status: n.status,
+            validatedCount: n.validatedCount,
+            pagerank: n.pagerank,
+            communityId: n.communityId,
+            createdAt: n.createdAt,
+            updatedAt: n.updatedAt,
+            tier: n.tier,
+            semanticScore: n.semanticScore ?? null,
+            pprScore: n.pprScore ?? null,
+            pagerankScore: n.pagerankScore ?? null,
+            combinedScore: n.combinedScore ?? null,
+          }));
+
           return {
             content: [{ type: "text", text }],
-            details: { count: res.nodes.length, query, tiers: res.nodes.filter((n: any) => n.tier) },
+            details: { count: res.nodes.length, query, tieredInfo },
           };
         },
       }),
@@ -782,6 +803,145 @@ const graphMemoryPlugin = {
         },
       }),
       { name: "gm_maintain" },
+    );
+
+    // ── gm_remove ─────────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_remove",
+        label: "Remove Node from Graph Memory",
+        description: "从知识图谱中删除指定节点（软删除，标记为 deprecated）。必须通过节点唯一名称（name）指定，一次只删一条。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点的唯一名称（name 字段），精确匹配" }),
+          reason: Type.Optional(Type.String({ description: "删除原因（可选）" })),
+        }),
+        async execute(_toolCallId: string, params: { name: string; reason?: string }) {
+          const { name, reason } = params;
+          const node = findByName(db, name);
+          if (!node) {
+            return {
+              content: [{ type: "text", text: `未找到名为 "${name}" 的节点，删除失败。` }],
+              details: { success: false, name },
+            };
+          }
+          if (node.status === "deprecated") {
+            return {
+              content: [{ type: "text", text: `节点 "${name}" 已经是 deprecated 状态，无需重复删除。` }],
+              details: { success: false, name, alreadyDeprecated: true },
+            };
+          }
+          // 软删除：标记 deprecated
+          deprecate(db, node.id);
+          // 顺手清理该节点的出边和入边（避免孤立边残留）
+          db.prepare("DELETE FROM gm_edges WHERE from_id = ? OR to_id = ?").run(node.id, node.id);
+          api.logger.info(`[graph-memory] removed node "${name}" (id=${node.id})${reason ? ` reason: ${reason}` : ""}`);
+          return {
+            content: [{
+              type: "text",
+              text: `已删除节点 "${name}"（类型: ${node.type}，原 status: ${node.status}）${
+                reason ? `\n删除原因：${reason}` : ""
+              }\n关联边也已清理。`,
+            }],
+            details: { success: true, nodeId: node.id, name, type: node.type },
+          };
+        },
+      }),
+      { name: "gm_remove" },
+    );
+
+    // ── gm_embedding ──────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_embedding",
+        label: "Re-embed Node in Graph Memory",
+        description: "对指定节点重新计算语义嵌入向量并更新到数据库。force=true 时跳过 Hash 比对强制重新计算。通常用于节点内容更新后同步向量。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点名称，精确匹配" }),
+          force: Type.Optional(Type.Boolean({ description: "强制重新计算向量，跳过 Hash 比对（默认 false）" })),
+        }),
+        async execute(_toolCallId: string, params: { name: string; force?: boolean }) {
+          const { name, force = false } = params;
+          const node = findByName(db, name);
+          if (!node) {
+            return {
+              content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }],
+              details: { success: false, name },
+            };
+          }
+          if (!recaller.isEmbedReady()) {
+            return {
+              content: [{ type: "text", text: `Embedding 功能未就绪（未配置 embedding），无法重新嵌入节点 "${name}"。` }],
+              details: { success: false, reason: "embed_not_ready" },
+            };
+          }
+          await recaller.syncEmbed(node, force);
+          return {
+            content: [{
+              type: "text",
+              text: `节点 "${name}" 的嵌入向量已重新计算并更新（force=${force}）。`,
+            }],
+            details: { success: true, nodeId: node.id, name, force },
+          };
+        },
+      }),
+      { name: "gm_embedding" },
+    );
+
+    // ── gm_reembedding_all ─────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_reembedding_all",
+        label: "Re-embed All Nodes in Graph Memory",
+        description: "对所有 active 节点重新计算嵌入向量并更新到数据库。force=true 时跳过 Hash 比对强制重新计算所有节点。注意：节点数量多时耗时较长，需要二次确认。",
+        parameters: Type.Object({
+          confirm: Type.Boolean({ description: "必须传 true 才真正执行，传 false 或不传则只返回待处理数量" }),
+          force: Type.Optional(Type.Boolean({ description: "强制重新计算所有节点向量，跳过 Hash 比对（默认 false）" })),
+        }),
+        async execute(_toolCallId: string, params: { confirm?: boolean; force?: boolean }) {
+          const { confirm, force = false } = params;
+          const allNodes = db.prepare(
+            "SELECT id, name, type, content FROM gm_nodes WHERE status = 'active'"
+          ).all() as any[];
+          if (!allNodes.length) {
+            return {
+              content: [{ type: "text", text: "图谱中没有任何 active 节点。" }],
+              details: { count: 0 },
+            };
+          }
+          if (!confirm) {
+            return {
+              content: [{
+                type: "text",
+                text: `图谱中共有 ${allNodes.length} 个 active 节点待重新嵌入。\n传入 confirm: true 确认执行。`,
+              }],
+              details: { count: allNodes.length, confirmRequired: true },
+            };
+          }
+          if (!recaller.isEmbedReady()) {
+            return {
+              content: [{ type: "text", text: `Embedding 功能未就绪，无法执行全量重新嵌入。` }],
+              details: { success: false, reason: "embed_not_ready" },
+            };
+          }
+          let updated = 0;
+          let failed = 0;
+          for (const row of allNodes) {
+            try {
+              await recaller.syncEmbed(row, force);
+              updated++;
+            } catch {
+              failed++;
+            }
+          }
+          const text = `全量重新嵌入完成：成功 ${updated} 个，失败 ${failed} 个（共 ${allNodes.length} 个节点，force=${force}）。`;
+          api.logger.info(`[graph-memory] reembedding_all: ${updated} ok, ${failed} failed`);
+          return {
+            content: [{ type: "text", text }],
+            details: { success: true, total: allNodes.length, updated, failed },
+          };
+        },
+      }),
+      { name: "gm_reembedding_all" },
     );
 
     api.logger.info(
