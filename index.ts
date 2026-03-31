@@ -547,10 +547,11 @@ const graphMemoryPlugin = {
 
           for (const nc of fin.promotedSkills) {
             if (nc.name && nc.content) {
-              upsertNode(db, {
+              const { node } = upsertNode(db, {
                 type: "SKILL", name: nc.name,
                 description: nc.description ?? "", content: nc.content,
               }, sid);
+              recaller.syncEmbed(node).catch(() => {});
             }
           }
           for (const ec of fin.newEdges) {
