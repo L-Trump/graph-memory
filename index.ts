@@ -721,25 +721,28 @@ const graphMemoryPlugin = {
       (_ctx: any) => ({
         name: "gm_stats",
         label: "Graph Memory Stats",
-        description: "查看知识图谱的统计信息：节点数、边数、社区数、PageRank Top 节点。",
+        description: "查看知识图谱的统计信息：节点数、边数、社区数、PageRank Top 节点、Embedding 开启状态。",
         parameters: Type.Object({}),
         async execute(_toolCallId: string, _params: any) {
           const stats = getStats(db);
           const topPr = (db.prepare(
             "SELECT name, type, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT 5"
           ).all() as any[]);
+          const embedEnabled = recaller.isEmbedReady();
+          const pendingCount = (recaller as any).pendingEmbedNodes?.length ?? 0;
 
           const text = [
             `知识图谱统计`,
             `节点：${stats.totalNodes} 个 (${Object.entries(stats.byType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `社区：${stats.communities} 个`,
+            `Embedding：${embedEnabled ? "✅ 已开启" : "❌ 未开启"}${pendingCount > 0 ? ` (待处理: ${pendingCount})` : ""}`,
             `PageRank Top 5：`,
             ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),
           ].join("\n");
           return {
             content: [{ type: "text", text }],
-            details: stats,
+            details: { ...stats, embedEnabled, pendingEmbedCount: pendingCount },
           };
         },
       }),

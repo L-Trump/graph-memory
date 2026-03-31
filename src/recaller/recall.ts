@@ -42,8 +42,8 @@ import { combinedScore, type Scored } from "../score.ts";
 
 // ─── 组合评分权重 ────────────────────────────────────────────
 const SEMANTIC_WEIGHT = 0.5;   // α：语义相关性权重
-const PPR_WEIGHT = 0.25;       // β：局部关联性权重（PPR）
-const PAGERANK_WEIGHT = 0.25;  // γ：全局重要性权重（PageRank）
+const PPR_WEIGHT = 0.3;        // β：局部关联性权重（PPR）
+const PAGERANK_WEIGHT = 0.2;   // γ：全局重要性权重（PageRank）
 
 // ─── 召回分级阈值 ────────────────────────────────────────────
 // k 默认 45，三层分级：L1=top k/3，L2=k/3~2k/3，L3=2k/3~k，filtered=k+
@@ -68,10 +68,32 @@ export interface RecallResultV2 {
 
 export class Recaller {
   private embed: EmbedFn | null = null;
+  private embedReady = false;
+  // 竞态队列：embedFn 未就绪时积压的节点，setEmbedFn 时一次性处理
+  private pendingEmbedNodes: GmNode[] = [];
 
   constructor(private db: DatabaseSyncInstance, private cfg: GmConfig) {}
 
-  setEmbedFn(fn: EmbedFn): void { this.embed = fn; }
+  setEmbedFn(fn: EmbedFn): void {
+    this.embed = fn;
+    this.embedReady = true;
+    // 处理竞态队列中积压的节点
+    if (this.pendingEmbedNodes.length > 0) {
+      const pending = this.pendingEmbedNodes.splice(0);
+      const logger = (process.env.GM_DEBUG ? console : undefined);
+      logger?.log(`[graph-memory] processing ${pending.length} pending embed nodes after embedFn ready`);
+      for (const node of pending) {
+        this._doSyncEmbed(node).catch((err) => {
+          const logErr = (process.env.GM_DEBUG ? console.error : undefined);
+          logErr?.(`[graph-memory] pending embed failed for node ${node.id}: ${err}`);
+        });
+      }
+    }
+  }
+
+  isEmbedReady(): boolean {
+    return this.embedReady;
+  }
 
   async recall(query: string): Promise<RecallResult> {
     const result = await this.recallV2(query);
@@ -111,6 +133,7 @@ export class Recaller {
   private async recallPreciseV2(query: string, limit: number): Promise<RecallResultV2> {
     let seeds: GmNode[] = [];
     const semanticScores = new Map<string, number>(); // nodeId → 原始向量相似度
+    let pagerankCandidateIds = new Set<string>(); // pagerank top k/5：仅作图扩展候选，不作 PPR 种子
     const k = DEFAULT_RECALL_K;
 
     if (this.embed) {
@@ -125,19 +148,13 @@ export class Recaller {
           console.log(`  [DEBUG] preciseV2: bestScore=${scored[0].score.toFixed(3)}, semanticSeeds=${seeds.length}`);
         }
 
-        // 全局 PageRank top k/5 也作为种子
+        // 全局 PageRank top k/5：仅作图扩展候选节点，不作为 PPR 种子
         const { topNodes } = await import("../store/store.ts");
-        const pagerankSeeds = topNodes(this.db, Math.ceil(k / 5));
-        const seen = new Set(seeds.map(n => n.id));
-        for (const ps of pagerankSeeds) {
-          if (!seen.has(ps.id)) {
-            seeds.push(ps);
-            seen.add(ps.id);
-          }
-        }
+        const pagerankCandidates = topNodes(this.db, Math.ceil(k / 5));
+        pagerankCandidateIds = new Set(pagerankCandidates.map(n => n.id));
 
-        if (process.env.GM_DEBUG && pagerankSeeds.length > 0) {
-          console.log(`  [DEBUG] preciseV2: pagerankSeeds=${pagerankSeeds.length}, totalSeeds=${seeds.length}`);
+        if (process.env.GM_DEBUG && pagerankCandidates.length > 0) {
+          console.log(`  [DEBUG] preciseV2: pagerankCandidates=${pagerankCandidates.length} (用于图扩展，不参与 PPR 种子)`);
         }
 
         // 向量结果不足时补 FTS5
@@ -157,12 +174,13 @@ export class Recaller {
 
     const seedIds = seeds.map(n => n.id);
 
-    // 社区扩展
+    // 社区扩展（语义种子 + pagerank 候选节点都作为图扩展起点）
     const expandedIds = new Set<string>(seedIds);
     for (const seed of seeds) {
       const peers = getCommunityPeers(this.db, seed.id, 2);
       for (const peerId of peers) expandedIds.add(peerId);
     }
+    for (const pid of pagerankCandidateIds) expandedIds.add(pid);
 
     // 图遍历拿三元组
     const { nodes, edges } = graphWalk(
@@ -259,7 +277,7 @@ export class Recaller {
     // 泛化路径：语义分数来自社区匹配，均匀分配
     const scoredNodes = combinedScore(
       nodes,
-      (n) => semanticScores.get(n.id) ?? 0.1, // fallback 低语义分
+      (n) => semanticScores.get(n.id) ?? 0.01, // fallback 低语义分
       (n) => pprScores.get(n.id) ?? 0,
       (n) => n.pagerank ?? 0,
       SEMANTIC_WEIGHT,
@@ -371,13 +389,31 @@ export class Recaller {
 
   /** 异步同步 embedding，不阻塞主流程 */
   async syncEmbed(node: GmNode): Promise<void> {
-    if (!this.embed) return;
+    if (!this.embed) {
+      // embedFn 尚未初始化，加入积压队列等待
+      this.pendingEmbedNodes.push(node);
+      const logger = (process.env.GM_DEBUG ? console.log : undefined);
+      logger?.call(console, `[graph-memory] syncEmbed: embed not ready, queued node ${node.id} (pending=${this.pendingEmbedNodes.length})`);
+      return;
+    }
+    return this._doSyncEmbed(node);
+  }
+
+  /** 实际执行 embedding 写入 */
+  private async _doSyncEmbed(node: GmNode): Promise<void> {
     const hash = createHash("md5").update(node.content).digest("hex");
     if (getVectorHash(this.db, node.id) === hash) return;
     try {
       const text = `${node.name}: ${node.description}\n${node.content.slice(0, 500)}`;
-      const vec = await this.embed(text);
-      if (vec.length) saveVector(this.db, node.id, node.content, vec);
-    } catch { /* 不影响主流程 */ }
+      const vec = await this.embed!(text);
+      if (vec.length) {
+        saveVector(this.db, node.id, node.content, vec);
+        const logger = (process.env.GM_DEBUG ? console.log : undefined);
+        logger?.call(console, `[graph-memory] synced embedding for node ${node.id} (${vec.length} dims)`);
+      }
+    } catch (err) {
+      const logErr = (process.env.GM_DEBUG ? console.error : undefined);
+      logErr?.call(console, `[graph-memory] syncEmbed failed for node ${node.id}: ${err}`);
+    }
   }
 }
