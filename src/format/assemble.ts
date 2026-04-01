@@ -25,24 +25,33 @@ import type { TieredNode, RecallTier } from "../recaller/recall.ts";
 
 const CHARS_PER_TOKEN = 3;
 
-// ─── 统一节点合并去重（tier 优先级：active > L1 > L2 > L3 > filtered）────────────
-const TIER_PRIORITY: Record<RecallTier, number> = { active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
+// ─── 统一节点合并去重（tier 优先级：hot > active > L1 > L2 > L3 > filtered）────────────
+const TIER_PRIORITY: Record<RecallTier, number> = { hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
 
 /** mergeNodes 的输出类型：GmNode + tier，不含 TieredNode 的 score 字段 */
 type MergedNode = GmNode & { tier: RecallTier };
 
-// activeNodes: GmNode（无tier）→ tier强制为"active"
+// hotNodes: GmNode → tier强制为"hot"（优先级最高）
 // recalledNodes: TieredNode（有tier）→ 保留原有tier
+// activeNodes: GmNode（无tier）→ tier强制为"active"
 function mergeNodes(
-  activeNodes: GmNode[],
+  hotNodes: GmNode[],
   recalledNodes: TieredNode[],
+  activeNodes: GmNode[],
 ): MergedNode[] {
   type Entry = { node: GmNode; tier: RecallTier; _priority: number };
   const map = new Map<string, Entry>();
 
+  for (const n of hotNodes) {
+    map.set(n.id, { node: n, tier: "hot", _priority: TIER_PRIORITY.hot });
+  }
+
   for (const n of recalledNodes) {
     const tier = n.tier ?? "L3";
-    map.set(n.id, { node: n, tier, _priority: TIER_PRIORITY[tier] ?? 0 });
+    const existing = map.get(n.id);
+    if (!existing || TIER_PRIORITY[tier] > existing._priority) {
+      map.set(n.id, { node: n, tier, _priority: TIER_PRIORITY[tier] ?? 0 });
+    }
   }
 
   for (const n of activeNodes) {
@@ -69,9 +78,10 @@ function shouldRenderEdge(fromTier: RecallTier, toTier: RecallTier): boolean {
   return fromTier !== "filtered" && toTier !== "filtered";
 }
 
-// ─── 边描述判断：至少一端是 active 或 L1 时带 description ──
+// ─── 边描述判断：至少一端是 hot、active 或 L1 时带 description ──
 function edgeHasDescription(fromTier: RecallTier, toTier: RecallTier): boolean {
-  return fromTier === "active" || fromTier === "L1" || toTier === "active" || toTier === "L1";
+  return fromTier === "hot" || fromTier === "active" || fromTier === "L1" ||
+         toTier === "hot" || toTier === "active" || toTier === "L1";
 }
 
 // ─── 节点输出（按 tier）────────────────────────────────────
@@ -218,6 +228,8 @@ function expandNeighbors(
 
 export interface AssembleParams {
   tokenBudget: number;
+  hotNodes: GmNode[];
+  hotEdges: GmEdge[];
   activeNodes: GmNode[];
   activeEdges: GmEdge[];
   recalledNodes: TieredNode[];   // V2: TieredNode[]（带 tier 信息）
@@ -230,14 +242,14 @@ export interface AssembleParams {
  * 组装知识图谱为 XML context
  *
  * 节点合并逻辑：
- * - activeNodes + recalledNodes 合并去重，相同 id 取更高 tier（active > L1 > L2 > L3 > filtered）
+ * - hotNodes + recalledNodes + activeNodes 合并去重，相同 id 取更高 tier（hot > active > L1 > L2 > L3 > filtered）
  *
  * 边合并逻辑：
- * - activeEdges + recalledEdges 合并去重，active 优先
+ * - hotEdges + activeEdges + recalledEdges 合并去重
  *
  * 边渲染规则：
  * - 两端都不是 filtered → 渲染
- * - 至少一端是 active 或 L1 → 带 description
+ * - 至少一端是 hot、active 或 L1 → 带 description
  * - 否则 → 仅渲染 name
  */
 export function assembleContext(
@@ -245,10 +257,10 @@ export function assembleContext(
   cfg: GmConfig | null,
   params: AssembleParams,
 ): { xml: string | null; systemPrompt: string; tokens: number; episodicXml: string; episodicTokens: number } {
-  const { recalledNodes } = params;
+  const { recalledNodes, hotNodes, hotEdges } = params;
 
-  // ── 节点合并去重 ──────────────────────────────────────────
-  const mergedNodes = mergeNodes(params.activeNodes, recalledNodes);
+  // ── 节点合并去重（hot → recalled → active）─────────────────
+  const mergedNodes = mergeNodes(hotNodes, recalledNodes, params.activeNodes);
 
   // 过滤 filtered
   const passNodes = mergedNodes.filter(n => n.tier !== "filtered");
@@ -258,8 +270,8 @@ export function assembleContext(
     return { xml: null, systemPrompt: "", tokens: 0, episodicXml: "", episodicTokens: 0 };
   }
 
-  // ── 边合并去重 ────────────────────────────────────────────
-  const allEdges = mergeEdges(params.activeEdges, params.recalledEdges);
+  // ── 边合并去重（hot → active → recalled）────────────────────
+  const allEdges = mergeEdges(hotEdges, mergeEdges(params.activeEdges, params.recalledEdges));
 
   // ── 构建节点 id → name 映射 ───────────────────────────────
   const idToName = new Map<string, string>();

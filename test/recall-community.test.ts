@@ -194,6 +194,8 @@ describe("assemble 社区分组", () => {
 
     const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
+      hotNodes: [] as GmNode[],
+      hotEdges: [] as GmEdge[],
       activeNodes: [nodeA, nodeB, nodeC],
       activeEdges: [],
       recalledNodes: [],
@@ -212,6 +214,8 @@ describe("assemble 社区分组", () => {
 
     const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
+      hotNodes: [] as GmNode[],
+      hotEdges: [] as GmEdge[],
       activeNodes: [node],
       activeEdges: [],
       recalledNodes: [],
@@ -230,6 +234,8 @@ describe("assemble 社区分组", () => {
 
     const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
+      hotNodes: [] as GmNode[],
+      hotEdges: [] as GmEdge[],
       activeNodes: [node],
       activeEdges: [],
       recalledNodes: [],
@@ -249,6 +255,8 @@ describe("assemble 社区分组", () => {
 
     const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
+      hotNodes: [] as GmNode[],
+      hotEdges: [] as GmEdge[],
       activeNodes: [node],
       activeEdges: [],
       recalledNodes: [],

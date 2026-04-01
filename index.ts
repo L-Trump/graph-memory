@@ -17,7 +17,7 @@ import {
   markExtracted,
   upsertNode, upsertEdge, findByName,
   getBySession, edgesFrom, edgesTo,
-  deprecate, getStats,
+  deprecate, getStats, getHotNodes, getEdgesForNodes, setNodeFlags,
 } from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
@@ -318,10 +318,14 @@ const graphMemoryPlugin = {
           ...edgesTo(db, n.id),
         ]);
 
+        // hot 节点始终渲染
+        const hotNodes = getHotNodes(db);
+        const hotEdges = hotNodes.length > 0 ? getEdgesForNodes(db, hotNodes.map(n => n.id)) : [];
+
         const rec = recalled.get(sessionId) ?? { nodes: [], edges: [], pprScores: {} };
         const totalGmNodes = activeNodes.length + rec.nodes.length;
 
-        if (totalGmNodes === 0) {
+        if (totalGmNodes === 0 && hotNodes.length === 0) {
           return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
         }
 
@@ -332,6 +336,8 @@ const graphMemoryPlugin = {
         // ── 2. 图谱 + 溯源 ─────────────────────────────
         const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, cfg, {
           tokenBudget: 0,
+          hotNodes,
+          hotEdges,
           activeNodes,
           activeEdges,
           recalledNodes: rec.nodes,
@@ -623,14 +629,15 @@ const graphMemoryPlugin = {
           }
 
           const lines = res.nodes.map((n: any) => {
-            const tierLabel = n.tier === "L1" ? "【L1-完整】" : n.tier === "L2" ? "【L2-描述】" : n.tier === "L3" ? "【L3-名称】" : "【过滤】";
+            const tierLabel = n.tier === "hot" ? "【🔥HOT】" : n.tier === "L1" ? "【L1-完整】" : n.tier === "L2" ? "【L2-描述】" : n.tier === "L3" ? "【L3-名称】" : "【过滤】";
+            const hotFlag = n.flags?.includes("hot") ? " 🔥" : "";
             const scores = [];
             if (n.semanticScore != null) scores.push(`语义=${n.semanticScore.toFixed(3)}`);
             if (n.pprScore != null) scores.push(`PPR=${n.pprScore.toFixed(3)}`);
             if (n.pagerankScore != null) scores.push(`PR=${n.pagerankScore.toFixed(3)}`);
             if (n.combinedScore != null) scores.push(`综合=${n.combinedScore.toFixed(3)}`);
             const scoreStr = scores.length ? ` (${scores.join(", ")})` : "";
-            return `${tierLabel} [${n.type}] ${n.name}${scoreStr}\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
+            return `${tierLabel} [${n.type}] ${n.name}${hotFlag}${scoreStr}\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
           });
 
           const edgeLines = res.edges.map((e: any) => {
@@ -653,6 +660,7 @@ const graphMemoryPlugin = {
             description: n.description,
             content: n.content,
             status: n.status,
+            flags: n.flags ?? [],
             validatedCount: n.validatedCount,
             pagerank: n.pagerank,
             communityId: n.communityId,
@@ -678,13 +686,14 @@ const graphMemoryPlugin = {
       (ctx: any) => ({
         name: "gm_record",
         label: "Record to Graph Memory",
-        description: "手动记录经验到知识图谱。发现重要解法、踩坑经验或工作流程时调用。",
+        description: "手动记录经验到知识图谱。发现重要解法、踩坑经验或工作流程时调用。\n\n如需将节点标记为 hot（每次 assemble 时必定渲染），可在 flags 中传入 [\"hot\"]，例如：gm_record(content=\"...\", flags=[\"hot\"])。hot 节点拥有最高渲染优先级，高于 active 和所有 recall tier。仅在用户明确要求将某条记忆设为 hot 时才使用此功能。",
         parameters: Type.Object({
           content: Type.String({ description: "用自然语言描述需要记忆的内容（会被当作待提取对话）" }),
+          flags: Type.Optional(Type.Array(Type.String(), { description: "节点标记数组。传 [\"hot\"] 将该节点标记为 hot（每次 assemble 时必定渲染）。" })),
         }),
         async execute(
           _toolCallId: string,
-          p: { content: string },
+          p: { content: string; flags?: string[] },
         ) {
           const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
 
@@ -723,6 +732,7 @@ const graphMemoryPlugin = {
             const { node } = upsertNode(db, {
               type: nc.type, name: nc.name,
               description: nc.description, content: nc.content,
+              flags: p.flags,
             }, sid);
             nameToId.set(node.name, node.id);
             recaller.syncEmbed(node).catch(() => {});
@@ -751,7 +761,7 @@ const graphMemoryPlugin = {
           return {
             content: [{
               type: "text",
-              text: `提取完成：${result.nodes.length} 个节点 [${nodeNames}]，${result.edges.length} 条边 [${edgeNames}]`,
+              text: `提取完成：${result.nodes.length} 个节点 [${nodeNames}]，${result.edges.length} 条边 [${edgeNames}]${p.flags?.includes("hot") ? "（已标记为 hot）" : ""}`,
             }],
             details: { nodes: result.nodes.length, edges: result.edges.length },
           };
@@ -764,7 +774,7 @@ const graphMemoryPlugin = {
       (_ctx: any) => ({
         name: "gm_stats",
         label: "Graph Memory Stats",
-        description: "查看知识图谱的统计信息：节点数、边数、社区数、PageRank Top 节点、Embedding 开启状态。",
+        description: "查看知识图谱的统计信息：节点数、边数、社区数、Hot 节点数、PageRank Top 节点、Embedding 开启状态。",
         parameters: Type.Object({}),
         async execute(_toolCallId: string, _params: any) {
           const stats = getStats(db);
@@ -779,6 +789,7 @@ const graphMemoryPlugin = {
             `节点：${stats.totalNodes} 个 (${Object.entries(stats.byType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `社区：${stats.communities} 个`,
+            `Hot 节点：${stats.hotNodes} 个`,
             `Embedding：${embedEnabled ? "✅ 已开启" : "❌ 未开启"}${pendingCount > 0 ? ` (待处理: ${pendingCount})` : ""}`,
             `PageRank Top 5：`,
             ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),
@@ -824,6 +835,78 @@ const graphMemoryPlugin = {
         },
       }),
       { name: "gm_maintain" },
+    );
+
+    // ── gm_get_hots ───────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_get_hots",
+        label: "Get Hot Nodes from Graph Memory",
+        description: "获取当前所有 hot 节点。hot 节点在每次 assemble 时必定渲染，拥有最高优先级。",
+        parameters: Type.Object({}),
+        async execute(_toolCallId: string, _params: any) {
+          const hotNodes = getHotNodes(db);
+          if (!hotNodes.length) {
+            return {
+              content: [{ type: "text", text: "当前没有 hot 节点。" }],
+              details: { count: 0 },
+            };
+          }
+          const lines = hotNodes.map((n: any) => {
+            const flagsStr = n.flags?.length ? ` [${n.flags.map((f: string) => `"${f}"`).join(", ")}]` : "";
+            return `[${n.type}] ${n.name}${flagsStr}\n  ${n.description || "(无描述)"}`;
+          });
+          const text = [
+            `当前共有 ${hotNodes.length} 个 hot 节点：`,
+            "",
+            ...lines,
+          ].join("\n");
+          return {
+            content: [{ type: "text", text }],
+            details: { count: hotNodes.length, nodes: hotNodes },
+          };
+        },
+      }),
+      { name: "gm_get_hots" },
+    );
+
+    // ── gm_set_flags ───────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_set_flags",
+        label: "Set Flags on Graph Memory Node",
+        description: "为已有节点设置 flags（覆盖而非追加）。可用于将节点标记为 hot（flags=[\"hot\"]）以在每次 assemble 时必定渲染，也可传入空数组清除所有 flags。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点名称，精确匹配" }),
+          flags: Type.Array(Type.String(), { description: "flags 数组，例如 [\"hot\"] 或 []（空数组清除所有 flags）" }),
+        }),
+        async execute(_toolCallId: string, params: { name: string; flags: string[] }) {
+          const { name, flags } = params;
+          const node = findByName(db, name);
+          if (!node) {
+            return {
+              content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }],
+              details: { success: false, name },
+            };
+          }
+          const ok = setNodeFlags(db, node.id, flags);
+          if (!ok) {
+            return {
+              content: [{ type: "text", text: `更新节点 "${name}" 的 flags 失败。` }],
+              details: { success: false, name },
+            };
+          }
+          invalidateGraphCache();
+          return {
+            content: [{
+              type: "text",
+              text: `节点 "${name}" 的 flags 已更新为 [${flags.map(f => `"${f}"`).join(", ")}]${flags.includes("hot") ? "（hot 节点，每次 assemble 时必定渲染）" : ""}`,
+            }],
+            details: { success: true, name, flags },
+          };
+        },
+      }),
+      { name: "gm_set_flags" },
     );
 
     // ── gm_remove ─────────────────────────────────────────────

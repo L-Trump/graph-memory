@@ -28,6 +28,7 @@ export interface GmNode {
   sourceSessions: string[];
   communityId: string | null;
   pagerank: number;
+  flags: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -142,7 +143,7 @@ export interface GmConfig {
 export const DEFAULT_CONFIG: GmConfig = {
   dbPath: "~/.openclaw/graph-memory.db",
   compactTurnCount: 6,
-  recallMaxNodes: 6,
+  recallMaxNodes: 45,
   recallMaxDepth: 2,
   freshTailCount: 10,
   dedupThreshold: 0.90,

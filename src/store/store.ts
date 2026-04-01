@@ -23,6 +23,7 @@ function toNode(r: any): GmNode {
     sourceSessions: JSON.parse(r.source_sessions ?? "[]"),
     communityId: r.community_id ?? null,
     pagerank: r.pagerank ?? 0,
+    flags: JSON.parse(r.flags ?? "[]"),
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -65,13 +66,29 @@ export function allActiveNodes(db: DatabaseSyncInstance): GmNode[] {
   return (db.prepare("SELECT * FROM gm_nodes WHERE status='active'").all() as any[]).map(toNode);
 }
 
+/** 获取所有 hot 节点（非 deprecated 且 flags 包含 'hot'） */
+export function getHotNodes(db: DatabaseSyncInstance): GmNode[] {
+  return (db.prepare(
+    "SELECT * FROM gm_nodes WHERE status='active' AND flags LIKE '%\"hot\"%'"
+  ).all() as any[]).map(toNode);
+}
+
+/** 获取指定节点 IDs 的所有边 */
+export function getEdgesForNodes(db: DatabaseSyncInstance, ids: string[]): GmEdge[] {
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  return (db.prepare(
+    `SELECT * FROM gm_edges WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`
+  ).all(...ids, ...ids) as any[]).map(toEdge);
+}
+
 export function allEdges(db: DatabaseSyncInstance): GmEdge[] {
   return (db.prepare("SELECT * FROM gm_edges").all() as any[]).map(toEdge);
 }
 
 export function upsertNode(
   db: DatabaseSyncInstance,
-  c: { type: NodeType; name: string; description: string; content: string },
+  c: { type: NodeType; name: string; description: string; content: string; flags?: string[] },
   sessionId: string,
 ): { node: GmNode; isNew: boolean } {
   const name = normalizeName(c.name);
@@ -90,10 +107,11 @@ export function upsertNode(
   }
 
   const id = uid("n");
+  const flags = JSON.stringify(c.flags ?? []);
   db.prepare(`INSERT INTO gm_nodes
-    (id, type, name, description, content, status, validated_count, source_sessions, created_at, updated_at)
-    VALUES (?,?,?,?,?,'active',1,?,?,?)`)
-    .run(id, c.type, name, c.description, c.content, JSON.stringify([sessionId]), Date.now(), Date.now());
+    (id, type, name, description, content, status, validated_count, source_sessions, flags, created_at, updated_at)
+    VALUES (?,?,?,?,?,'active',1,?,?,?,?)`)
+    .run(id, c.type, name, c.description, c.content, JSON.stringify([sessionId]), flags, Date.now(), Date.now());
   return { node: findByName(db, name)!, isNew: true };
 }
 
@@ -102,23 +120,35 @@ export function deprecate(db: DatabaseSyncInstance, nodeId: string): void {
     .run(Date.now(), nodeId);
 }
 
+/** 设置节点的 flags（覆盖而非追加） */
+export function setNodeFlags(db: DatabaseSyncInstance, nodeId: string, flags: string[]): boolean {
+  const node = findById(db, nodeId);
+  if (!node) return false;
+  db.prepare("UPDATE gm_nodes SET flags=?, updated_at=? WHERE id=?")
+    .run(JSON.stringify(flags), Date.now(), nodeId);
+  return true;
+}
+
 /** 合并两个节点：keepId 保留，mergeId 标记 deprecated，边迁移 */
 export function mergeNodes(db: DatabaseSyncInstance, keepId: string, mergeId: string): void {
   const keep = findById(db, keepId);
   const merge = findById(db, mergeId);
   if (!keep || !merge) return;
 
-  // 合并 validatedCount + sourceSessions
+  // 合并 validatedCount + sourceSessions + flags
   const sessions = JSON.stringify(
     Array.from(new Set([...keep.sourceSessions, ...merge.sourceSessions]))
+  );
+  const flags = JSON.stringify(
+    Array.from(new Set([...keep.flags, ...merge.flags]))
   );
   const count = keep.validatedCount + merge.validatedCount;
   const content = keep.content.length >= merge.content.length ? keep.content : merge.content;
   const desc = keep.description.length >= merge.description.length ? keep.description : merge.description;
 
   db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
-    source_sessions=?, updated_at=? WHERE id=?`)
-    .run(content, desc, count, sessions, Date.now(), keepId);
+    source_sessions=?, flags=?, updated_at=? WHERE id=?`)
+    .run(content, desc, count, sessions, flags, Date.now(), keepId);
 
   // 迁移边：mergeId 的边指向 keepId
   db.prepare("UPDATE gm_edges SET from_id=? WHERE from_id=?").run(keepId, mergeId);
@@ -413,6 +443,7 @@ export function getStats(db: DatabaseSyncInstance): {
   totalEdges: number;
   byEdgeType: Record<string, number>;
   communities: number;
+  hotNodes: number;
 } {
   const totalNodes = (db.prepare("SELECT COUNT(*) as c FROM gm_nodes WHERE status='active'").get() as any).c;
   const byType: Record<string, number> = {};
@@ -434,7 +465,10 @@ export function getStats(db: DatabaseSyncInstance): {
   const communities = (db.prepare(
     "SELECT COUNT(DISTINCT community_id) as c FROM gm_nodes WHERE status='active' AND community_id IS NOT NULL"
   ).get() as any).c;
-  return { totalNodes, byType, totalEdges, byEdgeType, communities };
+  const hotNodes = (db.prepare(
+    "SELECT COUNT(*) as c FROM gm_nodes WHERE status='active' AND flags LIKE '%\"hot\"%'"
+  ).get() as any).c;
+  return { totalNodes, byType, totalEdges, byEdgeType, communities, hotNodes };
 }
 
 // ─── 向量存储 + 搜索 ────────────────────────────────────────

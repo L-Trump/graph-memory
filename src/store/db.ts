@@ -51,7 +51,7 @@ export function closeDb(): void {
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags];
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
@@ -240,5 +240,18 @@ function m7_edge_flexible(db: DatabaseSyncInstance): void {
 
     -- 删除旧表
     DROP TABLE gm_edges_old;
+  `);
+}
+
+// ─── flags 字段迁移 ─────────────────────────────────────────
+
+function m8_flags(db: DatabaseSyncInstance): void {
+  try {
+    db.prepare("SELECT flags FROM gm_nodes LIMIT 1").get();
+    return; // 已迁移
+  } catch { /* 列不存在，继续 */ }
+
+  db.exec(`
+    ALTER TABLE gm_nodes ADD COLUMN flags TEXT NOT NULL DEFAULT '[]';
   `);
 }

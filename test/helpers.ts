@@ -31,6 +31,7 @@ export function createTestDb(): DatabaseSyncInstance {
       source_sessions TEXT NOT NULL DEFAULT '[]',
       community_id    TEXT,
       pagerank        REAL NOT NULL DEFAULT 0,
+      flags           TEXT NOT NULL DEFAULT '[]',
       created_at      INTEGER NOT NULL,
       updated_at      INTEGER NOT NULL
     );
@@ -129,12 +130,13 @@ export function insertNode(
     status?: string;
     validatedCount?: number;
     sessions?: string[];
+    flags?: string[];
   },
 ): string {
   const id = opts.id ?? `n-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   db.prepare(`
-    INSERT INTO gm_nodes (id, type, name, description, content, status, validated_count, source_sessions, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO gm_nodes (id, type, name, description, content, status, validated_count, source_sessions, flags, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     opts.type ?? "SKILL",
@@ -144,6 +146,7 @@ export function insertNode(
     opts.status ?? "active",
     opts.validatedCount ?? 1,
     JSON.stringify(opts.sessions ?? ["test-session"]),
+    JSON.stringify(opts.flags ?? []),
     Date.now(),
     Date.now(),
   );

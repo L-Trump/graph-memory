@@ -67,6 +67,8 @@ describe("assembleContext", () => {
 
     const { xml, systemPrompt, tokens } = assembleContext(db, null!, {
       tokenBudget: 128_000,
+      hotNodes: [] as GmNode[],
+      hotEdges: [] as GmEdge[],
       activeNodes: [node],
       activeEdges: [] as GmEdge[],
       recalledNodes: [] as any[],
@@ -84,6 +86,8 @@ describe("assembleContext", () => {
   it("空节点返回 null", () => {
     const { xml, systemPrompt } = assembleContext(db, null!, {
       tokenBudget: 128_000,
+      hotNodes: [] as GmNode[],
+      hotEdges: [] as GmEdge[],
       activeNodes: [] as GmNode[],
       activeEdges: [] as GmEdge[],
       recalledNodes: [] as any[],
@@ -101,6 +105,8 @@ describe("assembleContext", () => {
 
     const { xml } = assembleContext(db, null!, {
       tokenBudget: 128_000,
+      hotNodes: [] as GmNode[],
+      hotEdges: [] as GmEdge[],
       activeNodes: [] as GmNode[],
       activeEdges: [] as GmEdge[],
       recalledNodes: [{ ...node, tier: "L1" as const, semanticScore: 0.8, pprScore: 0.1, pagerankScore: 0.3, combinedScore: 0.5 }],
@@ -125,6 +131,8 @@ describe("assembleContext", () => {
     // 很小的 token 预算
     const { xml } = assembleContext(db, null!, {
       tokenBudget: 1000, // 1000 * 0.15 * 3 = 450 字符
+      hotNodes: [] as GmNode[],
+      hotEdges: [] as GmEdge[],
       activeNodes: nodes,
       activeEdges: [] as GmEdge[],
       recalledNodes: [] as any[],
@@ -137,6 +145,134 @@ describe("assembleContext", () => {
       const matches = xml.match(/name="skill-/g);
       expect(matches!.length).toBe(20);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// hot 节点渲染
+// ═══════════════════════════════════════════════════════════════
+
+describe("hot 节点渲染", () => {
+  it("hot 节点始终渲染且 tier 为 hot", () => {
+    // 插入一个普通节点和一个 hot 节点
+    const id1 = insertNode(db, { name: "normal-skill", type: "SKILL" });
+    const id2 = insertNode(db, { name: "hot-skill", type: "SKILL", flags: ["hot"] });
+    const node1 = findById(db, id1)!;
+    const node2 = findById(db, id2)!;
+
+    // 单独渲染 hot 节点（active 和 recalled 都为空）
+    const { xml } = assembleContext(db, null!, {
+      tokenBudget: 128_000,
+      hotNodes: [node2],
+      hotEdges: [] as GmEdge[],
+      activeNodes: [] as GmNode[],
+      activeEdges: [] as GmEdge[],
+      recalledNodes: [] as any[],
+      recalledEdges: [] as GmEdge[],
+      pprScores: {} as Record<string, number>,
+    });
+
+    expect(xml).toContain('name="hot-skill"');
+    expect(xml).toContain('tier="hot"');
+    expect(xml).not.toContain("normal-skill");
+  });
+
+  it("hot 节点与其他节点冲突时 hot 优先", () => {
+    // 同一个节点同时出现在 hot 和 recalled 中，hot 应优先
+    const id = insertNode(db, { name: "conflict-skill", type: "SKILL" });
+    const node = findById(db, id)!;
+
+    const { xml } = assembleContext(db, null!, {
+      tokenBudget: 128_000,
+      hotNodes: [{ ...node, flags: ["hot"] } as GmNode],
+      hotEdges: [] as GmEdge[],
+      activeNodes: [] as GmNode[],
+      activeEdges: [] as GmEdge[],
+      recalledNodes: [{ ...node, tier: "L1" as const, semanticScore: 0.8, pprScore: 0.1, pagerankScore: 0.3, combinedScore: 0.5 }],
+      recalledEdges: [] as GmEdge[],
+      pprScores: {} as Record<string, number>,
+    });
+
+    expect(xml).toContain('name="conflict-skill"');
+    expect(xml).toContain('tier="hot"');
+    expect(xml).not.toContain('tier="l1"');
+  });
+
+  it("hot 节点带 description 渲染（tier 不是 L3）", () => {
+    const id = insertNode(db, { name: "hot-with-desc", type: "SKILL", description: "hot 节点描述", content: "hot 节点内容" });
+    const node = findById(db, id)!;
+
+    const { xml } = assembleContext(db, null!, {
+      tokenBudget: 128_000,
+      hotNodes: [{ ...node, flags: ["hot"] } as GmNode],
+      hotEdges: [] as GmEdge[],
+      activeNodes: [] as GmNode[],
+      activeEdges: [] as GmEdge[],
+      recalledNodes: [] as any[],
+      recalledEdges: [] as GmEdge[],
+      pprScores: {} as Record<string, number>,
+    });
+
+    // hot tier 非 L3，应带 desc
+    expect(xml).toContain('desc="hot 节点描述"');
+    expect(xml).toContain('tier="hot"');
+  });
+
+  it("hot 节点在 hot+active+recalled 混合场景中排序正确", () => {
+    const id1 = insertNode(db, { name: "active-node", type: "TASK" });
+    const id2 = insertNode(db, { name: "hot-node", type: "SKILL", flags: ["hot"] });
+    const node1 = findById(db, id1)!;
+    const node2 = findById(db, id2)!;
+
+    const { xml } = assembleContext(db, null!, {
+      tokenBudget: 128_000,
+      hotNodes: [node2],
+      hotEdges: [] as GmEdge[],
+      activeNodes: [node1],
+      activeEdges: [] as GmEdge[],
+      recalledNodes: [] as any[],
+      recalledEdges: [] as GmEdge[],
+      pprScores: {} as Record<string, number>,
+    });
+
+    // 两个节点都应存在
+    expect(xml).toContain('name="hot-node"');
+    expect(xml).toContain('name="active-node"');
+    expect(xml).toContain('tier="hot"');
+    expect(xml).toContain('tier="active"');
+  });
+
+  it("hot 节点的边在两侧节点都在时正确渲染", () => {
+    const id1 = insertNode(db, { name: "hot-from", type: "SKILL" });
+    const id2 = insertNode(db, { name: "hot-to", type: "TASK" });
+    const node1 = findById(db, id1)!;
+    const node2 = findById(db, id2)!;
+    // 手动构建 hot 边（assembleContext 不自动查 hot 边，由调用方传入）
+    const hotEdge: GmEdge = {
+      id: "e-hot-test",
+      fromId: node1.id,
+      toId: node2.id,
+      name: "使用",
+      description: "hot 节点之间的边",
+      sessionId: "test",
+      createdAt: Date.now(),
+    };
+
+    const { xml } = assembleContext(db, null!, {
+      tokenBudget: 128_000,
+      hotNodes: [{ ...node1, flags: ["hot"] } as GmNode, node2],
+      hotEdges: [hotEdge],
+      activeNodes: [] as GmNode[],
+      activeEdges: [] as GmEdge[],
+      recalledNodes: [] as any[],
+      recalledEdges: [] as GmEdge[],
+      pprScores: {} as Record<string, number>,
+    });
+
+    // 边应该渲染
+    expect(xml).toContain('name="使用"');
+    expect(xml).toContain('from="hot-from"');
+    expect(xml).toContain('to="hot-to"');
   });
 });
 

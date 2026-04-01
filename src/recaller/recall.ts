@@ -45,11 +45,7 @@ const SEMANTIC_WEIGHT = 0.5;   // α：语义相关性权重
 const PPR_WEIGHT = 0.3;        // β：局部关联性权重（PPR）
 const PAGERANK_WEIGHT = 0.2;   // γ：全局重要性权重（PageRank）
 
-// ─── 召回分级阈值 ────────────────────────────────────────────
-// k 默认 45，三层分级：L1=top k/3，L2=k/3~2k/3，L3=2k/3~k，filtered=k+
-const DEFAULT_RECALL_K = 45;
-
-export type RecallTier = "L1" | "L2" | "L3" | "filtered" | "active";
+export type RecallTier = "L1" | "L2" | "L3" | "filtered" | "active" | "hot";
 
 export interface TieredNode extends GmNode {
   tier: RecallTier;
@@ -134,7 +130,7 @@ export class Recaller {
     let seeds: GmNode[] = [];
     const semanticScores = new Map<string, number>(); // nodeId → 原始向量相似度
     let pagerankCandidateIds = new Set<string>(); // pagerank top k/5：仅作图扩展候选，不作 PPR 种子
-    const k = DEFAULT_RECALL_K;
+    const k = this.cfg.recallMaxNodes;
 
     if (this.embed) {
       try {
@@ -157,17 +153,17 @@ export class Recaller {
           console.log(`  [DEBUG] preciseV2: pagerankCandidates=${pagerankCandidates.length} (用于图扩展，不参与 PPR 种子)`);
         }
 
-        // 向量结果不足时补 FTS5
+        // 向量结果不足时补 FTS5（limit/3 ≈ 15，与向量搜索种子数一致）
         if (seeds.length < 2) {
-          const fts = searchNodes(this.db, query, limit);
+          const fts = searchNodes(this.db, query, Math.ceil(limit / 3));
           const seen2 = new Set(seeds.map(n => n.id));
           seeds.push(...fts.filter(n => !seen2.has(n.id)));
         }
       } catch {
-        seeds = searchNodes(this.db, query, limit);
+        seeds = searchNodes(this.db, query, Math.ceil(limit / 3));
       }
     } else {
-      seeds = searchNodes(this.db, query, limit);
+      seeds = searchNodes(this.db, query, Math.ceil(limit / 3));
     }
 
     if (!seeds.length) return { nodes: [], edges: [], pprScores: {}, tokenEstimate: 0 };
@@ -212,7 +208,7 @@ export class Recaller {
     const tiered = this.assignTiers(scoredNodes);
 
     if (process.env.GM_DEBUG) {
-      const byTier: Record<RecallTier, number> = { L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
+      const byTier: Record<RecallTier, number> = { hot: 0, L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
       for (const n of tiered) byTier[n.tier]++;
       console.log(`  [DEBUG] preciseV2 tiers: L1=${byTier.L1} L2=${byTier.L2} L3=${byTier.L3} filtered=${byTier.filtered}`);
     }
@@ -287,7 +283,7 @@ export class Recaller {
     const tiered = this.assignTiers(scoredNodes);
 
     if (process.env.GM_DEBUG) {
-      const byTier: Record<RecallTier, number> = { L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
+      const byTier: Record<RecallTier, number> = { hot: 0, L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
       for (const n of tiered) byTier[n.tier]++;
       console.log(`  [DEBUG] generalizedV2 tiers: L1=${byTier.L1} L2=${byTier.L2} L3=${byTier.L3} filtered=${byTier.filtered}`);
     }
@@ -308,7 +304,7 @@ export class Recaller {
    * k 默认 45：L1=top k/3 (0~15)，L2=k/3~2k/3 (15~30)，L3=2k/3~k (30~45)，filtered=k+ (45+)
    */
   private assignTiers(scored: Scored<GmNode>[]): TieredNode[] {
-    const k = DEFAULT_RECALL_K;
+    const k = this.cfg.recallMaxNodes;
     const t1 = Math.ceil(k / 3);    // 15
     const t2 = Math.ceil(2 * k / 3); // 30
 
@@ -379,7 +375,7 @@ export class Recaller {
   }
 
   private tierPriority(tier: RecallTier): number {
-    const p: Record<RecallTier, number> = { L1: 3, L2: 2, L3: 1, filtered: 0, active: 4 };
+    const p: Record<RecallTier, number> = { hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
     return p[tier];
   }
 
