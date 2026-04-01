@@ -25,9 +25,58 @@ import type { TieredNode, RecallTier } from "../recaller/recall.ts";
 
 const CHARS_PER_TOKEN = 3;
 
+// ─── 统一节点合并去重（tier 优先级：active > L1 > L2 > L3 > filtered）────────────
+const TIER_PRIORITY: Record<RecallTier, number> = { active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
+
+/** mergeNodes 的输出类型：GmNode + tier，不含 TieredNode 的 score 字段 */
+type MergedNode = GmNode & { tier: RecallTier };
+
+// activeNodes: GmNode（无tier）→ tier强制为"active"
+// recalledNodes: TieredNode（有tier）→ 保留原有tier
+function mergeNodes(
+  activeNodes: GmNode[],
+  recalledNodes: TieredNode[],
+): MergedNode[] {
+  type Entry = { node: GmNode; tier: RecallTier; _priority: number };
+  const map = new Map<string, Entry>();
+
+  for (const n of recalledNodes) {
+    const tier = n.tier ?? "L3";
+    map.set(n.id, { node: n, tier, _priority: TIER_PRIORITY[tier] ?? 0 });
+  }
+
+  for (const n of activeNodes) {
+    const existing = map.get(n.id);
+    const priority = TIER_PRIORITY.active; // = 4
+    if (!existing || priority > existing._priority) {
+      map.set(n.id, { node: n, tier: "active", _priority: priority });
+    }
+  }
+
+  return Array.from(map.values()).map(({ node, tier }) => ({ ...node, tier } as MergedNode));
+}
+
+// ─── 统一边合并去重（active 优先）──────────────────────────
+function mergeEdges(activeEdges: GmEdge[], recalledEdges: GmEdge[]): GmEdge[] {
+  const seen = new Map<string, GmEdge>();
+  for (const e of recalledEdges) seen.set(e.id, e);
+  for (const e of activeEdges) seen.set(e.id, e); // active 覆盖 recalled
+  return Array.from(seen.values());
+}
+
+// ─── 边渲染判断：仅两端都不是 filtered 时渲染 ───────────────
+function shouldRenderEdge(fromTier: RecallTier, toTier: RecallTier): boolean {
+  return fromTier !== "filtered" && toTier !== "filtered";
+}
+
+// ─── 边描述判断：至少一端是 active 或 L1 时带 description ──
+function edgeHasDescription(fromTier: RecallTier, toTier: RecallTier): boolean {
+  return fromTier === "active" || fromTier === "L1" || toTier === "active" || toTier === "L1";
+}
+
 // ─── 节点输出（按 tier）────────────────────────────────────
 // L1: 完整 content；L2: description；L3: name；filtered: 不渲染
-function formatNode(n: TieredNode): string {
+function formatNode(n: MergedNode): string {
   if (n.tier === "filtered") return "";
 
   const tag = n.type.toLowerCase();
@@ -180,44 +229,57 @@ export interface AssembleParams {
 /**
  * 组装知识图谱为 XML context
  *
- * L1 (Top 15): 完整 content
- * L2 (Top 15-30): description
- * L3 (Top 30-45): name
- * filtered: 不传递
+ * 节点合并逻辑：
+ * - activeNodes + recalledNodes 合并去重，相同 id 取更高 tier（active > L1 > L2 > L3 > filtered）
  *
- * 边渲染：两端都在渲染节点中且至少一端为 L1/L2
+ * 边合并逻辑：
+ * - activeEdges + recalledEdges 合并去重，active 优先
  *
- * 组装后 PPR 重排
+ * 边渲染规则：
+ * - 两端都不是 filtered → 渲染
+ * - 至少一端是 active 或 L1 → 带 description
+ * - 否则 → 仅渲染 name
  */
 export function assembleContext(
   db: DatabaseSyncInstance,
   cfg: GmConfig | null,
   params: AssembleParams,
 ): { xml: string | null; systemPrompt: string; tokens: number; episodicXml: string; episodicTokens: number } {
-  const { recalledNodes, pprScores } = params;
+  const { recalledNodes } = params;
 
-  // ── 过滤 filtered 节点 ──────────────────────────────────
-  const passNodes = recalledNodes.filter(n => n.tier !== "filtered");
-  const passNodeIds = new Set(passNodes.map(n => n.id));
+  // ── 节点合并去重 ──────────────────────────────────────────
+  const mergedNodes = mergeNodes(params.activeNodes, recalledNodes);
+
+  // 过滤 filtered
+  const passNodes = mergedNodes.filter(n => n.tier !== "filtered");
+
+  // 无节点时返回 null
+  if (!passNodes.length) {
+    return { xml: null, systemPrompt: "", tokens: 0, episodicXml: "", episodicTokens: 0 };
+  }
+
+  // ── 边合并去重 ────────────────────────────────────────────
+  const allEdges = mergeEdges(params.activeEdges, params.recalledEdges);
+
+  // ── 构建节点 id → name 映射 ───────────────────────────────
+  const idToName = new Map<string, string>();
+  for (const n of passNodes) idToName.set(n.id, n.name);
 
   // ── 按社区分组 ──────────────────────────────────────────
-  const byCommunity = new Map<string, TieredNode[]>();
-  const noCommunity: TieredNode[] = [];
+  const byCommunity = new Map<string, typeof passNodes>();
+  const noCommunity: typeof passNodes = [];
 
   for (const n of passNodes) {
-    if (n.communityId) {
-      if (!byCommunity.has(n.communityId)) byCommunity.set(n.communityId, []);
-      byCommunity.get(n.communityId)!.push(n);
+    if ((n as any).communityId) {
+      const cid = (n as any).communityId;
+      if (!byCommunity.has(cid)) byCommunity.set(cid, []);
+      byCommunity.get(cid)!.push(n);
     } else {
       noCommunity.push(n);
     }
   }
 
   // ── 构建节点 XML ─────────────────────────────────────────
-  // L1: 完整 content；L2: description；L3: name
-  const idToName = new Map<string, string>();
-  for (const n of passNodes) idToName.set(n.id, n.name);
-
   const xmlParts: string[] = [];
 
   for (const [cid, members] of byCommunity) {
@@ -226,167 +288,95 @@ export function assembleContext(
     xmlParts.push(`  <community id="${cid}" desc="${label}">`);
 
     for (const n of members) {
-      xmlParts.push(formatNode(n));
+      const tag = n.type.toLowerCase();
+      const tier = n.tier;
+      const srcAttr = tier === "active" ? ` source="active"` : ` source="recalled"`;
+      const tierAttr = ` tier="${tier.toLowerCase()}"`;
+      const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
+
+      if (tier === "L3") {
+        xmlParts.push(`    <${tag} name="${escapeXml(n.name)}"${srcAttr}${tierAttr}${timeAttr}/>`);
+      } else if (tier === "L2" || tier === "active") {
+        xmlParts.push(`    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}/>`);
+      } else {
+        // L1
+        xmlParts.push(`    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}>\n${n.content.trim()}\n    </${tag}>`);
+      }
     }
 
     xmlParts.push(`  </community>`);
   }
 
   for (const n of noCommunity) {
-    xmlParts.push(formatNode(n));
+    const tag = n.type.toLowerCase();
+    const tier = n.tier;
+    const srcAttr = tier === "active" ? ` source="active"` : ` source="recalled"`;
+    const tierAttr = ` tier="${tier.toLowerCase()}"`;
+    const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
+
+    if (tier === "L3") {
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}"${srcAttr}${tierAttr}${timeAttr}/>`);
+    } else if (tier === "L2" || tier === "active") {
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}/>`);
+    } else {
+      // L1
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}>\n${n.content.trim()}\n  </${tag}>`);
+    }
   }
 
   // ── 构建边 XML ──────────────────────────────────────────
-  // 仅渲染：两端都在 passNodes 里 且 至少一端为 L1/L2 的边
-  const edgeIdSet = new Set<string>();
+  const seenEdgeIds = new Set<string>();
   const edgesXmlParts: string[] = [];
 
-  for (const e of params.recalledEdges) {
-    if (!passNodeIds.has(e.fromId) || !passNodeIds.has(e.toId)) continue;
+  for (const e of allEdges) {
+    if (seenEdgeIds.has(e.id)) continue;
+
     const fromNode = passNodes.find(n => n.id === e.fromId);
     const toNode = passNodes.find(n => n.id === e.toId);
-    const fromTier = fromNode?.tier ?? "filtered";
-    const toTier = toNode?.tier ?? "filtered";
-    if (fromTier === "filtered" && toTier === "filtered") continue;
-    // 至少一端为 L1 或 L2
-    const hasL1L2 = (fromTier === "L1" || fromTier === "L2") || (toTier === "L1" || toTier === "L2");
-    if (!hasL1L2) continue;
+    const fromTier = (fromNode as any)?.tier as RecallTier ?? "filtered";
+    const toTier = (toNode as any)?.tier as RecallTier ?? "filtered";
+
+    if (!shouldRenderEdge(fromTier, toTier)) continue;
+    seenEdgeIds.add(e.id);
 
     const fromName = idToName.get(e.fromId) ?? e.fromId;
     const toName = idToName.get(e.toId) ?? e.toId;
-    // 有一端为 L1 则带 description
-    const hasDescription = fromTier === "L1" || toTier === "L1";
-    if (!edgeIdSet.has(e.id)) {
-      edgeIdSet.add(e.id);
-      edgesXmlParts.push(formatEdge(e, fromName, toName, hasDescription));
-    }
+    const hasDesc = edgeHasDescription(fromTier, toTier);
+    edgesXmlParts.push(formatEdge(e, fromName, toName, hasDesc));
   }
 
   const nodesXml = xmlParts.join("\n");
   const edgesXml = edgesXmlParts.length
     ? `\n  <edges>\n${edgesXmlParts.join("\n")}\n  </edges>`
     : "";
-
   const xml = `<knowledge_graph>\n${nodesXml}${edgesXml}\n</knowledge_graph>`;
 
-  // ── activeNodes（当前 session）合并入主 xmlParts ─────────
-  const allActiveNodes = [...params.activeNodes];
-  const allActiveEdges = [...params.activeEdges];
-  const activeIds = new Set(allActiveNodes.map(n => n.id));
-
-  const activeSorted = allActiveNodes
-    .sort((a, b) => b.validatedCount - a.validatedCount);
-
-  // 无节点时返回 null（与原始行为一致）
-  if (!activeSorted.length && !passNodes.length) {
-    return { xml: null, systemPrompt: "", tokens: 0, episodicXml: "", episodicTokens: 0 };
-  }
-
-  const activeIdToName = new Map<string, string>();
-  for (const n of activeSorted) activeIdToName.set(n.id, n.name);
-
-  // active nodes 加入社区分组
-  for (const n of activeSorted) {
-    if (n.communityId) {
-      if (!byCommunity.has(n.communityId)) byCommunity.set(n.communityId, []);
-      byCommunity.get(n.communityId)!.push({ ...n, tier: "active" } as unknown as TieredNode);
-    } else {
-      noCommunity.push({ ...n, tier: "active" } as unknown as TieredNode);
-    }
-  }
-
-  // 重建 byCommunity/noCommunity 的 XML（包含 active + recalled）
-  const communityXmlParts: string[] = [];
-  const idToNameActive = new Map<string, string>();
-  for (const n of activeSorted) idToNameActive.set(n.id, n.name);
-
-  // 有社区的节点
-  for (const [cid, members] of byCommunity) {
-    const summary = getCommunitySummary(db, cid);
-    const label = summary ? escapeXml(summary.summary) : cid;
-    communityXmlParts.push(`  <community id="${cid}" desc="${label}">`);
-    for (const n of members) {
-      const tag = n.type.toLowerCase();
-      const srcAttr = n.tier === "active" ? ` source="active"` : ` source="recalled"`;
-      const tierAttr = n.tier !== "active" ? ` tier="${n.tier.toLowerCase()}"` : ` tier="active"`;
-      const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-      if (n.tier === "active") {
-        communityXmlParts.push(`    <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${tierAttr}${timeAttr}>\n${n.content.trim()}\n    </${tag}>`);
-      } else if (n.tier === "L3") {
-        communityXmlParts.push(`    <${tag} name="${n.name}"${srcAttr}${tierAttr}${timeAttr}/>`);
-      } else if (n.tier === "L2") {
-        communityXmlParts.push(`    <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${tierAttr}${timeAttr}/>`);
-      } else {
-        communityXmlParts.push(`    <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${tierAttr}${timeAttr}>\n${n.content.trim()}\n    </${tag}>`);
-      }
-    }
-    communityXmlParts.push(`  </community>`);
-  }
-
-  // 无社区的节点
-  const renderedIds = new Set<string>();
-  for (const members of byCommunity.values()) {
-    for (const n of members) renderedIds.add(n.id);
-  }
-  for (const n of noCommunity) {
-    if (renderedIds.has(n.id)) continue;
-    renderedIds.add(n.id);
-    const tag = n.type.toLowerCase();
-    const srcAttr = n.tier === "active" ? ` source="active"` : ` source="recalled"`;
-    const tierAttr = n.tier !== "active" ? ` tier="${n.tier.toLowerCase()}"` : ` tier="active"`;
-    const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-    if (n.tier === "active") {
-      xmlParts.push(`  <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${tierAttr}${timeAttr}>\n${n.content.trim()}\n  </${tag}>`);
-    } else if (n.tier === "L3") {
-      xmlParts.push(`  <${tag} name="${n.name}"${srcAttr}${tierAttr}${timeAttr}/>`);
-    } else if (n.tier === "L2") {
-      xmlParts.push(`  <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${tierAttr}${timeAttr}/>`);
-    } else {
-      xmlParts.push(`  <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${tierAttr}${timeAttr}>\n${n.content.trim()}\n  </${tag}>`);
-    }
-  }
-
-  // 社区节点加入 xmlParts
-  xmlParts.push(...communityXmlParts);
-
-  // active edges 加入 edgesXmlParts
-  const activeEdges = allActiveEdges.filter(e => activeIds.has(e.fromId) && activeIds.has(e.toId));
-  for (const e of activeEdges) {
-    const fromName = (idToNameActive.get(e.fromId) ?? idToName.get(e.fromId)) ?? e.fromId;
-    const toName = (idToNameActive.get(e.toId) ?? idToName.get(e.toId)) ?? e.toId;
-    edgesXmlParts.push(formatEdge(e, fromName, toName, true));
-  }
-
-  // 重建 xml（包含 recalled + active）
-  const nodesXmlWithActive = xmlParts.join("\n");
-  const edgesXmlWithActive = edgesXmlParts.length
-    ? `\n  <edges>\n${edgesXmlParts.join("\n")}\n  </edges>`
-    : "";
-  const xmlWithActive = `<knowledge_graph>\n${nodesXmlWithActive}${edgesXmlWithActive}\n</knowledge_graph>`;
-
-  // 收集相关边（两端都在 passNodeIds 里 且 至少一端为 L1/L2）
-  const relevantEdges = params.recalledEdges.filter(e => {
-    if (!passNodeIds.has(e.fromId) || !passNodeIds.has(e.toId)) return false;
-    const fromTier = passNodes.find(n => n.id === e.fromId)?.tier ?? "filtered";
-    const toTier = passNodes.find(n => n.id === e.toId)?.tier ?? "filtered";
-    return (fromTier === "L1" || fromTier === "L2" || toTier === "L1" || toTier === "L2");
+  // ── System prompt ─────────────────────────────────────────
+  const relevantEdges = allEdges.filter(e => {
+    if (seenEdgeIds.has(e.id)) return true;
+    const fromNode = passNodes.find(n => n.id === e.fromId);
+    const toNode = passNodes.find(n => n.id === e.toId);
+    const fromTier = (fromNode as any)?.tier as RecallTier ?? "filtered";
+    const toTier = (toNode as any)?.tier as RecallTier ?? "filtered";
+    return shouldRenderEdge(fromTier, toTier);
   });
 
   const systemPrompt = buildSystemPromptAddition({
-    selectedNodes: [
-      ...activeSorted.map(n => ({ type: n.type, src: "active" as const, tier: "active" })),
-      ...passNodes.map(n => ({ type: n.type, src: "recalled" as const, tier: n.tier })),
-    ],
-    edgeCount: relevantEdges.length + activeEdges.length,
+    selectedNodes: passNodes.map(n => ({
+      type: n.type,
+      src: (n.tier === "active" ? "active" : "recalled") as "active" | "recalled",
+      tier: n.tier.toLowerCase(),
+    })),
+    edgeCount: relevantEdges.length,
   });
 
   // ── 溯源片段：组合评分 top 3 节点 ─────────────────────────
-  const topNodes = passNodes.slice(0, 3);
+  const topNodes = passNodes.filter(n => n.tier !== "active").slice(0, 3);
   const episodicParts: string[] = [];
 
   for (const node of topNodes) {
-    if (!node.sourceSessions?.length) continue;
-    const recentSessions = node.sourceSessions.slice(-2);
+    if (!(node as any).sourceSessions?.length) continue;
+    const recentSessions = (node as any).sourceSessions.slice(-2);
     const msgs = getEpisodicMessages(db, recentSessions, node.updatedAt, 500);
     if (!msgs.length) continue;
 
@@ -400,9 +390,9 @@ export function assembleContext(
     ? `<episodic_context>\n${episodicParts.join("\n")}\n</episodic_context>`
     : "";
 
-  const fullContent = systemPrompt + "\n\n" + xmlWithActive + (episodicXml ? "\n\n" + episodicXml : "");
+  const fullContent = systemPrompt + "\n\n" + xml + (episodicXml ? "\n\n" + episodicXml : "");
   return {
-    xml: xmlWithActive,
+    xml,
     systemPrompt,
     tokens: Math.ceil(fullContent.length / CHARS_PER_TOKEN),
     episodicXml,
@@ -411,7 +401,6 @@ export function assembleContext(
 }
 
 // ─── Extract 用知识图谱 ──────────────────────────────────────
-const TIER_PRIORITY: Record<RecallTier, number> = { active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
 
 /**
  * 为 extraction 构建知识图谱 XML
@@ -435,6 +424,7 @@ export function buildExtractKnowledgeGraph(
   db: DatabaseSyncInstance,
   sessionNodes: GmNode[],
   recalledNodes: TieredNode[],
+  sessionEdges: GmEdge[],
   recalledEdges: GmEdge[],
 ): string {
   // ── 合并去重 ────────────────────────────────────────────
@@ -516,12 +506,15 @@ export function buildExtractKnowledgeGraph(
   }
 
   // ── 构建边 XML ─────────────────────────────────────────
-  // 仅渲染：两端都在 passNodes 里 且 至少一端为 L1/L2
+  // 统一处理：sessionEdges + recalledEdges 合并，对合并后的节点集应用 L1/L2 过滤
   const passIdSet = new Set(passNodes.map(e => e.node.id));
   const edgesXmlParts: string[] = [];
   const seenEdgeIds = new Set<string>();
 
-  for (const e of recalledEdges) {
+  // 合并所有边，统一去重
+  const allEdges = [...sessionEdges, ...recalledEdges];
+
+  for (const e of allEdges) {
     if (!passIdSet.has(e.fromId) || !passIdSet.has(e.toId)) continue;
     if (seenEdgeIds.has(e.id)) continue;
     seenEdgeIds.add(e.id);

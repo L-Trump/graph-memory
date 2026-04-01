@@ -83,7 +83,16 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
    5.1 只返回 JSON，格式为 {"nodes":[...],"edges":[...]}
    5.2 禁止 markdown 代码块包裹，禁止解释文字，禁止额外字段
    5.3 没有知识产出时返回 {"nodes":[],"edges":[]}
-   5.4 每条 edge 的 description 必须写具体内容，不能为空或"见上文"`;
+   5.4 每条 edge 的 description 必须写具体内容，不能为空或"见上文"
+
+6. 敏感信息保护（所有节点类型强制执行）：
+   6.1 content 和 description 中，禁止写入任何实际敏感值（密码、API Key、Token、Access Token、Secret、Credentials 等）
+   6.2 如需记录凭证，只写获取方式，例如：
+       · API Key: 从 rbw 获取（rbw get xxx）
+       · 密码: 用户在对话中提供
+       · Token: 环境变量 $OPENAI_API_KEY
+       · Credentials: 从飞书 OAuth 获取
+   6.3 凭证描述要具体到足以让未来重新获取，但不得包含实际值`;
 
 // ─── 提取 User Prompt ───────────────────────────────────────────
 // knowledgeGraph: 合并后的知识图谱 XML（session 节点 + recalled 节点 merged）

@@ -186,10 +186,17 @@ const graphMemoryPlugin = {
           if (!msgs.length) return;
 
           const sessionNodes = getBySession(db, sessionId);
+          const sessionNodeIds = new Set(sessionNodes.map(n => n.id));
+          const sessionEdges: any[] = [];
+          for (const node of sessionNodes) {
+            for (const edge of edgesFrom(db, node.id)) {
+              if (sessionNodeIds.has(edge.toId)) sessionEdges.push(edge);
+            }
+          }
           const recalledData = recalled.get(sessionId) as any;
           const recalledNodes = recalledData?.nodes ?? [];
           const recalledEdges = recalledData?.edges ?? [];
-          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, recalledEdges);
+          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, sessionEdges, recalledEdges);
 
           const result = await extractor.extract({
             messages: msgs,
@@ -375,10 +382,17 @@ const graphMemoryPlugin = {
 
         try {
           const sessionNodes = getBySession(db, sessionId);
+          const sessionNodeIds = new Set(sessionNodes.map(n => n.id));
+          const sessionEdges: any[] = [];
+          for (const node of sessionNodes) {
+            for (const edge of edgesFrom(db, node.id)) {
+              if (sessionNodeIds.has(edge.toId)) sessionEdges.push(edge);
+            }
+          }
           const recalledData = recalled.get(sessionId) as any;
           const recalledNodes = recalledData?.nodes ?? [];
           const recalledEdges = recalledData?.edges ?? [];
-          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, recalledEdges);
+          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, sessionEdges, recalledEdges);
 
           const result = await extractor.extract({
             messages: msgs,
@@ -676,6 +690,13 @@ const graphMemoryPlugin = {
 
           // ── 1. 获取本 session 已有的节点 ─────────────────────
           const sessionNodes = getBySession(db, sid);
+          const sessionNodeIds = new Set(sessionNodes.map(n => n.id));
+          const sessionEdges: any[] = [];
+          for (const node of sessionNodes) {
+            for (const edge of edgesFrom(db, node.id)) {
+              if (sessionNodeIds.has(edge.toId)) sessionEdges.push(edge);
+            }
+          }
 
           // ── 2. recallV2 召回相关节点 ────────────────────────
           const recalledResult = await recaller.recallV2(p.content);
@@ -683,7 +704,7 @@ const graphMemoryPlugin = {
           const recalledEdges = recalledResult.edges;
 
           // ── 3. 构建知识图谱（组合评分三级格式）───────────────
-          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, recalledEdges);
+          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, sessionEdges, recalledEdges);
 
           // ── 4. 模拟一条用户消息，触发提取 ───────────────────
           const simulatedMsg = {
