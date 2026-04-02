@@ -176,8 +176,201 @@ const COMMUNITY_SUMMARY_SYS = `你是知识图谱摘要引擎。根据节点列�
 - 描述涵盖的工具/技术/任务领域
 - 不要使用"社区"这个词`;
 
+const BATCH_SUMMARY_SYS = `你是知识图谱摘要引擎。根据多组节点列表，为每个社区生成简短的描述概括其主题领域。
+
+## 输入格式
+输入包含多个社区块，每个社区以 "### 社区ID" 开头，后跟该社区的所有节点。每个节点占一行，格式为：
+  类型:节点名称 — 节点描述
+
+例如：
+  ### c-1
+  SKILL:用户偏好记忆 — 记录用户的偏好设置和习惯
+  TASK:生日提醒设置 — 设置提醒的自动化任务
+  KNOWLEDGE:NixOS系统配置 — NixOS 相关配置经验
+
+  ### c-2
+  EVENT:Gateway重启 — 网关服务重启事件
+
+## 输出要求
+- 输出严格的 JSON 对象，键是社区 ID（如 c-1），值是该社区的简短摘要
+- 每个摘要只返回短语本身，不要解释
+- 描述涵盖的工具/技术/任务领域
+- 不要使用"社区"这个词
+- 必须为每个输入的社区都生成一个摘要`;
+
+interface BatchCommunity {
+  id: string;
+  members: any[];
+  memberIds: string[];
+}
+
+/**
+ * 提取社区成员信息（带缓存）
+ */
+function getCommunityMembers(db: DatabaseSyncInstance, communityId: string, memberIds: string[]): any[] {
+  if (memberIds.length === 0) return [];
+  
+  const placeholders = memberIds.map(() => "?").join(",");
+  return db.prepare(`
+    SELECT name, type, description FROM gm_nodes
+    WHERE id IN (${placeholders}) AND status='active'
+    ORDER BY validated_count DESC
+    LIMIT 10
+  `).all(...memberIds) as any[];
+}
+
+/**
+ * 清理 LLM 返回的摘要
+ */
+function cleanSummary(summary: string): string {
+  return summary
+    .trim()
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")  // 去掉思维链
+    .replace(/<think>[\s\S]*/gi, "")              // 去掉未闭合的 <think>
+    .replace(/^["'「」]|["'「」]$/g, "")
+    .replace(/\n/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+    .slice(0, 100);
+}
+
+/**
+ * 处理单个社区（降级用）
+ */
+async function processSingleCommunity(
+  db: DatabaseSyncInstance,
+  communityId: string,
+  memberIds: string[],
+  llm: CompleteFn,
+  embedFn?: EmbedFn,
+): Promise<boolean> {
+  if (memberIds.length === 0) return false;
+  
+  const members = getCommunityMembers(db, communityId, memberIds);
+  if (members.length === 0) return false;
+  
+  const memberText = members
+    .map((m: any) => `${m.type}:${m.name} — ${m.description}`)
+    .join("\n");
+  
+  try {
+    const summary = await llm(
+      COMMUNITY_SUMMARY_SYS,
+      `社区成员：\n${memberText}`,
+    );
+    
+    const cleaned = cleanSummary(summary);
+    if (cleaned.length === 0) return false;
+    
+    // 生成 embedding
+    let embedding: number[] | undefined;
+    if (embedFn) {
+      try {
+        const embedText = `${cleaned}\n${members.map((m: any) => m.name).join(", ")}`;
+        embedding = await embedFn(embedText);
+      } catch {
+        if (process.env.GM_DEBUG) {
+          console.log(`  [DEBUG] community embedding failed for ${communityId}`);
+        }
+      }
+    }
+    
+    upsertCommunitySummary(db, communityId, cleaned, memberIds.length, embedding);
+    return true;
+  } catch (err) {
+    console.log(`  [WARN] community summary failed for ${communityId}: ${err}`);
+    return false;
+  }
+}
+
+/**
+ * 批量处理多个社区（一次 LLM 调用）
+ */
+async function processBatch(
+  db: DatabaseSyncInstance,
+  batch: BatchCommunity[],
+  llm: CompleteFn,
+  embedFn?: EmbedFn,
+): Promise<number> {
+  if (batch.length === 0) return 0;
+  
+  // 构建批量输入
+  const batchInput = batch.map(c => {
+    const memberText = c.members
+      .map((m: any) => `${m.type}:${m.name} — ${m.description}`)
+      .join("\n");
+    return `### ${c.id}\n${memberText}`;
+  }).join("\n\n");
+  
+  try {
+    const response = await llm(BATCH_SUMMARY_SYS, batchInput);
+    
+    // 尝试解析 JSON
+    let summaries: Record<string, string>;
+    try {
+      summaries = JSON.parse(response);
+    } catch {
+      // JSON 解析失败，降级为单个处理
+      if (process.env.GM_DEBUG) {
+        console.log(`  [DEBUG] batch JSON parse failed, falling back to single processing`);
+      }
+      let success = 0;
+      for (const c of batch) {
+        if (await processSingleCommunity(db, c.id, c.memberIds, llm, embedFn)) {
+          success++;
+        }
+      }
+      return success;
+    }
+    
+    // 处理每个社区的摘要
+    let success = 0;
+    for (const c of batch) {
+      const rawSummary = summaries[c.id];
+      if (!rawSummary) continue;
+      
+      const cleaned = cleanSummary(rawSummary);
+      if (cleaned.length === 0) continue;
+      
+      // 生成 embedding
+      let embedding: number[] | undefined;
+      if (embedFn) {
+        try {
+          const embedText = `${cleaned}\n${c.members.map((m: any) => m.name).join(", ")}`;
+          embedding = await embedFn(embedText);
+        } catch {
+          if (process.env.GM_DEBUG) {
+            console.log(`  [DEBUG] community embedding failed for ${c.id}`);
+          }
+        }
+      }
+      
+      upsertCommunitySummary(db, c.id, cleaned, c.memberIds.length, embedding);
+      success++;
+    }
+    
+    return success;
+  } catch (err) {
+    console.log(`  [WARN] batch processing failed: ${err}`);
+    // 降级为单个处理
+    let success = 0;
+    for (const c of batch) {
+      if (await processSingleCommunity(db, c.id, c.memberIds, llm, embedFn)) {
+        success++;
+      }
+    }
+    return success;
+  }
+}
+
 /**
  * 为所有社区生成 LLM 摘要描述 + embedding 向量
+ * 
+ * 批量策略：
+ * - maxNodesPerBatch: 每批最多节点数（默认 50，最多 100）
+ * - 按节点数分批，而非按社区数
+ * - 智能跳过：加入社区后超限，则跳过该社区，开始批量执行
+ * - 超大社区（>maxNodesPerBatch）：单独处理
  *
  * 调用时机：runMaintenance → detectCommunities 之后
  */
@@ -186,64 +379,80 @@ export async function summarizeCommunities(
   communities: Map<string, string[]>,
   llm: CompleteFn,
   embedFn?: EmbedFn,
+  maxNodesPerBatch = 50,
 ): Promise<number> {
+  // 限制最大批次大小
+  maxNodesPerBatch = Math.min(maxNodesPerBatch, 100);
+  
   pruneCommunitySummaries(db);
-  let generated = 0;
-
+  
+  // 预处理：获取所有社区的成员信息
+  const communityData: BatchCommunity[] = [];
   for (const [communityId, memberIds] of communities) {
     if (memberIds.length === 0) continue;
-
-    const placeholders = memberIds.map(() => "?").join(",");
-    const members = db.prepare(`
-      SELECT name, type, description FROM gm_nodes
-      WHERE id IN (${placeholders}) AND status='active'
-      ORDER BY validated_count DESC
-      LIMIT 10
-    `).all(...memberIds) as any[];
-
+    const members = getCommunityMembers(db, communityId, memberIds);
     if (members.length === 0) continue;
-
-    const memberText = members
-      .map((m: any) => `${m.type}:${m.name} — ${m.description}`)
-      .join("\n");
-
-    try {
-      // LLM 生成描述
-      const summary = await llm(
-        COMMUNITY_SUMMARY_SYS,
-        `社区成员：\n${memberText}`,
-      );
-
-      const cleaned = summary.trim()
-        .replace(/<think>[\s\S]*?<\/think>/gi, "")  // 去掉思维链
-        .replace(/<think>[\s\S]*/gi, "")              // 去掉未闭合的 <think>
-        .replace(/^["'「」]|["'「」]$/g, "")
-        .replace(/\n/g, " ")
-        .replace(/\s{2,}/g, " ")
-        .trim()
-        .slice(0, 100);
-
-      if (cleaned.length === 0) continue;
-
-      // 生成社区 embedding（用描述 + 成员名拼接）
-      let embedding: number[] | undefined;
-      if (embedFn) {
-        try {
-          const embedText = `${cleaned}\n${members.map((m: any) => m.name).join(", ")}`;
-          embedding = await embedFn(embedText);
-        } catch {
-          if (process.env.GM_DEBUG) {
-            console.log(`  [DEBUG] community embedding failed for ${communityId}`);
-          }
-        }
-      }
-
-      upsertCommunitySummary(db, communityId, cleaned, memberIds.length, embedding);
-      generated++;
-    } catch (err) {
-      console.log(`  [WARN] community summary failed for ${communityId}: ${err}`);
-    }
+    communityData.push({ id: communityId, members, memberIds });
   }
-
+  
+  // 分批处理
+  const batches: BatchCommunity[][] = [];
+  let currentBatch: BatchCommunity[] = [];
+  let currentNodeCount = 0;
+  
+  for (const c of communityData) {
+    const nodeCount = c.memberIds.length; // 用 memberIds.length 而非 members.length（LIMIT 会截断 members）
+    
+    // 超大社区（>maxNodesPerBatch）：单独成批
+    if (nodeCount > maxNodesPerBatch) {
+      // 先处理当前批次
+      if (currentBatch.length > 0) {
+        batches.push(currentBatch);
+        currentBatch = [];
+        currentNodeCount = 0;
+      }
+      // 这个超大社区单独成批
+      batches.push([c]);
+      continue;
+    }
+    
+    // 加入后超限：开始当前批次，跳过这个社区
+    if (currentNodeCount + nodeCount > maxNodesPerBatch) {
+      if (currentBatch.length > 0) {
+        batches.push(currentBatch);
+      }
+      currentBatch = [c];
+      currentNodeCount = nodeCount;
+      continue;
+    }
+    
+    // 正常加入批次
+    currentBatch.push(c);
+    currentNodeCount += nodeCount;
+  }
+  
+  // 处理最后的批次
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
+  }
+  
+  if (process.env.GM_DEBUG) {
+    console.log(`  [DEBUG] community summarization: ${communityData.length} communities → ${batches.length} batches`);
+  }
+  
+  // 执行批量处理
+  let generated = 0;
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const batchNodeCount = batch.reduce((sum, c) => sum + c.memberIds.length, 0);
+    
+    if (process.env.GM_DEBUG) {
+      console.log(`  [DEBUG] batch ${i + 1}: ${batch.length} communities, ${batchNodeCount} nodes`);
+    }
+    
+    const success = await processBatch(db, batch, llm, embedFn);
+    generated += success;
+  }
+  
   return generated;
 }

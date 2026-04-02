@@ -8,13 +8,13 @@
 /**
  * graph-memory 类型定义
  *
- * 节点：TASK / SKILL / EVENT / KNOWLEDGE
+ * 节点：TASK / SKILL / EVENT / KNOWLEDGE / STATUS
  * 边：USED_SKILL / SOLVED_BY / REQUIRES / PATCHES / CONFLICTS_WITH
  */
 
 // ─── 节点 ─────────────────────────────────────────────────────
 
-export type NodeType = "TASK" | "SKILL" | "EVENT" | "KNOWLEDGE";
+export type NodeType = "TASK" | "SKILL" | "EVENT" | "KNOWLEDGE" | "STATUS";
 export type NodeStatus = "active" | "deprecated";
 
 export interface GmNode {

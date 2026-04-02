@@ -140,6 +140,7 @@ export function buildSystemPromptAddition(params: {
   const eventCount = selectedNodes.filter(n => n.type === "EVENT").length;
   const taskCount = selectedNodes.filter(n => n.type === "TASK").length;
   const knowledgeCount = selectedNodes.filter(n => n.type === "KNOWLEDGE").length;
+  const statusCount = selectedNodes.filter(n => n.type === "STATUS").length;
   const isRich = selectedNodes.length >= 4 || edgeCount >= 3;
 
   const sections: string[] = [];
@@ -150,7 +151,7 @@ export function buildSystemPromptAddition(params: {
     "Below `<knowledge_graph>` is your accumulated experience from past conversations.",
     "It contains structured knowledge — NOT raw conversation history.",
     "",
-    `Current graph: ${taskCount} tasks, ${skillCount} skills, ${eventCount} events, ${knowledgeCount} knowledge, ${edgeCount} relationships.`,
+    `Current graph: ${taskCount} tasks, ${skillCount} skills, ${eventCount} events, ${knowledgeCount} knowledge, ${statusCount} status, ${edgeCount} relationships.`,
   );
 
   if (hasRecalled) {

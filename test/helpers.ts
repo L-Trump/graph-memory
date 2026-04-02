@@ -113,6 +113,26 @@ export function createTestDb(): DatabaseSyncInstance {
     );
   `);
 
+  // m6: 社区描述
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_communities (
+      id          TEXT PRIMARY KEY,
+      summary     TEXT NOT NULL,
+      node_count  INTEGER NOT NULL DEFAULT 0,
+      embedding   BLOB,
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+  `);
+
+  // m7: 社区检测（由 runMaintenance 生成）
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS community_detection (
+      node_id     TEXT PRIMARY KEY,
+      member_ids  TEXT NOT NULL DEFAULT '[]'
+    );
+  `);
+
   return db;
 }
 

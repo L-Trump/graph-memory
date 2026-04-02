@@ -715,14 +715,29 @@ const graphMemoryPlugin = {
           // ── 3. 构建知识图谱（组合评分三级格式）───────────────
           const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, sessionEdges, recalledEdges);
 
-          // ── 4. 模拟一条用户消息，触发提取 ───────────────────
-          const simulatedMsg = {
-            role: "user",
-            turn_index: 0,
-            content: p.content,
-          };
+          // ── 4. 构造带系统指令的消息序列，触发提取 ───────────
+          // system: 明确 gm_record 的提取规则，覆盖默认的会话提取行为
+          // user:   原始记录内容
+          const recordSysPrompt = `【记忆记录指令 — 仅在执行 gm_record 时使用】
+
+当你收到用户通过 gm_record 工具主动提交的记忆内容时，严格按以下规则处理：
+
+1. 创建新记忆：仔细分析用户提供的记忆内容，创建能够准确反映原始语义的记忆节点。每个记忆节点必须包含完整的 name、type、description 和 content。
+
+2. 去重与合并：如果待创建的记忆与已有记忆在语义上重叠或重复，请将该记忆的内容与已有记忆的内容进行语义合并，然后通过同名节点的方式更新（对应程序中的 upsert 语义，相同 name 的节点会被覆盖而非重复创建）。
+
+3. 允许多节点：允许对复杂内容进行语义切分，创建多个独立的记忆节点，只要它们各自有独立的语义即可。不要强行把不相关的内容合并到一个节点。
+
+4. 语义覆盖完整性：创建的节点内容必须能够完整覆盖用户传入的原始语义，不得遗漏关键信息。
+
+5. 提取范围：仅从下方【待记录内容】中提取知识，不要自行补充或扩展无关内容。`;
+
+          const simulatedMsgs = [
+            { role: "system", turn_index: 0, content: recordSysPrompt },
+            { role: "user",   turn_index: 1, content: `【待记录内容】\n${p.content}` },
+          ];
           const result = await extractor.extract({
-            messages: [simulatedMsg],
+            messages: simulatedMsgs,
             knowledgeGraph,
           });
 

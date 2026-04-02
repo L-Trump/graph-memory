@@ -52,12 +52,18 @@ export async function runMaintenance(
   const communityResult = detectCommunities(db);
 
   // 4. 社区描述生成（需要 LLM）
+  // TODO: 当前只处理成员数≥3 的社区，避免大量单节点社区导致 LLM 调用爆炸
+  // 后续优化方向：批量生成摘要（一次 LLM 调用处理多个社区）或增强边提取减少孤岛节点
   let communitySummaries = 0;
-  if (llm && communityResult.communities.size > 0) {
+  const significantCommunities = new Map(
+    Array.from(communityResult.communities.entries())
+      .filter(([_, members]) => members.length >= 3)
+  );
+  if (llm && significantCommunities.size > 0) {
     try {
-      communitySummaries = await summarizeCommunities(db, communityResult.communities, llm, embedFn);
+      communitySummaries = await summarizeCommunities(db, significantCommunities, llm, embedFn);
       if (process.env.GM_DEBUG) {
-        console.log(`  [DEBUG] maintenance: generated ${communitySummaries} community summaries`);
+        console.log(`  [DEBUG] maintenance: generated ${communitySummaries} community summaries (from ${significantCommunities.size} communities with ≥3 members)`);
       }
     } catch (err) {
       if (process.env.GM_DEBUG) {

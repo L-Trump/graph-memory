@@ -10,7 +10,7 @@ import type { CompleteFn } from "../engine/llm.ts";
 
 // ─── 节点合法类型 ──────────────────────────────────────────────
 
-const VALID_NODE_TYPES = new Set(["TASK", "SKILL", "EVENT", "KNOWLEDGE"]);
+const VALID_NODE_TYPES = new Set(["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"]);
 
 // ─── 提取 System Prompt ─────────────────────────────────────────
 
@@ -19,13 +19,14 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
 输出严格 JSON：{"nodes":[...],"edges":[...]}，不包含任何额外文字。
 
 1. 节点提取：
-   1.1 从对话中识别四类知识节点：
+   1.1 从对话中识别五类知识节点：
        - TASK：用户要求 Agent 完成的具体任务，或对话中讨论，分析、对比的主题
        - SKILL：可复用的操作技能，有具体工具/命令/API，有明确触发条件，步骤可直接执行
        - EVENT：一次性的报错或异常，记录现象、原因和解决方法
        - KNOWLEDGE：专业领域知识，有明确适用范围和条件，排除 LLM 本身已知的常识（如太阳东升西落、基本物理定律、常见数学结论等）
+       - STATUS：时效性强的快照、状态或新闻类内容，记完即用，不需要纠错，不期待后续迭代（如系统配置、版本号、一次性事件记录）
    1.2 每个节点必须包含 4 个字段，缺一不可：
-       - type：节点类型，只允许 TASK / SKILL / EVENT / KNOWLEDGE
+       - type：节点类型，只允许 TASK / SKILL / EVENT / KNOWLEDGE / STATUS
        - name：全小写连字符命名，确保整个提取过程命名一致
        - description：一句话说明什么场景触发
        - content：纯文本格式的知识内容（见 1.3 的模板）
@@ -34,12 +35,14 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
        - SKILL：工具-操作格式，如 conda-env-create、docker-port-expose
        - EVENT：现象-工具格式，如 importerror-libgl1、timeout-paddleocr
        - KNOWLEDGE：领域-主题格式，如 analog-cs-amplifier-noise-analysis、analog-cs-bandgap-reference-design
+       - STATUS：【场景-状态描述-YYYYMMDDHHMM】，如 system-nixos-version-202604021405、feishu-group-purpose-oc123-20260402
        - 已有节点列表会提供，相同事物必须复用已有 name，不得创建重复节点
    1.4 content 模板（纯文本，按 type 选用）：
        TASK → "[name]\n目标: ...\n执行步骤:\n1. ...\n2. ...\n结果: ..."
        SKILL → "[name]\n触发条件: ...\n执行步骤:\n1. ...\n2. ...\n常见错误:\n- ... -> ..."
        EVENT → "[name]\n现象: ...\n原因: ...\n解决方法: ..."
        KNOWLEDGE → "[name]\n适用条件: ...\n核心内容:\n1. ...\n2. ...\n注意事项:\n- ..."
+       STATUS → "[name]\n记录时间: ...\n快照内容:\n- ...\n备注:\n- ..."
 
 2. 关系提取（边）：
    2.1 识别节点之间直接、明确的关系（参考知识图谱中已有的边作为上下文）。
@@ -51,11 +54,12 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
 3. 知识图谱 XML 结构说明（仅供参考，不要在输出中重复这些标签）：
    知识图谱以 XML 格式呈现，节点和边分别用不同标签表示：
 
-   节点标签（4 种，对应 4 种节点类型）：
+   节点标签（5 种，对应 5 种节点类型）：
      <task name="节点名" desc="描述" tier="l1|l2|l3">内容</task>
      <skill name="节点名" desc="描述" tier="l1|l2|l3">内容</skill>
      <event name="节点名" desc="描述" tier="l1|l2|l3">内容</event>
      <knowledge name="节点名" desc="描述" tier="l1|l2|l3">内容</knowledge>
+     <status name="节点名" desc="描述" tier="l1|l2|l3">内容</status>
      - tier 表示节点重要度：l1 最高（有完整 content）、l2（仅 description）、l3（仅 name）
      - 自闭合标签（如 <task .../>）表示该节点仅含 description，无完整 content
 
@@ -78,6 +82,7 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
      → 正常提取，不做特殊处理
    4.5 所有对话内容都应尝试提取，包括讨论、分析、对比、方案选型等
    4.6 只有纯粹的寒暄问候（如"你好""谢谢"）或者是显而易见的常识（比如太阳东升西落）才不提取
+   4.7 【STATUS 特殊规则】STATUS 节点不合并、不覆盖，永远用新的时间戳创建新节点
 
 5. 输出规范：
    5.1 只返回 JSON，格式为 {"nodes":[...],"edges":[...]}
