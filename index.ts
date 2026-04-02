@@ -801,7 +801,7 @@ const graphMemoryPlugin = {
 
           const text = [
             `知识图谱统计`,
-            `节点：${stats.totalNodes} 个 (${Object.entries(stats.byType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
+            `节点：${stats.totalNodes} 个 (${["TASK","SKILL","EVENT","KNOWLEDGE","STATUS"].map(t => `${t}: ${stats.byType[t] ?? 0}`).join(", ")})`,
             `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `社区：${stats.communities} 个`,
             `Hot 节点：${stats.hotNodes} 个`,

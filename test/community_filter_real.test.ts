@@ -12,7 +12,7 @@ const DB_PATH = process.env.HOME + "/.openclaw/graph-memory.db";
 
 describe("真实数据库社区过滤验证", () => {
   it("maintenance.ts 中的过滤逻辑会过滤掉 92% 的小社区", () => {
-    const db = new DatabaseSync(DB_PATH, { readonly: true });
+    const db = new DatabaseSync(DB_PATH, { readOnly: true });
 
     // 模拟 maintenance.ts 中的 detectCommunities
     const result = detectCommunities(db);
@@ -39,7 +39,7 @@ describe("真实数据库社区过滤验证", () => {
   });
 
   it("但 summarizeCommunities 本身没有过滤，会处理所有传入的社区", () => {
-    const db = new DatabaseSync(DB_PATH, { readonly: true });
+    const db = new DatabaseSync(DB_PATH, { readOnly: true });
 
     const result = detectCommunities(db);
     console.log(`\n直接传入 summarizeCommunities 的社区数: ${result.communities.size}`);

@@ -5,7 +5,8 @@
 
 import { describe, test, expect, beforeEach } from "vitest";
 import { summarizeCommunities } from "../src/graph/community";
-import type { CompleteFn, EmbedFn } from "../src/types";
+import type { CompleteFn } from "../src/engine/llm";
+import type { EmbedFn } from "../src/engine/embed";
 import { createTestDb, insertNode } from "./helpers.ts";
 
 describe('BATCH_SUMMARY_SYS 提示词格式验证', () => {

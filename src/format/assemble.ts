@@ -169,7 +169,7 @@ export function buildSystemPromptAddition(params: {
     "This is a context engine. The following was retrieved by semantic search for the current message:",
     "",
     "- **`<episodic_context>`** — Trimmed conversation traces from sessions that produced the knowledge nodes, ordered by time.",
-    "- **`<knowledge_graph>`** — Relevant triples (TASK/SKILL/EVENT) and edges, grouped by community.",
+    "- **`<knowledge_graph>`** — Relevant triples (TASK/SKILL/EVENT/KNOWLEDGE/STATUS) and edges, grouped by community.",
     "- **Recent 5 turns** — Last turn in full, previous 4 turns as user+assistant text only.",
     "",
     "Read this context first. Use `gm_search` only if insufficient. Use `gm_record` to save new knowledge.",

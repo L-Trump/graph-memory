@@ -200,7 +200,7 @@ async function main() {
   const l1Matches = (assembledXml.match(/tier="l1"/g) || []).length;
   const l2Matches = (assembledXml.match(/tier="l2"/g) || []).length;
   const l3Matches = (assembledXml.match(/tier="l3"/g) || []).length;
-  const totalTags = (assembledXml.match(/<task|<skill|<event|<knowledge/gi) || []).length;
+  const totalTags = (assembledXml.match(/<task|<skill|<event|<knowledge|<status/gi) || []).length;
 
   console.log(`Tier 标签分布：L1=${l1Matches}, L2=${l2Matches}, L3=${l3Matches}`);
   console.log(`总节点标签：${totalTags}`);

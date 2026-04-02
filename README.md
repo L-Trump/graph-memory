@@ -97,7 +97,7 @@ v2.0 ships a **Windows installer** (`.exe`). Download from [Releases](https://gi
 
 graph-memory builds a typed property graph from conversations:
 
-- **3 node types**: `TASK` (what was done), `SKILL` (how to do it), `EVENT` (what went wrong)
+- **5 node types**: `TASK` (what was done), `SKILL` (how to do it), `EVENT` (what went wrong), `KNOWLEDGE` (domain knowledge with scope), `STATUS` (time-sensitive snapshots)
 - **5 edge types**: `USED_SKILL`, `SOLVED_BY`, `REQUIRES`, `PATCHES`, `CONFLICTS_WITH`
 - **Personalized PageRank**: ranks nodes by relevance to the current query, not global popularity
 - **Community detection**: automatically groups related skills (Docker cluster, Python cluster, etc.)

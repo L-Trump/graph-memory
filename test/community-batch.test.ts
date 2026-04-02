@@ -11,7 +11,8 @@
 import { describe, test, expect, beforeEach } from "vitest";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { summarizeCommunities } from "../src/graph/community";
-import type { CompleteFn, EmbedFn } from "../src/types";
+import type { CompleteFn } from "../src/engine/llm";
+import type { EmbedFn } from "../src/engine/embed";
 import { createTestDb, insertNode } from "./helpers.ts";
 
 // 模拟 LLM 调用（返回 mock 摘要）

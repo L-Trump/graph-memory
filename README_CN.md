@@ -99,7 +99,7 @@ v2.0 提供 **Windows 安装包**（`.exe`）。从 [Releases](https://github.co
 
 graph-memory 从对话中构建类型化属性图：
 
-- **3 种节点**: `TASK`（做了什么）、`SKILL`（怎么做的）、`EVENT`（出了什么问题）
+- **5 种节点**: `TASK`（做了什么）、`SKILL`（怎么做的）、`EVENT`（出了什么问题）、`KNOWLEDGE`（有明确适用范围的领域知识）、`STATUS`（时效性强的快照状态）
 - **5 种边**: `USED_SKILL`、`SOLVED_BY`、`REQUIRES`、`PATCHES`、`CONFLICTS_WITH`
 - **个性化 PageRank**: 根据当前查询动态排序，不是全局固定排名
 - **社区检测**: 自动将相关技能分组（Docker 集群、Python 集群等）

@@ -22,7 +22,7 @@ export function createTestDb(): DatabaseSyncInstance {
   db.exec(`
     CREATE TABLE IF NOT EXISTS gm_nodes (
       id              TEXT PRIMARY KEY,
-      type            TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT','KNOWLEDGE')),
+      type            TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT','KNOWLEDGE','STATUS')),
       name            TEXT NOT NULL,
       description     TEXT NOT NULL DEFAULT '',
       content         TEXT NOT NULL,
