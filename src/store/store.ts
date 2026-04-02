@@ -100,18 +100,24 @@ export function upsertNode(
     const content = c.content;
     const desc = c.description;
     const count = ex.validatedCount + 1;
+    // flags 合并：已有 flags 保留，与新传入的 flags 做 union
+    const mergedFlags = JSON.stringify(
+      Array.from(new Set([...ex.flags, ...(c.flags ?? [])]))
+    );
+    // deprecated 节点被重新引用时自动复活
+    const status = ex.status === 'deprecated' ? 'active' : ex.status;
     db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
-      source_sessions=?, updated_at=? WHERE id=?`)
-      .run(content, desc, count, sessions, Date.now(), ex.id);
-    return { node: { ...ex, content, description: desc, validatedCount: count }, isNew: false };
+      source_sessions=?, flags=?, status=?, updated_at=? WHERE id=?`)
+      .run(content, desc, count, sessions, mergedFlags, status, Date.now(), ex.id);
+    return { node: { ...ex, content, description: desc, validatedCount: count, status, flags: JSON.parse(mergedFlags) }, isNew: false };
   }
 
   const id = uid("n");
   const flags = JSON.stringify(c.flags ?? []);
   db.prepare(`INSERT INTO gm_nodes
     (id, type, name, description, content, status, validated_count, source_sessions, flags, created_at, updated_at)
-    VALUES (?,?,?,?,?,'active',1,?,?,?,?)`)
-    .run(id, c.type, name, c.description, c.content, JSON.stringify([sessionId]), flags, Date.now(), Date.now());
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, c.type, name, c.description, c.content, 'active', 1, JSON.stringify([sessionId]), flags, Date.now(), Date.now());
   return { node: findByName(db, name)!, isNew: true };
 }
 
@@ -124,8 +130,10 @@ export function deprecate(db: DatabaseSyncInstance, nodeId: string): void {
 export function setNodeFlags(db: DatabaseSyncInstance, nodeId: string, flags: string[]): boolean {
   const node = findById(db, nodeId);
   if (!node) return false;
-  db.prepare("UPDATE gm_nodes SET flags=?, updated_at=? WHERE id=?")
-    .run(JSON.stringify(flags), Date.now(), nodeId);
+  // deprecated 节点设 flags 时自动复活
+  const status = node.status === 'deprecated' ? 'active' : node.status;
+  db.prepare("UPDATE gm_nodes SET flags=?, status=?, updated_at=? WHERE id=?")
+    .run(JSON.stringify(flags), status, Date.now(), nodeId);
   return true;
 }
 

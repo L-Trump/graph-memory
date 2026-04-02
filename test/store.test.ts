@@ -15,6 +15,7 @@ import {
   saveMessage, getMessages, getUnextracted, markExtracted,
   saveSignal, pendingSignals, markSignalsDone,
   getStats, saveVector, vectorSearch, getAllVectors,
+  setNodeFlags,
 } from "../src/store/store.ts";
 
 let db: DatabaseSyncInstance;
@@ -69,6 +70,27 @@ describe("node CRUD", () => {
     expect(found!.name).toBe("docker-port-expose");
   });
 
+  it("upsertNode UPDATE 时合并 flags（union），不覆盖已有 flags", () => {
+    // 第一次插入，带 flags
+    const { node: n1 } = upsertNode(db, {
+      type: "TASK", name: "flag-test",
+      description: "测试 flags 合并", content: "内容",
+      flags: ["hot"],
+    }, "s1");
+    expect(n1.flags).toContain("hot");
+
+    // 第二次用不同 session 更新，传入不同 flags
+    const { node: n2, isNew } = upsertNode(db, {
+      type: "TASK", name: "flag-test",
+      description: "更新描述", content: "新内容",
+      flags: ["reviewed"],
+    }, "s2");
+    expect(isNew).toBe(false);
+    // 两次 flags 都保留（union）
+    expect(n2.flags).toContain("hot");
+    expect(n2.flags).toContain("reviewed");
+  });
+
   it("deprecate 标记节点失效", () => {
     const { node } = upsertNode(db, {
       type: "EVENT", name: "old-error",
@@ -78,6 +100,40 @@ describe("node CRUD", () => {
     deprecate(db, node.id);
     const after = findById(db, node.id);
     expect(after!.status).toBe("deprecated");
+  });
+
+  it("upsertNode 复活 deprecated 节点", () => {
+    // 第一次插入
+    const { node: n1 } = upsertNode(db, {
+      type: "TASK", name: "revive-test",
+      description: "v1", content: "内容",
+    }, "s1");
+    // 标记为 deprecated
+    deprecate(db, n1.id);
+    // 再次 upsert 同一 name，节点应自动复活
+    const { node: n2, isNew } = upsertNode(db, {
+      type: "TASK", name: "revive-test",
+      description: "v2", content: "新内容",
+    }, "s1");
+    expect(isNew).toBe(false);
+    expect(n2.status).toBe("active");
+    expect(n2.description).toBe("v2");
+    expect(n2.content).toBe("新内容");
+  });
+
+  it("setNodeFlags 复活 deprecated 节点", () => {
+    // 第一次插入
+    const { node } = upsertNode(db, {
+      type: "TASK", name: "revive-test-2",
+      description: "待复活", content: "内容",
+    }, "s1");
+    // 标记为 deprecated
+    deprecate(db, node.id);
+    // 通过 setNodeFlags 复活
+    setNodeFlags(db, node.id, ["hot"]);
+    const after = findByName(db, "revive-test-2");
+    expect(after!.status).toBe("active");
+    expect(after!.flags).toContain("hot");
   });
 
   it("findByName 找不到返回 null", () => {
