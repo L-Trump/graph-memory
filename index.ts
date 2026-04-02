@@ -854,7 +854,7 @@ const graphMemoryPlugin = {
           }
           const lines = hotNodes.map((n: any) => {
             const flagsStr = n.flags?.length ? ` [${n.flags.map((f: string) => `"${f}"`).join(", ")}]` : "";
-            return `[${n.type}] ${n.name}${flagsStr}\n  ${n.description || "(无描述)"}`;
+            return `[${n.type}] ${n.name}${flagsStr}\n  ${n.description || "(无描述)"}\n  ${(n.content || "").slice(0, 500)}${(n.content || "").length > 500 ? "..." : ""}`;
           });
           const text = [
             `当前共有 ${hotNodes.length} 个 hot 节点：`,
