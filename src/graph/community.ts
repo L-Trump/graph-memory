@@ -381,6 +381,8 @@ export async function summarizeCommunities(
   embedFn?: EmbedFn,
   maxNodesPerBatch = 50,
 ): Promise<number> {
+  // [DISABLED] 社区太稀疏，社区数过多，summarize 会导致 LLM 调用爆炸，暂返 0
+  return 0;
   // 限制最大批次大小
   maxNodesPerBatch = Math.min(maxNodesPerBatch, 100);
   
