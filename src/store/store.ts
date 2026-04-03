@@ -211,6 +211,11 @@ export function upsertEdge(
   db: DatabaseSyncInstance,
   e: { fromId: string; toId: string; name: string; description: string; sessionId: string },
 ): void {
+  // 跳过连接到 deprecated 节点的边
+  const fromNode = db.prepare("SELECT status FROM gm_nodes WHERE id=?").get(e.fromId) as any;
+  const toNode = db.prepare("SELECT status FROM gm_nodes WHERE id=?").get(e.toId) as any;
+  if (!fromNode || !toNode || fromNode.status === "deprecated" || toNode.status === "deprecated") return;
+
   // 灵活边：同 from+to+name 即视为重复（不用 type 列）
   const ex = db.prepare("SELECT id FROM gm_edges WHERE from_id=? AND to_id=? AND name=?")
     .get(e.fromId, e.toId, e.name) as any;

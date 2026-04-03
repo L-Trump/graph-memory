@@ -344,4 +344,35 @@ describe("getBySession", () => {
     expect(result).toHaveLength(1);
     expect(result[0].name).toBe("node-s1");
   });
+
+  // ═══════════════════════════════════════════════════════════════
+  // upsertEdge 跳过 deprecated 节点
+  // ═══════════════════════════════════════════════════════════════
+
+  it("upsertEdge 跳过连接到 deprecated 节点的边", () => {
+    // 创建两个节点
+    upsertNode(db, { type: "KNOWLEDGE", name: "node-a", description: "a", content: "a", sessionId: "s1", importance: 0.8 });
+    upsertNode(db, { type: "KNOWLEDGE", name: "node-b", description: "b", content: "b", sessionId: "s1", importance: 0.8 });
+    upsertNode(db, { type: "KNOWLEDGE", name: "node-c", description: "c", content: "c", sessionId: "s1", importance: 0.8 });
+
+    const aId = findByName(db, "node-a")!.id;
+    const bId = findByName(db, "node-b")!.id;
+    const cId = findByName(db, "node-c")!.id;
+
+    // 把 node-b 标记为 deprecated
+    deprecate(db, bId);
+
+    // 建三条边：a→b（deprecated）、a→c（active）、b→c（deprecated）
+    upsertEdge(db, { fromId: aId, toId: bId, name: "ab-edge", description: "应被跳过", sessionId: "s1" });
+    upsertEdge(db, { fromId: aId, toId: cId, name: "ac-edge", description: "应被创建", sessionId: "s1" });
+    upsertEdge(db, { fromId: bId, toId: cId, name: "bc-edge", description: "应被跳过", sessionId: "s1" });
+
+    const edges = db.prepare("SELECT * FROM gm_edges ORDER BY name").all() as any[];
+
+    // 只有 a→c 这条边应该存在
+    expect(edges).toHaveLength(1);
+    expect(edges[0].name).toBe("ac-edge");
+    expect(edges[0].from_id).toBe(aId);
+    expect(edges[0].to_id).toBe(cId);
+  });
 });
