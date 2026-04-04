@@ -78,7 +78,7 @@ export function getEdgesForNodes(db: DatabaseSyncInstance, ids: string[]): GmEdg
   if (!ids.length) return [];
   const placeholders = ids.map(() => "?").join(",");
   return (db.prepare(
-    `SELECT * FROM gm_edges WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`
+    `SELECT * FROM gm_edges WHERE from_id IN (${placeholders}) AND to_id IN (${placeholders})`
   ).all(...ids, ...ids) as any[]).map(toEdge);
 }
 
