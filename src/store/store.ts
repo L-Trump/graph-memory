@@ -358,6 +358,60 @@ export function getUnextracted(db: DatabaseSyncInstance, sid: string, limit: num
     .all(sid, limit) as any[];
 }
 
+/**
+ * 获取最近 N 轮已提取消息（以 user 消息为边界）。
+ * 从最近一条已提取消息向前追溯，收集最多 recentTurns 轮的消息。
+ * 返回的消息按 turn_index 升序排列。
+ */
+export function getRecentExtractedMessages(
+  db: DatabaseSyncInstance,
+  sid: string,
+  recentTurns: number,
+): any[] {
+  if (recentTurns <= 0) return [];
+
+  // 找到最近一条已提取消息的 turn_index
+  const lastExtracted = db
+    .prepare("SELECT MAX(turn_index) as maxTurn FROM gm_messages WHERE session_id=? AND extracted=1")
+    .get(sid) as any;
+  if (!lastExtracted?.maxTurn) return [];
+
+  // 向前取足够的已提取消息（每轮假设最多 20 条，recentTurns * 20 是安全上限）
+  const rows = db
+    .prepare(
+      "SELECT * FROM gm_messages WHERE session_id=? AND extracted=1 AND turn_index<=? ORDER BY turn_index DESC LIMIT ?",
+    )
+    .all(sid, lastExtracted.maxTurn, recentTurns * 20) as any[];
+
+  if (!rows.length) return [];
+
+  // 按 user 边界分组，取最近 recentTurns 轮
+  const turns: any[][] = [];
+  let currentTurn: any[] = [];
+
+  // 倒序遍历（从老到新），逐条收集
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const msg = rows[i];
+    currentTurn.push(msg);
+    if (msg.role === "user") {
+      turns.push(currentTurn.reverse()); // 这一轮收集完了，反转使其按时间升序
+      currentTurn = [];
+      if (turns.length >= recentTurns) break;
+    }
+  }
+  // 如果还有剩余未成一轮的，加入最后一轮
+  if (currentTurn.length > 0 && turns.length < recentTurns) {
+    turns.push(currentTurn.reverse());
+  }
+
+  // 合并所有轮次的消息（升序）
+  const result: any[] = [];
+  for (const turn of turns) {
+    result.push(...turn);
+  }
+  return result;
+}
+
 export function markExtracted(db: DatabaseSyncInstance, sid: string, upToTurn: number): void {
   db.prepare("UPDATE gm_messages SET extracted=1 WHERE session_id=? AND turn_index<=?")
     .run(sid, upToTurn);

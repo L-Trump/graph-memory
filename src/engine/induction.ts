@@ -386,7 +386,7 @@ export async function induceTopics(params: {
         semToTopicEdges.push({
           fromName: fromNorm,
           toName: toNorm,
-          name: "属于",
+          name: "主题属于",
           description: edge.description,
         });
       }
@@ -413,7 +413,6 @@ export async function induceTopics(params: {
   // ── 数据库写入：topic 节点（第二阶段）────────────────────
   const createdTopics: GmNode[] = [];
   const updatedTopics: GmNode[] = [];
-  const allWrittenEdges: GmEdge[] = [];
 
   for (const n of result.nodes) {
     const { node, isNew } = upsertNode(db, {
@@ -433,67 +432,62 @@ export async function induceTopics(params: {
     if (recaller) recaller.syncEmbed(node).catch(() => {});
   }
 
-  // 处理 semantic → topic 边
+  // ── 写入 semantic → topic 边 ────────────────────────────
+  const semanticToTopicEdges: GmEdge[] = [];
   for (const e of semToTopicEdges) {
-    // from 是 semantic 节点，需要通过 findByName 查找（可能来自 sessionNodes 或 recalledNodes）
     const fromNode = findByName(db, e.fromName);
     const toId = topicNameToId.get(e.toName);
-    if (fromNode && toId) {
-      upsertEdge(db, {
-        fromId: fromNode.id,
-        toId,
-        name: e.name,
-        description: e.description,
-        sessionId: "topic-induction",
-      });
-      // 记录边信息（用于返回）
-      allWrittenEdges.push({
-        id: `${fromNode.id}|${toId}|${e.name}`,
-        fromId: fromNode.id,
-        toId,
-        name: e.name,
-        description: e.description,
-        status: "active",
-        sessionId: "topic-induction",
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      } as unknown as GmEdge);
-    }
+    if (!fromNode || !toId) continue;
+    upsertEdge(db, {
+      fromId: fromNode.id,
+      toId,
+      name: e.name,
+      description: e.description,
+      sessionId: "topic-induction",
+    });
+    semanticToTopicEdges.push({
+      id: `${fromNode.id}|${toId}|${e.name}`,
+      fromId: fromNode.id,
+      toId,
+      name: e.name,
+      description: e.description,
+      status: "active",
+      sessionId: "topic-induction",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    } as unknown as GmEdge);
   }
 
-  // 处理 topic ↔ topic 边
+  // ── 写入 topic ↔ topic 边 ───────────────────────────────
+  const topicToTopicEdges: GmEdge[] = [];
   for (const e of rawTopicToTopicEdges) {
     const fromId = topicNameToId.get(e.fromName);
     const toId = topicNameToId.get(e.toName);
-    if (fromId && toId) {
-      upsertEdge(db, {
-        fromId,
-        toId,
-        name: e.name,
-        description: e.description,
-        sessionId: "topic-induction",
-      });
-      allWrittenEdges.push({
-        id: `${fromId}|${toId}|${e.name}`,
-        fromId,
-        toId,
-        name: e.name,
-        description: e.description,
-        status: "active",
-        sessionId: "topic-induction",
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      } as unknown as GmEdge);
-    }
+    if (!fromId || !toId) continue;
+    upsertEdge(db, {
+      fromId,
+      toId,
+      name: e.name,
+      description: e.description,
+      sessionId: "topic-induction",
+    });
+    topicToTopicEdges.push({
+      id: `${fromId}|${toId}|${e.name}`,
+      fromId,
+      toId,
+      name: e.name,
+      description: e.description,
+      status: "active",
+      sessionId: "topic-induction",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    } as unknown as GmEdge);
   }
-
-  const resultSemanticToTopicEdges = allWrittenEdges.filter(e => e.name === "属于");
-  const resultTopicToTopicEdges = allWrittenEdges.filter(e => e.name !== "属于");
 
   return {
     createdTopics,
     updatedTopics,
-    semanticToTopicEdges: resultSemanticToTopicEdges,
-    topicToTopicEdges: resultTopicToTopicEdges,
+    semanticToTopicEdges,
+    topicToTopicEdges,
   };
 }

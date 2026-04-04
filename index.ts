@@ -13,7 +13,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
 import { getDb } from "./src/store/db.ts";
 import {
-  saveMessage, getUnextracted,
+  saveMessage, getUnextracted, getRecentExtractedMessages,
   markExtracted,
   upsertNode, upsertEdge, findByName,
   getBySession, edgesFrom, edgesTo,
@@ -187,6 +187,10 @@ const graphMemoryPlugin = {
           const msgs = getUnextracted(db, sessionId, 50);
           if (!msgs.length) return;
 
+          // 获取最近 N 轮已提取消息作为上下文参考
+          const recentTurns = cfg.extractionRecentTurns ?? 3;
+          const recentMsgs = getRecentExtractedMessages(db, sessionId, recentTurns);
+
           const sessionNodes = getBySession(db, sessionId);
           const sessionNodeIds = new Set(sessionNodes.map(n => n.id));
           const sessionEdges: any[] = [];
@@ -202,6 +206,7 @@ const graphMemoryPlugin = {
 
           const result = await extractor.extract({
             messages: msgs,
+            recentMessages: recentMsgs,
             knowledgeGraph,
           });
 
@@ -402,8 +407,12 @@ const graphMemoryPlugin = {
           const recalledEdges = recalledData?.edges ?? [];
           const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, sessionEdges, recalledEdges);
 
+          const recentTurns = cfg.extractionRecentTurns ?? 3;
+          const recentMsgs = getRecentExtractedMessages(db, sessionId, recentTurns);
+
           const result = await extractor.extract({
             messages: msgs,
+            recentMessages: recentMsgs,
             knowledgeGraph,
           });
 
@@ -722,7 +731,7 @@ const graphMemoryPlugin = {
       (ctx: any) => ({
         name: "gm_record",
         label: "Record to Graph Memory",
-        description: "手动记录经验到知识图谱。发现重要解法、踩坑经验或工作流程时调用。\n\n如需将节点标记为 hot（每次 assemble 时必定渲染），可在 flags 中传入 [\"hot\"]，例如：gm_record(content=\"...\", flags=[\"hot\"])。hot 节点拥有最高渲染优先级，高于 active 和所有 recall tier。仅在用户明确要求将某条记忆设为 hot 时才使用此功能。",
+        description: "手动记录经验到知识图谱。发现重要解法、踩坑经验或工作流程时调用。\n\n如需标记 hot，可在 flags 中传入 [\"hot\"]，例如：gm_record(content=\"...\", flags=[\"hot\"])。仅在用户明确说明时才打 hot 标记。",
         parameters: Type.Object({
           content: Type.String({ description: "用自然语言描述需要记忆的内容（会被当作待提取对话）" }),
           flags: Type.Optional(Type.Array(Type.String(), { description: "节点标记数组。传 [\"hot\"] 将该节点标记为 hot（每次 assemble 时必定渲染）。" })),

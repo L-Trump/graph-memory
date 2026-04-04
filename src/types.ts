@@ -138,6 +138,8 @@ export interface GmConfig {
   pagerankDamping: number;
   /** PageRank 迭代次数 */
   pagerankIterations: number;
+  /** 提取时传给 LLM 的本 session 历史消息轮次数（以 user 消息为边界），默认 3 */
+  extractionRecentTurns: number;
 }
 
 export const DEFAULT_CONFIG: GmConfig = {
@@ -149,4 +151,5 @@ export const DEFAULT_CONFIG: GmConfig = {
   dedupThreshold: 0.90,
   pagerankDamping: 0.85,
   pagerankIterations: 20,
+  extractionRecentTurns: 3,
 };

@@ -350,6 +350,17 @@ All parameters have defaults. Only set what you want to override.
 | `pagerankDamping` | `0.85` | PPR damping factor |
 | `pagerankIterations` | `20` | PPR iteration count |
 
+### Extract prompt and recent context
+
+The extract prompt (`EXTRACT_SYS` + `EXTRACT_USER`) is defined in `src/prompts.ts`. It instructs the LLM to extract 5 node types: `TASK`, `SKILL`, `EVENT`, `KNOWLEDGE`, `STATUS`.
+
+**Recent context feature** (v2.1+): before extraction, the engine loads the **most recently extracted messages** from `gm_messages` and injects them into `EXTRACT_USER` as `<history>` XML. This gives the LLM conversation continuity — it knows what was already extracted in recent turns, reducing duplicate nodes and improving consistency.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `extractRecentMessages` | `true` | Whether to inject recent extracted messages into the extract prompt |
+| `extractRecentTurns` | `3` | How many conversation turns of history to include |
+
 ## Database
 
 SQLite via `@photostructure/sqlite` (prebuilt binaries, zero native compilation). Default: `~/.openclaw/graph-memory.db`.

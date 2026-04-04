@@ -333,7 +333,7 @@ describe("induceTopics - 数据库写入", () => {
     expect(result.semanticToTopicEdges).toHaveLength(1);
     expect(result.semanticToTopicEdges[0].fromId).toBe("n1");
     expect(result.semanticToTopicEdges[0].toId).toBe("topic-xxx");
-    expect(result.semanticToTopicEdges[0].name).toBe("属于");
+    expect(result.semanticToTopicEdges[0].name).toBe("主题属于");
 
     // 数据库验证
     const edges = getSemanticToTopicEdges(testDb);

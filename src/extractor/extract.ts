@@ -98,23 +98,71 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
    5.3 没有知识产出时返回 {"nodes":[],"edges":[]}
    5.4 每条 edge 的 description 必须写具体内容，不能为空或"见上文"
 
-6. 敏感信息保护（所有节点类型强制执行）：
-   6.1 content 和 description 中，禁止写入任何实际敏感值（密码、API Key、Token、Access Token、Secret、Credentials 等）
-   6.2 如需记录凭证，只写获取方式，例如：
+6. 历史对话与当前对话的处理原则：
+   6.1 对话分为"=== 历史对话 ==="（同 session 内更早的已提取消息）和"=== 当前对话 ==="（待提取的新消息）
+   6.2 **优先为当前对话提取知识**，当前对话中的 TASK / SKILL / EVENT / KNOWLEDGE / STATUS 必须完整提取
+   6.3 历史对话作为上下文参考，如果发现其中有重要知识被遗漏（当前对话中有关联引用或明确讨论），也可以提取
+   6.4 历史对话中的敏感信息（密码、API Key 等）请同样套用脱敏规则
+
+7. 敏感信息保护（所有节点类型强制执行）：
+   7.1 content 和 description 中，禁止写入任何实际敏感值（密码、API Key、Token、Access Token、Secret、Credentials 等）
+   7.2 如需记录凭证，只写获取方式，例如：
        · API Key: 从 rbw 获取（rbw get xxx）
        · 密码: 用户在对话中提供
        · Token: 环境变量 $OPENAI_API_KEY
        · Credentials: 从飞书 OAuth 获取
-   6.3 凭证描述要具体到足以让未来重新获取，但不得包含实际值`;
+   7.3 凭证描述要具体到足以让未来重新获取，但不得包含实际值`;
+
+// ─── 消息渲染（truncation 800字）───────────────────────────────
+
+const MSG_TRUNCATE = 800;
+
+/**
+ * 将消息数组渲染为 LLM 可读的文本，每条消息截断到 MSG_TRUNCATE 字符。
+ * 跳过 thinking 块。
+ * 以 [ROLE t=TURN] 前缀标注。
+ */
+export function renderMsgs(msgs: any[]): string {
+  return msgs
+    .map((m) => {
+      const role = (m.role ?? "?").toUpperCase();
+      const turn = m.turn_index ?? 0;
+      let raw: string;
+      if (typeof m.content === "string") {
+        raw = m.content;
+      } else if (Array.isArray(m.content)) {
+        raw = m.content
+          .filter((b: any) => b && typeof b === "object" && b.type === "text")
+          .map((b: any) => {
+            let text = b.text ?? "";
+            if (text.length > MSG_TRUNCATE) {
+              text = text.slice(0, MSG_TRUNCATE) + `\n...(truncated ${text.length - MSG_TRUNCATE} chars)`;
+            }
+            return text;
+          })
+          .join("\n");
+      } else {
+        raw = JSON.stringify(m.content ?? "");
+      }
+      if (raw.length > MSG_TRUNCATE) {
+        raw = raw.slice(0, MSG_TRUNCATE) + `\n...(truncated ${raw.length - MSG_TRUNCATE} chars)`;
+      }
+      return `[${role} t=${turn}]\n${raw}`;
+    })
+    .join("\n\n---\n\n");
+}
 
 // ─── 提取 User Prompt ───────────────────────────────────────────
 // knowledgeGraph: 合并后的知识图谱 XML（session 节点 + recalled 节点 merged）
-const EXTRACT_USER = (msgs: string, knowledgeGraph: string) =>
+const EXTRACT_USER = (recent: string, current: string, knowledgeGraph: string) =>
 `<知识图谱（跨会话关联参考）>
 ${knowledgeGraph || "（无）"}
 
-<当前对话>
-${msgs}`;
+=== 历史对话 ===
+${recent || "（无）"}
+
+=== 当前对话 ===
+${current}`;
 
 // ─── 整理 System Prompt ─────────────────────────────────────────
 
@@ -168,15 +216,15 @@ export class Extractor {
     messages: any[];
     /** 合并后的知识图谱 XML（session 节点 + recalled 节点 merged）*/
     knowledgeGraph?: string;
+    /** 提取时附加的最近已提取消息（放在 unextracted 前面，作为上下文参考） */
+    recentMessages?: any[];
   }): Promise<ExtractionResult> {
-    const msgs = params.messages
-      .map(m => `[${(m.role ?? "?").toUpperCase()} t=${m.turn_index ?? 0}]\n${
-        String(typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 800)
-      }`).join("\n\n---\n\n");
+    const recentRendered = renderMsgs(params.recentMessages ?? []);
+    const currentRendered = renderMsgs(params.messages);
 
     const raw = await this.llm(
       EXTRACT_SYS,
-      EXTRACT_USER(msgs, params.knowledgeGraph ?? ""),
+      EXTRACT_USER(recentRendered, currentRendered, params.knowledgeGraph ?? ""),
     );
 
     if (process.env.GM_DEBUG) {
