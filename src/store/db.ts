@@ -5,6 +5,7 @@
  * Email: Wywelljob@gmail.com
  */
 
+export { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { mkdirSync } from "fs";
 import { homedir } from "os";
@@ -51,7 +52,7 @@ export function closeDb(): void {
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes];
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
@@ -254,4 +255,41 @@ function m8_flags(db: DatabaseSyncInstance): void {
   db.exec(`
     ALTER TABLE gm_nodes ADD COLUMN flags TEXT NOT NULL DEFAULT '[]';
   `);
+}
+
+// ─── TOPIC 节点类型迁移 ──────────────────────────────────────
+
+function m9_topic_nodes(db: DatabaseSyncInstance): void {
+  // 更新 CHECK 约束，允许 TOPIC 类型
+  // SQLite 不支持 ALTER TABLE CHECK，需要重建表
+  try {
+    // 检查当前 CHECK 是否已包含 TOPIC
+    const colInfo = db.prepare("PRAGMA table_info(gm_nodes)").all() as any[];
+    // 如果 type 列没有 CHECK 约束包含 TOPIC，则重建表
+    db.exec(`
+      ALTER TABLE gm_nodes RENAME TO gm_nodes_old;
+
+      CREATE TABLE gm_nodes (
+        id              TEXT PRIMARY KEY,
+        type            TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT','KNOWLEDGE','STATUS','TOPIC')),
+        name            TEXT NOT NULL,
+        description     TEXT NOT NULL DEFAULT '',
+        content         TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','deprecated')),
+        validated_count INTEGER NOT NULL DEFAULT 1,
+        source_sessions TEXT NOT NULL DEFAULT '[]',
+        community_id    TEXT,
+        pagerank        REAL NOT NULL DEFAULT 0,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        flags           TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_nodes_name ON gm_nodes(name);
+      CREATE INDEX IF NOT EXISTS ix_gm_nodes_type_status ON gm_nodes(type, status);
+      CREATE INDEX IF NOT EXISTS ix_gm_nodes_community ON gm_nodes(community_id);
+
+      INSERT INTO gm_nodes SELECT * FROM gm_nodes_old;
+      DROP TABLE gm_nodes_old;
+    `);
+  } catch { /* 已经是最新 schema */ }
 }

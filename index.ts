@@ -18,6 +18,7 @@ import {
   upsertNode, upsertEdge, findByName,
   getBySession, edgesFrom, edgesTo,
   deprecate, getStats, getHotNodes, getEdgesForNodes, setNodeFlags,
+  getTopicNodes, getTopicToTopicEdges, getSemanticToTopicEdges,
 } from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
@@ -28,6 +29,7 @@ import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts"
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
 import { detectCommunities } from "./src/graph/community.ts";
+import { induceTopics } from "./src/engine/induction.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
 
 // ─── 从 OpenClaw config 读 provider/model ────────────────────
@@ -589,6 +591,40 @@ const graphMemoryPlugin = {
           for (const id of fin.invalidations) deprecate(db, id);
         }
 
+        // ★ Topic Induction：基于 session 语义节点归纳主题
+        try {
+          const sessionNodes = getBySession(db, sid);
+          const sessionSemanticNodes = sessionNodes.filter(n =>
+            ["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"].includes(n.type)
+          );
+
+          const induction = await induceTopics({
+            db,
+            sessionNodes: sessionSemanticNodes,
+            llm,
+            recaller,
+          });
+
+          const total =
+            induction.createdTopics.length +
+            induction.updatedTopics.length +
+            induction.semanticToTopicEdges.length +
+            induction.topicToTopicEdges.length;
+
+          if (total > 0) {
+            invalidateGraphCache();
+          }
+
+          api.logger.info(
+            `[graph-memory] topic induction: created=${induction.createdTopics.length}, ` +
+            `updated=${induction.updatedTopics.length}, ` +
+            `sem→topic=${induction.semanticToTopicEdges.length}, ` +
+            `topic↔topic=${induction.topicToTopicEdges.length}`,
+          );
+        } catch (err) {
+          api.logger.error(`[graph-memory] topic induction failed: ${err}`);
+        }
+
         const embedFn = (recaller as any).embed ?? undefined;
         const result = await runMaintenance(db, cfg, llm, embedFn);
         api.logger.info(
@@ -798,10 +834,13 @@ const graphMemoryPlugin = {
           ).all() as any[]);
           const embedEnabled = recaller.isEmbedReady();
           const pendingCount = (recaller as any).pendingEmbedNodes?.length ?? 0;
+          const topicCount = (db.prepare(
+            "SELECT COUNT(*) as c FROM gm_nodes WHERE type='TOPIC' AND status='active'"
+          ).get() as any)?.c ?? 0;
 
           const text = [
             `知识图谱统计`,
-            `节点：${stats.totalNodes} 个 (${["TASK","SKILL","EVENT","KNOWLEDGE","STATUS"].map(t => `${t}: ${stats.byType[t] ?? 0}`).join(", ")})`,
+            `节点：${stats.totalNodes} 个 (${["TASK","SKILL","EVENT","KNOWLEDGE","STATUS","TOPIC"].map(t => `${t}: ${t === "TOPIC" ? topicCount : (stats.byType[t] ?? 0)}`).join(", ")})`,
             `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `社区：${stats.communities} 个`,
             `Hot 节点：${stats.hotNodes} 个`,
@@ -1061,6 +1100,97 @@ const graphMemoryPlugin = {
         },
       }),
       { name: "gm_reembedding_all" },
+    );
+
+    // ── gm_induce_topics ──────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_induce_topics",
+        label: "Induce Topics for a Node",
+        description: "对指定节点执行主题归纳。以该节点为 sessionNode 传入 induceTopics，函数内部会跨会话 recall 相关节点，形成以该节点为核心的局部子图，然后 LLM 归纳出主题。适用于：以某个节点为中心探索关联主题、整理某个领域的知识结构。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点名称（精确匹配）" }),
+        }),
+        async execute(_toolCallId: string, params: { name: string }) {
+          const { name } = params;
+
+          // 根据节点名查找节点
+          const node = findByName(db, name);
+          if (!node) {
+            return {
+              content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }],
+              details: { success: false, name },
+            };
+          }
+          if (node.type === "TOPIC") {
+            return {
+              content: [{ type: "text", text: `"${name}" 已经是 TOPIC 类型节点，主题归纳只需对 semantic 节点执行。` }],
+              details: { success: false, reason: "already_topic" },
+            };
+          }
+
+          // 以该节点作为唯一的 sessionNode，induceTopics 内部会做 recall 召回相关节点
+          try {
+            const result = await induceTopics({
+              db,
+              sessionNodes: [node],
+              llm,
+              recaller,
+            });
+
+            if (result.createdTopics.length === 0 && result.updatedTopics.length === 0
+                && result.semanticToTopicEdges.length === 0 && result.topicToTopicEdges.length === 0) {
+              return {
+                content: [{
+                  type: "text",
+                  text: `节点 "${name}" 没有归纳出新的主题关系（可能现有主题已足够覆盖，或该节点语义较孤立）。`,
+                }],
+                details: {
+                  success: true,
+                  name,
+                  nodeId: node.id,
+                  ...result,
+                },
+              };
+            }
+
+            invalidateGraphCache();
+
+            const lines = [
+              `主题归纳完成（以 "${name}" 为核心）：`,
+              result.createdTopics.length > 0
+                ? `新建主题：${result.createdTopics.map(t => t.name).join(", ")}`
+                : null,
+              result.updatedTopics.length > 0
+                ? `更新主题：${result.updatedTopics.map(t => t.name).join(", ")}`
+                : null,
+              result.semanticToTopicEdges.length > 0
+                ? `新建归属边：${result.semanticToTopicEdges.length} 条`
+                : null,
+              result.topicToTopicEdges.length > 0
+                ? `新建层级边：${result.topicToTopicEdges.length} 条`
+                : null,
+            ].filter(Boolean);
+
+            return {
+              content: [{ type: "text", text: lines.join("\n") }],
+              details: {
+                success: true,
+                name,
+                nodeId: node.id,
+                ...result,
+              },
+            };
+          } catch (err) {
+            api.logger.error(`[graph-memory] gm_induce_topics failed: ${err}`);
+            return {
+              content: [{ type: "text", text: `主题归纳失败: ${String(err)}` }],
+              details: { success: false, error: String(err) },
+            };
+          }
+        },
+      }),
+      { name: "gm_induce_topics" },
     );
 
     api.logger.info(

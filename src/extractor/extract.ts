@@ -10,6 +10,7 @@ import type { CompleteFn } from "../engine/llm.ts";
 
 // ─── 节点合法类型 ──────────────────────────────────────────────
 
+// TOPIC 节点由 topic induction 阶段单独管理，extract 阶段不创建
 const VALID_NODE_TYPES = new Set(["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"]);
 
 // ─── 提取 System Prompt ─────────────────────────────────────────
@@ -20,7 +21,7 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
 
 1. 节点提取：
    1.1 从对话中识别五类知识节点：
-       - TASK：用户要求 Agent 完成的具体任务，或对话中讨论，分析、对比的主题
+       - TASK：用户要求 Agent 完成的具体任务，或对话中讨论、分析、对比的主题
        - SKILL：可复用的操作技能，有具体工具/命令/API，有明确触发条件，步骤可直接执行
        - EVENT：一次性的报错或异常，记录现象、原因和解决方法
        - KNOWLEDGE：专业领域知识，有明确适用范围和条件，排除 LLM 本身已知的常识（如太阳东升西落、基本物理定律、常见数学结论等）
@@ -60,7 +61,7 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
 3. 知识图谱 XML 结构说明（仅供参考，不要在输出中重复这些标签）：
    知识图谱以 XML 格式呈现，节点和边分别用不同标签表示：
 
-   节点标签（5 种，对应 5 种节点类型）：
+   节点标签（5 种，对应 5 种知识节点类型）：
      <task name="节点名" desc="描述" tier="l1|l2|l3">内容</task>
      <skill name="节点名" desc="描述" tier="l1|l2|l3">内容</skill>
      <event name="节点名" desc="描述" tier="l1|l2|l3">内容</event>
@@ -68,6 +69,7 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
      <status name="节点名" desc="描述" tier="l1|l2|l3">内容</status>
      - tier 表示节点重要度：l1 最高（有完整 content）、l2（仅 description）、l3（仅 name）
      - 自闭合标签（如 <task .../>）表示该节点仅含 description，无完整 content
+     - 注意：传入的图谱中可能存在 TOPIC 类型节点，这些节点由 topic induction 阶段管理，请忽略不要为其建边
 
    边标签（位于 <edges> 父标签内）：
      <e name="边类型名" from="起点节点名" to="终点节点名">描述</e>
@@ -91,8 +93,8 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
    4.7 【STATUS 特殊规则】STATUS 节点不合并、不覆盖，永远用新的时间戳创建新节点
 
 5. 输出规范：
-   5.1 只返回 JSON，格式为 {"nodes":[...],"edges":[...]}
-   5.2 禁止 markdown 代码块包裹，禁止解释文字，禁止额外字段
+   5.1 只返回 JSON，格式为 {"nodes":[...],"edges":[...]}，禁止 markdown 代码块包裹
+   5.2 禁止解释文字，禁止额外字段
    5.3 没有知识产出时返回 {"nodes":[],"edges":[]}
    5.4 每条 edge 的 description 必须写具体内容，不能为空或"见上文"
 

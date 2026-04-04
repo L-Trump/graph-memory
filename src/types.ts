@@ -14,7 +14,7 @@
 
 // ─── 节点 ─────────────────────────────────────────────────────
 
-export type NodeType = "TASK" | "SKILL" | "EVENT" | "KNOWLEDGE" | "STATUS";
+export type NodeType = "TASK" | "SKILL" | "EVENT" | "KNOWLEDGE" | "STATUS" | "TOPIC";
 export type NodeStatus = "active" | "deprecated";
 
 export interface GmNode {

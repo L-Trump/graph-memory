@@ -415,6 +415,9 @@ export function assembleContext(
 
 // ─── Extract 用知识图谱 ──────────────────────────────────────
 
+// extract 阶段不处理的节点类型（由 topic induction 阶段管理）
+const EXTRACT_EXCLUDED_TYPES = new Set(["TOPIC"]);
+
 /**
  * 为 extraction 构建知识图谱 XML
  *
@@ -432,6 +435,8 @@ export function assembleContext(
  * - filtered: 不渲染
  *
  * 边渲染规则：两端都在渲染节点中（L1/L2/L3）且至少一端为 L1/L2
+ *
+ * 注意：TOPIC 节点会被过滤，不参与 extraction（由 topic induction 阶段单独管理）
  */
 export function buildExtractKnowledgeGraph(
   db: DatabaseSyncInstance,
@@ -444,15 +449,16 @@ export function buildExtractKnowledgeGraph(
   type Entry = { node: GmNode; tier: RecallTier };
   const merged = new Map<string, Entry>();
 
-  // recalled nodes 入场（保持原有 tier）
+  // recalled nodes 入场（保持原有 tier），过滤 TOPIC 类型
   for (const n of recalledNodes) {
-    if (n.tier !== "filtered") {
+    if (n.tier !== "filtered" && !EXTRACT_EXCLUDED_TYPES.has(n.type)) {
       merged.set(n.id, { node: n, tier: n.tier });
     }
   }
 
-  // session nodes 入场（作为 L2），保留更高 tier
+  // session nodes 入场（作为 L2），保留更高 tier，过滤 TOPIC 类型
   for (const n of sessionNodes) {
+    if (EXTRACT_EXCLUDED_TYPES.has(n.type)) continue;
     const existing = merged.get(n.id);
     if (!existing || TIER_PRIORITY["L2"] > TIER_PRIORITY[existing.tier]) {
       merged.set(n.id, { node: n, tier: "L2" });

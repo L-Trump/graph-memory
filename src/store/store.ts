@@ -702,3 +702,55 @@ export function pruneCommunitySummaries(db: DatabaseSyncInstance): number {
   `).run();
   return result.changes;
 }
+
+// ─── TOPIC 节点查询 ─────────────────────────────────────────
+
+const SEMANTIC_TYPES = new Set(["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"]);
+
+/**
+ * 获取所有 TOPIC 类型的节点（排除 deprecated）
+ */
+export function getTopicNodes(db: DatabaseSyncInstance): GmNode[] {
+  const rows = db.prepare(
+    "SELECT * FROM gm_nodes WHERE type='TOPIC' AND status='active'"
+  ).all() as any[];
+  return rows.map(toNode);
+}
+
+/**
+ * 获取 topic → topic 边（两端都是 TOPIC 节点，且两端都是 active 的边）
+ */
+export function getTopicToTopicEdges(db: DatabaseSyncInstance): GmEdge[] {
+  const rows = db.prepare(`
+    SELECT e.* FROM gm_edges e
+    JOIN gm_nodes f ON f.id = e.from_id
+    JOIN gm_nodes t ON t.id = e.to_id
+    WHERE f.type = 'TOPIC' AND t.type = 'TOPIC'
+      AND f.status = 'active' AND t.status = 'active'
+  `).all() as any[];
+  return rows.map(toEdge);
+}
+
+/**
+ * 获取 semantic → topic 边（从非 TOPIC 节点指向 active TOPIC 节点的边）
+ */
+export function getSemanticToTopicEdges(db: DatabaseSyncInstance): GmEdge[] {
+  const rows = db.prepare(`
+    SELECT e.* FROM gm_edges e
+    JOIN gm_nodes f ON f.id = e.from_id
+    JOIN gm_nodes t ON t.id = e.to_id
+    WHERE f.type != 'TOPIC' AND t.type = 'TOPIC'
+      AND f.status = 'active' AND t.status = 'active'
+  `).all() as any[];
+  return rows.map(toEdge);
+}
+
+/**
+ * 获取所有 semantic 类型的节点（KNOWLEDGE/SKILL/TASK/EVENT/STATUS，排除 deprecated）
+ */
+export function getSemanticNodes(db: DatabaseSyncInstance): GmNode[] {
+  const rows = db.prepare(
+    "SELECT * FROM gm_nodes WHERE type IN ('TASK','SKILL','EVENT','KNOWLEDGE','STATUS') AND status='active'"
+  ).all() as any[];
+  return rows.map(toNode);
+}

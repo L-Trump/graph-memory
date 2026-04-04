@@ -351,9 +351,9 @@ describe("getBySession", () => {
 
   it("upsertEdge 跳过连接到 deprecated 节点的边", () => {
     // 创建两个节点
-    upsertNode(db, { type: "KNOWLEDGE", name: "node-a", description: "a", content: "a", sessionId: "s1", importance: 0.8 });
-    upsertNode(db, { type: "KNOWLEDGE", name: "node-b", description: "b", content: "b", sessionId: "s1", importance: 0.8 });
-    upsertNode(db, { type: "KNOWLEDGE", name: "node-c", description: "c", content: "c", sessionId: "s1", importance: 0.8 });
+    upsertNode(db, { type: "KNOWLEDGE", name: "node-a", description: "a", content: "a" }, "s1");
+    upsertNode(db, { type: "KNOWLEDGE", name: "node-b", description: "b", content: "b" }, "s1");
+    upsertNode(db, { type: "KNOWLEDGE", name: "node-c", description: "c", content: "c" }, "s1");
 
     const aId = findByName(db, "node-a")!.id;
     const bId = findByName(db, "node-b")!.id;
