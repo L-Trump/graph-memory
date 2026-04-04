@@ -52,7 +52,33 @@ export function closeDb(): void {
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief];
+function m10_belief(db: DatabaseSyncInstance): void {
+  try {
+    db.prepare("SELECT belief FROM gm_nodes LIMIT 1").get();
+    return; // already migrated
+  } catch { /* column doesn't exist */ }
+
+  db.exec(`
+    ALTER TABLE gm_nodes ADD COLUMN belief REAL NOT NULL DEFAULT 0.5;
+    ALTER TABLE gm_nodes ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE gm_nodes ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE gm_nodes ADD COLUMN last_signal_at INTEGER NOT NULL DEFAULT 0;
+
+    CREATE TABLE IF NOT EXISTS gm_belief_signals (
+      id TEXT PRIMARY KEY,
+      node_id TEXT NOT NULL,
+      node_name TEXT NOT NULL,
+      signal_type TEXT NOT NULL,
+      weight REAL NOT NULL DEFAULT 1.0,
+      context TEXT NOT NULL DEFAULT '{}',
+      session_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ix_belief_sig_node ON gm_belief_signals(node_id, created_at);
+    CREATE INDEX IF NOT EXISTS ix_belief_sig_session ON gm_belief_signals(session_id);
+  `);
+}
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());

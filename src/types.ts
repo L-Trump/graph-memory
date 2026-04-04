@@ -31,6 +31,14 @@ export interface GmNode {
   flags: string[];
   createdAt: number;
   updatedAt: number;
+  /** Belief/confidence score [0, 1]: 0=fully discredited, 1=fully validated. Default 0.5. */
+  belief?: number;
+  /** Number of successful uses/confirmations */
+  successCount?: number;
+  /** Number of failed uses/corrections */
+  failureCount?: number;
+  /** Timestamp of last belief signal */
+  lastSignalAt?: number;
 }
 
 // ─── 边（两层：name自由命名 + description一句话描述）───────────

@@ -25,6 +25,11 @@ function toNode(r: any): GmNode {
     pagerank: r.pagerank ?? 0,
     flags: JSON.parse(r.flags ?? "[]"),
     createdAt: r.created_at, updatedAt: r.updated_at,
+    // Belief fields (may be undefined in pre-belief dbs)
+    belief: r.belief ?? 0.5,
+    successCount: r.success_count ?? 0,
+    failureCount: r.failure_count ?? 0,
+    lastSignalAt: r.last_signal_at ?? 0,
   };
 }
 
@@ -769,6 +774,153 @@ export function getTopicNodes(db: DatabaseSyncInstance): GmNode[] {
     "SELECT * FROM gm_nodes WHERE type='TOPIC' AND status='active'"
   ).all() as any[];
   return rows.map(toNode);
+}
+
+// ─── Belief System ─────────────────────────────────────────────
+
+export type BeliefSignalType =
+  | "tool_success" | "tool_error" | "user_correction" | "explicit_confirm"
+  | "recall_used" | "recall_rejected" | "belief_increase" | "belief_decrease" | "initial";
+
+/**
+ * Beta-Bayesian belief computation.
+ * belief = (α + successes) / (α + β + successes + failures)
+ * With α=1, β=1 (uniform prior): belief = (1+s)/(2+s+f)
+ */
+export function computeBeliefA(successCount: number, failureCount: number): number {
+  const α = 1, β = 1;
+  return (α + successCount) / (α + β + successCount + failureCount);
+}
+
+/**
+ * Exponential Moving Average belief update.
+ * belief_t = λ * belief_{t-1} + (1-λ) * signal
+ */
+export function computeBeliefB(currentBelief: number, signal: number, λ = 0.85): number {
+  const newBelief = λ * currentBelief + (1 - λ) * (signal > 0 ? 1 : signal < 0 ? 0 : 0.5);
+  return Math.max(0, Math.min(1, newBelief));
+}
+
+/**
+ * Record a belief signal for a node.
+ */
+function beliefUid(p: string): string {
+  return `${p}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+export function recordBeliefSignal(
+  db: DatabaseSyncInstance,
+  nodeId: string,
+  nodeName: string,
+  signalType: BeliefSignalType,
+  sessionId: string,
+  weight = 1.0,
+  context: Record<string, unknown> = {},
+): void {
+  try {
+    db.prepare(`
+      INSERT INTO gm_belief_signals (id, node_id, node_name, signal_type, weight, context, session_id, created_at)
+      VALUES (?,?,?,?,?,?,?,?)
+    `).run(
+      beliefUid("bsig"), nodeId, nodeName, signalType, weight, JSON.stringify(context), sessionId, Date.now(),
+    );
+  } catch {
+    // gm_belief_signals may not exist in pre-belief databases
+  }
+}
+
+/**
+ * Update a node's belief score using the Beta-Bayesian scheme.
+ * Returns the update result or null if node not found.
+ */
+export interface BeliefUpdateResult {
+  beliefBefore: number;
+  beliefAfter: number;
+  delta: number;
+  successCount: number;
+  failureCount: number;
+}
+
+export function updateNodeBelief(
+  db: DatabaseSyncInstance,
+  nodeId: string,
+  signalType?: BeliefSignalType,
+): BeliefUpdateResult | null {
+  const row = db.prepare(
+    "SELECT belief, success_count, failure_count FROM gm_nodes WHERE id=?"
+  ).get(nodeId) as any;
+  if (!row) return null;
+
+  const beliefBefore = row.belief ?? 0.5;
+  let successCount = row.success_count ?? 0;
+  let failureCount = row.failure_count ?? 0;
+
+  if (signalType) {
+    const isPositive = (
+      signalType === "tool_success" || signalType === "explicit_confirm" ||
+      signalType === "recall_used" || signalType === "belief_increase" || signalType === "initial"
+    );
+    const isNegative = (
+      signalType === "tool_error" || signalType === "user_correction" ||
+      signalType === "recall_rejected" || signalType === "belief_decrease"
+    );
+    if (isPositive) successCount++;
+    else if (isNegative) failureCount++;
+  }
+
+  const beliefAfter = computeBeliefA(successCount, failureCount);
+
+  try {
+    db.prepare(`
+      UPDATE gm_nodes
+      SET belief=?, success_count=?, failure_count=?, last_signal_at=?, updated_at=?
+      WHERE id=?
+    `).run(beliefAfter, successCount, failureCount, Date.now(), Date.now(), nodeId);
+  } catch {
+    // Belief columns may not exist in pre-belief databases — silent fail
+  }
+
+  return {
+    beliefBefore,
+    beliefAfter,
+    delta: beliefAfter - beliefBefore,
+    successCount,
+    failureCount,
+  };
+}
+
+/**
+ * Get belief info for a node.
+ */
+export function getBeliefInfo(
+  db: DatabaseSyncInstance,
+  nodeId: string,
+): { belief: number; successCount: number; failureCount: number } | null {
+  const row = db.prepare(
+    "SELECT belief, success_count, failure_count FROM gm_nodes WHERE id=?"
+  ).get(nodeId) as any;
+  return row ? { belief: row.belief ?? 0.5, successCount: row.success_count ?? 0, failureCount: row.failure_count ?? 0 } : null;
+}
+
+/**
+ * Get belief history (recent signals) for a node.
+ */
+export function getBeliefHistory(
+  db: DatabaseSyncInstance,
+  nodeId: string,
+  limit = 20,
+): Array<{ signalType: BeliefSignalType; weight: number; createdAt: number }> {
+  try {
+    return (db.prepare(
+      "SELECT signal_type, weight, created_at FROM gm_belief_signals WHERE node_id=? ORDER BY created_at DESC LIMIT ?"
+    ).all(nodeId, limit) as any[]).map(r => ({
+      signalType: r.signal_type as BeliefSignalType,
+      weight: r.weight,
+      createdAt: r.created_at,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 /**

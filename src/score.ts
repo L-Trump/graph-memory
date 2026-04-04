@@ -14,8 +14,9 @@ export interface Scored<T> {
   item: T;
   combined: number;
   semantic: number;     // 原始语义分数（向量相似度，0-1）
-  ppr: number;         // 原始 PPR 分数
-  pagerank: number;    // 原始 PageRank 分数（全局重要性）
+  ppr: number;          // 原始 PPR 分数
+  pagerank: number;     // 原始 PageRank 分数（全局重要性）
+  belief?: number;     // 原始信念分数（0-1）
 }
 
 /** 归一化到 [0,1]：min-max */
@@ -32,18 +33,22 @@ function minMax(scores: number[]): number[] {
  * @param getSemantic 每个候选的语义分数（向量相似度，0-1）
  * @param getPpr 每个候选的 PPR 分数
  * @param getPageRank 每个候选的全局 PageRank 分数
- * @param alpha semantic 权重，默认 0.5
- * @param gamma pagerank 权重，默认 0.25
+ * @param alpha semantic 权重，默认 0.40
+ * @param gamma pagerank 权重，默认 0.20
+ * @param getBelief 每个候选的信念分数（0-1），可选
+ * @param delta belief 权重，默认 0.15
  */
 export function combinedScore<T>(
   items: T[],
   getSemantic: (item: T) => number,
   getPpr: (item: T) => number,
   getPageRank: (item: T) => number,
-  alpha = 0.5,
-  gamma = 0.25,
+  alpha = 0.40,
+  gamma = 0.20,
+  getBelief?: (item: T) => number,
+  delta = 0.15,
 ): Scored<T>[] {
-  const beta = 1 - alpha - gamma;
+  const beta = 1 - alpha - gamma - delta;
 
   // 归一化
   const semScores = items.map(getSemantic);
@@ -52,6 +57,18 @@ export function combinedScore<T>(
   const normSem = minMax(semScores);
   const normPpr = minMax(pprScores);
   const normPr = minMax(prScores);
+
+  if (getBelief) {
+    const beliefScores = items.map(getBelief);
+    const normBelief = minMax(beliefScores);
+    return items.map((item, i) => ({
+      item,
+      semantic: semScores[i],
+      ppr: pprScores[i],
+      pagerank: prScores[i],
+      combined: alpha * normSem[i] + beta * normPpr[i] + gamma * normPr[i] + delta * normBelief[i],
+    }));
+  }
 
   return items.map((item, i) => ({
     item,
