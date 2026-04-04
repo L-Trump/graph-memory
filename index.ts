@@ -19,7 +19,15 @@ import {
   getBySession, edgesFrom, edgesTo,
   deprecate, getStats, getHotNodes, getEdgesForNodes, setNodeFlags,
   getTopicNodes, getTopicToTopicEdges, getSemanticToTopicEdges,
+  updateNodeBelief, recordBeliefSignal,
 } from "./src/store/store.ts";
+import {
+  detectSignals,
+  extractTextFromContent,
+  getSignalWeight,
+  shouldEmitSignal,
+  type DetectedSignal,
+} from "./src/signal-detector.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Recaller, type TieredNode } from "./src/recaller/recall.ts";
@@ -158,6 +166,12 @@ const graphMemoryPlugin = {
     const recalled = new Map<string, { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }>();
     const turnCounter = new Map<string, number>(); // 社区维护计数器
 
+    // ── Belief 追踪状态 ────────────────────────────────────────
+    // 追踪每个 session 中本轮 recall 的节点
+    const recalledNodesPerTurn = new Map<string, TieredNode[]>();
+    // 追踪最近 N 轮已发射的信号（去重用）
+    const recentSignalsPerTurn = new Map<string, DetectedSignal[]>();
+
     // ── 提取串行化（同 session Promise chain，不同 session 并行）────
     const extractChain = new Map<string, Promise<void>>();
 
@@ -274,6 +288,9 @@ const graphMemoryPlugin = {
           if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) {
             recalled.set(ctx.sessionKey, stored);
           }
+          // 追踪本轮 recall 的节点（用于 belief 信号检测）
+          const sid = ctx?.sessionKey ?? ctx?.sessionId;
+          if (sid) recalledNodesPerTurn.set(sid, res.nodes);
           api.logger.info(
             `[graph-memory] recalled ${res.nodes.length} nodes, ${res.edges.length} edges`,
           );
@@ -482,6 +499,91 @@ const graphMemoryPlugin = {
           `[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
         );
 
+        // ── Belief 信号检测与更新 ──────────────────────────────
+        if (newMessages.length > 0) {
+          try {
+            const recalledNodes = recalledNodesPerTurn.get(sessionId) ?? [];
+            const recentSignals = recentSignalsPerTurn.get(sessionId) ?? [];
+
+            // 提取用户消息
+            const userMsgs = newMessages
+              .filter((m: any) => m.role === "user")
+              .map((m: any) => ({
+                text: extractTextFromContent(m.content),
+                turnIndex: m.turn_index ?? 0,
+              }))
+              .filter((m: any) => m.text.trim());
+
+            // 提取工具结果
+            const toolResults = newMessages
+              .filter((m: any) => m.role === "tool" || m.role === "toolResult")
+              .map((m: any) => ({
+                text: extractTextFromContent(m.content),
+                isError: (m.content ?? "").toString().includes("error") ||
+                  (m.content ?? "").toString().includes("failed") ||
+                  (m.content ?? "").toString().includes("权限"),
+              }));
+
+            // 组合上下文
+            const userText = userMsgs.map((m: any) => m.text).join("\n");
+
+            if (userText || toolResults.length > 0) {
+              const signals = detectSignals({
+                turnMessages: newMessages,
+                recalledNodes,
+                userText,
+                toolResults,
+                sessionId,
+              });
+
+              let emittedCount = 0;
+              for (const signal of signals) {
+                if (!shouldEmitSignal(signal, recentSignals)) continue;
+
+                // 找到对应的节点（优先用 recall 的节点匹配）
+                const targetNodeIds = signal.nodeIds.length > 0
+                  ? signal.nodeIds
+                  : recalledNodes.map(n => n.id);
+
+                const weight = getSignalWeight(signal.type);
+
+                for (const nodeId of targetNodeIds) {
+                  // 记录信号
+                  const node = recalledNodes.find(n => n.id === nodeId);
+                  const nodeName = node?.name ?? signal.nodeName ?? "unknown";
+                  try {
+                    recordBeliefSignal(db, nodeId, nodeName, signal.type, sessionId, weight, {
+                      confidence: signal.confidence,
+                      triggerText: signal.triggerText.slice(0, 100),
+                    });
+                  } catch { /* belief may not be migrated yet */ }
+
+                  // 更新置信度
+                  try {
+                    const result = updateNodeBelief(db, nodeId, signal.type);
+                    if (result && Math.abs(result.delta) > 0.001) {
+                      api.logger.info(
+                        `[graph-memory] belief ${nodeName}: ${result.beliefBefore.toFixed(3)} → ${result.beliefAfter.toFixed(3)} (Δ=${result.delta >= 0 ? "+" : ""}${result.delta.toFixed(3)}) [${signal.type}]`,
+                      );
+                      emittedCount++;
+                    }
+                  } catch { /* belief may not be migrated yet */ }
+                }
+              }
+
+              // 保存本轮信号（用于后续去重）
+              const updatedRecent = [...recentSignals, ...signals].slice(-20);
+              recentSignalsPerTurn.set(sessionId, updatedRecent);
+
+              if (emittedCount > 0) {
+                invalidateGraphCache();
+              }
+            }
+          } catch (err) {
+            api.logger.warn(`[graph-memory] belief signal detection failed: ${err}`);
+          }
+        }
+
         // ★ 每轮直接提取
         runTurnExtract(sessionId, newMessages).catch((err) => {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
@@ -539,12 +641,16 @@ const graphMemoryPlugin = {
       async onSubagentEnded({ childSessionKey }: { childSessionKey: string }) {
         recalled.delete(childSessionKey);
         msgSeq.delete(childSessionKey);
+        recalledNodesPerTurn.delete(childSessionKey);
+        recentSignalsPerTurn.delete(childSessionKey);
       },
 
       async dispose() {
         extractChain.clear();
         msgSeq.clear();
         recalled.clear();
+        recalledNodesPerTurn.clear();
+        recentSignalsPerTurn.clear();
       },
     };
 
@@ -643,6 +749,28 @@ const graphMemoryPlugin = {
           `summaries=${result.communitySummaries}, ` +
           `top_pr=${result.pagerank.topK.slice(0, 3).map((n: any) => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
         );
+
+        // ── Belief: Session 完成信号 ──────────────────────────
+        // 对本 session 的所有节点记录 task_completed 信号（如果 session_nodes 存在）
+        try {
+          const sessionBeliefNodes = getBySession(db, sid);
+          for (const node of sessionBeliefNodes) {
+            try {
+              recordBeliefSignal(db, node.id, node.name, "belief_increase", sid, 1.0, {
+                source: "session_end",
+                nodeCount: sessionBeliefNodes.length,
+              });
+              updateNodeBelief(db, node.id, "belief_increase");
+            } catch { /* belief may not be migrated */ }
+          }
+          if (sessionBeliefNodes.length > 0) {
+            api.logger.info(
+              `[graph-memory] session_end belief: emitted task_completed for ${sessionBeliefNodes.length} session nodes`,
+            );
+          }
+        } catch (err) {
+          api.logger.warn(`[graph-memory] session_end belief update failed: ${err}`);
+        }
       } catch (err) {
         api.logger.error(`[graph-memory] session_end error: ${err}`);
       } finally {
@@ -681,6 +809,7 @@ const graphMemoryPlugin = {
             if (n.pprScore != null) scores.push(`PPR=${n.pprScore.toFixed(3)}`);
             if (n.pagerankScore != null) scores.push(`PR=${n.pagerankScore.toFixed(3)}`);
             if (n.combinedScore != null) scores.push(`综合=${n.combinedScore.toFixed(3)}`);
+            if (n.belief != null) scores.push(`信念=${n.belief.toFixed(3)}`);
             const scoreStr = scores.length ? ` (${scores.join(", ")})` : "";
             return `${tierLabel} [${n.type}] ${n.name}${hotFlag}${scoreStr}\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
           });
@@ -698,25 +827,43 @@ const graphMemoryPlugin = {
           ].join("\n\n");
 
           // 返回完整 TieredNode 信息（含层级、评分、原始字段）
-          const tieredInfo = res.nodes.map((n: any) => ({
-            id: n.id,
-            type: n.type,
-            name: n.name,
-            description: n.description,
-            content: n.content,
-            status: n.status,
-            flags: n.flags ?? [],
-            validatedCount: n.validatedCount,
-            pagerank: n.pagerank,
-            communityId: n.communityId,
-            createdAt: n.createdAt,
-            updatedAt: n.updatedAt,
-            tier: n.tier,
-            semanticScore: n.semanticScore ?? null,
-            pprScore: n.pprScore ?? null,
-            pagerankScore: n.pagerankScore ?? null,
-            combinedScore: n.combinedScore ?? null,
-          }));
+          const tieredInfo = res.nodes.map((n: any) => {
+            // Get belief info if available
+            let belief: number | null = null;
+            let successCount: number | null = null;
+            let failureCount: number | null = null;
+            try {
+              const bRow = db.prepare("SELECT belief, success_count, failure_count FROM gm_nodes WHERE id=?").get(n.id) as any;
+              if (bRow) {
+                belief = bRow.belief ?? null;
+                successCount = bRow.success_count ?? null;
+                failureCount = bRow.failure_count ?? null;
+              }
+            } catch { /* belief not available */ }
+
+            return {
+              id: n.id,
+              type: n.type,
+              name: n.name,
+              description: n.description,
+              content: n.content,
+              status: n.status,
+              flags: n.flags ?? [],
+              validatedCount: n.validatedCount,
+              pagerank: n.pagerank,
+              communityId: n.communityId,
+              createdAt: n.createdAt,
+              updatedAt: n.updatedAt,
+              tier: n.tier,
+              semanticScore: n.semanticScore ?? null,
+              pprScore: n.pprScore ?? null,
+              pagerankScore: n.pagerankScore ?? null,
+              combinedScore: n.combinedScore ?? null,
+              belief,
+              successCount,
+              failureCount,
+            };
+          });
 
           return {
             content: [{ type: "text", text }],
@@ -847,6 +994,22 @@ const graphMemoryPlugin = {
             "SELECT COUNT(*) as c FROM gm_nodes WHERE type='TOPIC' AND status='active'"
           ).get() as any)?.c ?? 0;
 
+          // Belief 统计
+          let beliefText = "";
+          try {
+            const beliefRows = db.prepare(
+              "SELECT belief FROM gm_nodes WHERE status='active'"
+            ).all() as any[];
+            const beliefs = beliefRows.map((r: any) => r.belief ?? 0.5);
+            if (beliefs.length > 0) {
+              const avgBelief = beliefs.reduce((s: number, b: number) => s + b, 0) / beliefs.length;
+              const highBelief = beliefs.filter((b: number) => b > 0.7).length;
+              const lowBelief = beliefs.filter((b: number) => b < 0.3).length;
+              const signalCount = (db.prepare("SELECT COUNT(*) as c FROM gm_belief_signals").get() as any)?.c ?? 0;
+              beliefText = `\n置信度：平均 ${avgBelief.toFixed(3)} | 高置信度(>0.7): ${highBelief} | 低置信度(<0.3): ${lowBelief} | 信号总数: ${signalCount}`;
+            }
+          } catch { /* belief columns may not exist */ }
+
           const text = [
             `知识图谱统计`,
             `节点：${stats.totalNodes} 个 (${["TASK","SKILL","EVENT","KNOWLEDGE","STATUS","TOPIC"].map(t => `${t}: ${t === "TOPIC" ? topicCount : (stats.byType[t] ?? 0)}`).join(", ")})`,
@@ -855,7 +1018,7 @@ const graphMemoryPlugin = {
             `Hot 节点：${stats.hotNodes} 个`,
             `Embedding：${embedEnabled ? "✅ 已开启" : "❌ 未开启"}${pendingCount > 0 ? ` (待处理: ${pendingCount})` : ""}`,
             `PageRank Top 5：`,
-            ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),
+            ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),${beliefText}
           ].join("\n");
           return {
             content: [{ type: "text", text }],
