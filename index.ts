@@ -518,6 +518,7 @@ const graphMemoryPlugin = {
             const toolResults = newMessages
               .filter((m: any) => m.role === "tool" || m.role === "toolResult")
               .map((m: any) => ({
+                toolName: (m as any).toolName ?? (m as any).name ?? "unknown",
                 text: extractTextFromContent(m.content),
                 isError: (m.content ?? "").toString().includes("error") ||
                   (m.content ?? "").toString().includes("failed") ||
@@ -1018,7 +1019,8 @@ const graphMemoryPlugin = {
             `Hot 节点：${stats.hotNodes} 个`,
             `Embedding：${embedEnabled ? "✅ 已开启" : "❌ 未开启"}${pendingCount > 0 ? ` (待处理: ${pendingCount})` : ""}`,
             `PageRank Top 5：`,
-            ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),${beliefText}
+            ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),
+            beliefText,
           ].join("\n");
           return {
             content: [{ type: "text", text }],
