@@ -74,7 +74,31 @@ export interface Signal {
   data: Record<string, any>;
 }
 
+// ─── 置信度更新 ─────────────────────────────────────────────────────
+
+export type BeliefUpdateType = SignalType;
+
+/** 置信度更新信号（与 Signal 相同，用于语义清晰） */
+export interface BeliefUpdateSignal {
+  type: BeliefUpdateType;
+  turnIndex: number;
+  data: Record<string, any>;
+}
+
 // ─── 提取结果 ─────────────────────────────────────────────────
+
+export type BeliefVerdict = "supported" | "contradicted";
+
+export interface BeliefUpdate {
+  /** 被评估的已召回节点名称（精确匹配） */
+  nodeName: string;
+  /** 本轮对话对该节点内容的判断：supported=支持/正例，contradicted=反对/反例 */
+  verdict: BeliefVerdict;
+  /** 置信度调整力度，范围 0.5-2.0 */
+  weight: number;
+  /** 简短原因说明 */
+  reason: string;
+}
 
 export interface ExtractionResult {
   nodes: Array<{
@@ -89,6 +113,8 @@ export interface ExtractionResult {
     name: string;
     description: string;
   }>;
+  /** 本轮对话对已召回 L1 节点的置信度更新 */
+  beliefUpdates?: BeliefUpdate[];
 }
 
 export interface FinalizeResult {

@@ -778,9 +778,6 @@ export function getTopicNodes(db: DatabaseSyncInstance): GmNode[] {
 
 // ─── Belief System ─────────────────────────────────────────────
 
-export type BeliefSignalType =
-  | "tool_success" | "tool_error" | "user_correction" | "explicit_confirm"
-  | "recall_used" | "recall_rejected" | "belief_increase" | "belief_decrease" | "initial";
 
 /**
  * Beta-Bayesian belief computation.
@@ -792,14 +789,6 @@ export function computeBeliefA(successCount: number, failureCount: number): numb
   return (α + successCount) / (α + β + successCount + failureCount);
 }
 
-/**
- * Exponential Moving Average belief update.
- * belief_t = λ * belief_{t-1} + (1-λ) * signal
- */
-export function computeBeliefB(currentBelief: number, signal: number, λ = 0.85): number {
-  const newBelief = λ * currentBelief + (1 - λ) * (signal > 0 ? 1 : signal < 0 ? 0 : 0.5);
-  return Math.max(0, Math.min(1, newBelief));
-}
 
 /**
  * Record a belief signal for a node.
@@ -812,7 +801,7 @@ export function recordBeliefSignal(
   db: DatabaseSyncInstance,
   nodeId: string,
   nodeName: string,
-  signalType: BeliefSignalType,
+  verdict: "supported" | "contradicted",
   sessionId: string,
   weight = 1.0,
   context: Record<string, unknown> = {},
@@ -822,7 +811,7 @@ export function recordBeliefSignal(
       INSERT INTO gm_belief_signals (id, node_id, node_name, signal_type, weight, context, session_id, created_at)
       VALUES (?,?,?,?,?,?,?,?)
     `).run(
-      beliefUid("bsig"), nodeId, nodeName, signalType, weight, JSON.stringify(context), sessionId, Date.now(),
+      beliefUid("bsig"), nodeId, nodeName, verdict, weight, JSON.stringify(context), sessionId, Date.now(),
     );
   } catch {
     // gm_belief_signals may not exist in pre-belief databases
@@ -844,7 +833,8 @@ export interface BeliefUpdateResult {
 export function updateNodeBelief(
   db: DatabaseSyncInstance,
   nodeId: string,
-  signalType?: BeliefSignalType,
+  verdict?: "supported" | "contradicted",
+  signalWeight = 1.0,  // LLM 给出的权重 0.5-2.0，直接累加
 ): BeliefUpdateResult | null {
   const row = db.prepare(
     "SELECT belief, success_count, failure_count FROM gm_nodes WHERE id=?"
@@ -855,17 +845,10 @@ export function updateNodeBelief(
   let successCount = row.success_count ?? 0;
   let failureCount = row.failure_count ?? 0;
 
-  if (signalType) {
-    const isPositive = (
-      signalType === "tool_success" || signalType === "explicit_confirm" ||
-      signalType === "recall_used" || signalType === "belief_increase" || signalType === "initial"
-    );
-    const isNegative = (
-      signalType === "tool_error" || signalType === "user_correction" ||
-      signalType === "recall_rejected" || signalType === "belief_decrease"
-    );
-    if (isPositive) successCount++;
-    else if (isNegative) failureCount++;
+  if (verdict === "supported") {
+    successCount += signalWeight;
+  } else if (verdict === "contradicted") {
+    failureCount += signalWeight;
   }
 
   const beliefAfter = computeBeliefA(successCount, failureCount);
@@ -909,12 +892,12 @@ export function getBeliefHistory(
   db: DatabaseSyncInstance,
   nodeId: string,
   limit = 20,
-): Array<{ signalType: BeliefSignalType; weight: number; createdAt: number }> {
+): Array<{ verdict: "supported" | "contradicted"; weight: number; createdAt: number }> {
   try {
     return (db.prepare(
       "SELECT signal_type, weight, created_at FROM gm_belief_signals WHERE node_id=? ORDER BY created_at DESC LIMIT ?"
     ).all(nodeId, limit) as any[]).map(r => ({
-      signalType: r.signal_type as BeliefSignalType,
+      verdict: r.signal_type as "supported" | "contradicted",
       weight: r.weight,
       createdAt: r.created_at,
     }));

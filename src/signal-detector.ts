@@ -1,20 +1,15 @@
 /**
- * graph-memory — Belief Signal Detector
+ * graph-memory — Belief Update Detector (Simplified)
  *
- * Extracts belief signals from conversation context.
+ * Detects belief updates from user messages using pattern matching.
+ * This complements the LLM-based belief detection in extract.ts.
  *
- * Signal Types:
+ * Update Types (Pattern-based only):
  * - user_correction:   User explicitly corrects/contradicts a recalled node
- * - explicit_confirm: User explicitly confirms a recalled node was correct
- * - tool_error:       Tool call failed after recalling this node
- * - tool_success:     Tool call succeeded after recalling this node
- * - recall_used:      Recalled node's guidance was followed in this turn
- * - recall_rejected:   Recalled node's guidance was contradicted/ignored
+ * - explicit_confirm:  User explicitly confirms a recalled node was correct
  *
- * Detection Strategy:
- * 1. Pattern matching on user message for corrections/confirms
- * 2. Tool result parsing for success/failure
- * 3. Semantic matching: associate signals with recalled nodes
+ * Note: Tool success/failure signals are detected by LLM in extract.ts
+ * to avoid redundant LLM calls and improve accuracy.
  */
 
 import type { TieredNode } from "./recaller/recall.ts";
@@ -23,13 +18,13 @@ import type { TieredNode } from "./recaller/recall.ts";
 
 /** High-confidence correction patterns (user explicitly says something is wrong) */
 const CORRECTION_PATTERNS_HIGH = [
-  /不对|不是|错了|纠正|修正|取消|停|不对的|不正确/i,
+  /不对 | 不是 | 错了 | 纠正 | 修正 | 取消 | 停 | 不对的 | 不正确/i,
   /wrong|incorrect|not right|cancel|stop|never mind/i,
 ];
 
 /** Medium-confidence correction patterns (user expresses doubt/negation) */
 const CORRECTION_PATTERNS_MEDIUM = [
-  /不行|没用|无用|有误|失败|别|不要/i,
+  /不行 | 没用 | 无用 | 有误 | 失败 | 别 | 不要/i,
   /doesn'?t work|didn?'?t work|failed|i don'?t think so/i,
 ];
 
@@ -38,7 +33,7 @@ const CORRECTION_PATTERNS_MEDIUM = [
  * Checked AFTER correction detection to filter false positives.
  */
 const CORRECTION_FALSE_POSITIVE = [
-  /不要停|不要中断工具调用|别停/i,   // encouragement to continue, not correction
+  /不要停 | 不要中断工具调用 | 别停/i,   // encouragement to continue, not correction
   /完成前不要中断/i,                 // continuation instruction
 ];
 
@@ -49,17 +44,17 @@ const CORRECTION_FALSE_POSITIVE = [
  */
 const CONFIRM_PATTERNS = [
   // Chinese: explicit confirm at word boundary (positive lookahead)
-  /(?:^|[\s,。!?])对的(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])可以(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])好的(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])行(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])行吧(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])好(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])好吧(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])明白(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])知道了(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])正确(?:[\s,。!?]|$)/,
-  /(?:^|[\s,。!?])谢谢(?:[\s,。!?]|$)/i,
+  /(?:^|[\s,。!?]) 对的 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 可以 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 好的 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 行 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 行吧 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 好 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 好吧 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 明白 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 知道了 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 正确 (?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?]) 谢谢 (?:[\s,。!?]|$)/i,
   // English
   /(?:^|[\s,])ok(?:[\s,!?.]|$)/i,
   /(?:^|[\s,])yes(?:[\s,!?.]|$)/i,
@@ -73,44 +68,10 @@ const CONFIRM_PATTERNS = [
 /** Patterns that negate a confirmation — NOT a confirm signal */
 const NEGATE_CONFIRM_PATTERNS = [
   /^谢谢你/im,           // gratitude at start — not confirmation
-  /好不好|好吗|好不/i,   // question form
+  /好不好 | 好吗 | 好不/i,   // question form
   /^呃/im,               // hesitation at line start
-  /^那[,.。!?\s]/m,     // "那" at line start → follow-up, not confirm
+  /^那 [,.。!?\s]/m,     // "那" at line start → follow-up, not confirm
   /怎么.*\?$|为什么.*\?$/i,  // question ending → not confirm
-];
-
-/** Tool error indicators — must be REAL errors, not code snippets containing "error" */
-const TOOL_ERROR_PATTERNS = [
-  // Structured error responses (OpenClaw tool error format)
-  /"status"\s*:\s*"error"/,
-  /Error\[ERR_/,                    // Node.js system errors
-  /command exited with code [1-9]/, // Non-zero exit codes
-  /fatal error/i,
-  /permission denied/i,
-  /ENOENT|EACCES|EISDIR/,         // Common FS errors
-  /未找到|权限不足/i,
-  // Explicit failure in tool output (not code context)
-  /^(?:Error|FAILED|FAILURE)\b/m,
-];
-
-/** Patterns that indicate the text is CODE, not a real error */
-const TOOL_ERROR_FALSE_POSITIVE = [
-  /```/s,                          // Inside code block → not a real error
-  /\bTS\d{4}\b/,                   // TypeScript compiler diagnostics
-  /\berror TS\w+\b/,              // TypeScript type errors in code
-  /node:internal\/modules/,        // Node internal stack traces (often noise)
-  /throw (err|new Error)/,         // Code containing throw statements
-  /test\/[^\s]+\.ts\(/,            // Test file references in TS compiler output
-  /\.filter\(/,                   // Code containing .filter() calls
-  /triggerUncaughtException/,      // Node crash output (noise)
-  /package_json_reader/,           // Node internal module
-  /const text = `/s,               // Template literal assignments (code)
-];
-
-/** Tool success indicators — must be clear operational success */
-const TOOL_SUCCESS_PATTERNS = [
-  /\[SUCCESS\]|成功|已创建|已删除|已更新|已完成/i,
-  /^(?:success|done|completed|ready)\b/im,
 ];
 
 // ─── Text Extraction ────────────────────────────────────────────
@@ -147,38 +108,18 @@ export function extractUserMessages(messages: any[]): Array<{ text: string; turn
   return results;
 }
 
-/** Extract tool results from a turn's messages */
-export function extractToolResults(messages: any[]): Array<{ toolName: string; text: string; isError: boolean }> {
-  const results: Array<{ toolName: string; text: string; isError: boolean }> = [];
-  for (const msg of messages) {
-    if (msg.role === "tool" || msg.role === "toolResult") {
-      const text = extractTextFromContent(msg.content);
-      const toolName = (msg as any).name ?? (msg as any).tool_name ?? "unknown";
-      
-      // Check for real error patterns
-      const hasError = TOOL_ERROR_PATTERNS.some(p => p.test(text));
-      // Filter out false positives (code snippets, TS diagnostics)
-      const isFalsePositive = TOOL_ERROR_FALSE_POSITIVE.some(p => p.test(text));
-      const isError = hasError && !isFalsePositive;
-      
-      results.push({ toolName, text, isError });
-    }
-  }
-  return results;
-}
-
 // ─── Signal Detection ────────────────────────────────────────────
 
 export interface DetectedSignal {
-  /** What kind of signal */
-  type: "user_correction" | "explicit_confirm" | "tool_error" | "tool_success" | "recall_used" | "recall_rejected";
+  /** What kind of belief update */
+  type: "user_correction" | "explicit_confirm";
   /** Which node name this relates to (best guess) */
   nodeName: string | null;
   /** Which node IDs this relates to */
   nodeIds: string[];
   /** How confident we are (0-1) */
   confidence: number;
-  /** The text that triggered this signal */
+  /** The text that triggered this update */
   triggerText: string;
   /** The full turn messages for context */
   messages: any[];
@@ -191,20 +132,19 @@ export interface SignalDetectionContext {
   recalledNodes: TieredNode[];
   /** The user's message text */
   userText: string;
-  /** Tool results from this turn */
-  toolResults: Array<{ toolName: string; text: string; isError: boolean }>;
   /** Session ID */
   sessionId: string;
 }
 
 /**
- * Detect belief signals from a conversation turn.
+ * Detect belief updates from a conversation turn using pattern matching.
  *
- * Returns an array of detected signals, ordered by confidence (highest first).
+ * This complements the LLM-based belief detection in extract.ts.
+ * Returns an array of detected updates, ordered by confidence (highest first).
  */
 export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
   const signals: DetectedSignal[] = [];
-  const { turnMessages, recalledNodes, userText, toolResults, sessionId } = ctx;
+  const { turnMessages, recalledNodes, userText, sessionId } = ctx;
 
   // ── 1. User Correction Detection ──────────────────────────────
   let correctionScore = Math.max(
@@ -252,70 +192,6 @@ export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
     });
   }
 
-  // ── 3. Tool Result Analysis ────────────────────────────────
-  for (const tool of toolResults) {
-    const targetNodes = rankTargetNodes(recalledNodes);
-
-    if (tool.isError) {
-      signals.push({
-        type: "tool_error",
-        nodeName: targetNodes[0]?.name ?? null,
-        nodeIds: targetNodes.map(n => n.id),
-        confidence: 0.8,
-        triggerText: tool.text.slice(0, 100),
-        messages: turnMessages,
-      });
-    } else {
-      // Check for success patterns
-      const successScore = Math.max(
-        ...TOOL_SUCCESS_PATTERNS.map(p => p.test(tool.text) ? 0.7 : 0),
-      );
-      if (successScore > 0) {
-        signals.push({
-          type: "tool_success",
-          nodeName: targetNodes[0]?.name ?? null,
-          nodeIds: targetNodes.map(n => n.id),
-          confidence: successScore,
-          triggerText: tool.text.slice(0, 100),
-          messages: turnMessages,
-        });
-      }
-    }
-  }
-
-  // ── 4. Recall Feedback ──────────────────────────────────────
-  // Use targetNodes with rank decay — only L1 nodes ranked by semantic+PPR
-  // Confidence decreases with rank (top node is most likely the cause)
-  const targetNodes = rankTargetNodes(recalledNodes);
-  if (targetNodes.length > 0) {
-    const hadCorrection = correctionScore > 0;
-    const hadConfirm = confirmScore > 0;
-
-    for (let i = 0; i < targetNodes.length; i++) {
-      const rankDecay = 1.0 / (1.0 + i * 0.3);
-
-      if (hadCorrection) {
-        signals.push({
-          type: "recall_rejected",
-          nodeName: targetNodes[i].name,
-          nodeIds: [targetNodes[i].id],
-          confidence: 0.6 * rankDecay,
-          triggerText: userText.slice(0, 80),
-          messages: turnMessages,
-        });
-      } else if (hadConfirm) {
-        signals.push({
-          type: "recall_used",
-          nodeName: targetNodes[i].name,
-          nodeIds: [targetNodes[i].id],
-          confidence: 0.5 * rankDecay,
-          triggerText: userText.slice(0, 80),
-          messages: turnMessages,
-        });
-      }
-    }
-  }
-
   // Sort by confidence
   signals.sort((a, b) => b.confidence - a.confidence);
 
@@ -327,16 +203,6 @@ export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
  *
  * This determines which recalled nodes are most likely to have driven
  * the agent's behavior this turn — the natural targets for belief signals.
- *
- * Algorithm:
- * 1. Filter to L1 tier nodes only (full content, most actionable)
- * 2. Re-rank using normalized semantic score (0.7) + normalized PPR score (0.3)
- * 3. Return top N nodes (default 5)
- *
- * Why exclude PageRank?
- * - PR reflects global importance, not turn-specific relevance
- * - A globally important node that was irrelevant this turn should not
- *   receive credit/blame for this turn's outcome
  */
 function rankTargetNodes(recalledNodes: TieredNode[], topN = 5): TieredNode[] {
   const l1Nodes = recalledNodes.filter(n => n.tier === "L1");
@@ -369,26 +235,22 @@ function rankTargetNodes(recalledNodes: TieredNode[], topN = 5): TieredNode[] {
 }
 
 /**
- * Get the weight for a signal type.
+ * Get the weight for a belief update type (pattern-based detection).
  * Higher weight = stronger effect on belief.
  */
 export function getSignalWeight(
   type: DetectedSignal["type"]
 ): number {
   switch (type) {
-    case "user_correction":    return 3.0;  // Highest: user explicitly said it's wrong
-    case "recall_rejected":    return 2.5;  // High: recalled guidance was wrong
-    case "explicit_confirm":   return 2.0;  // High: user explicitly confirmed
-    case "tool_error":        return 2.0;  // High: tool failed
-    case "recall_used":       return 1.0;  // Medium: guidance was followed
-    case "tool_success":       return 1.0;  // Medium: tool succeeded
+    case "user_correction":    return 2.0;  // Highest: user explicitly said it's wrong
+    case "explicit_confirm":   return 1.5;  // High: user explicitly confirmed
     default:                   return 1.0;
   }
 }
 
 /**
- * Should we emit this signal?
- * Deduplicates and filters low-confidence signals.
+ * Should we emit this belief update?
+ * Deduplicates and filters low-confidence updates.
  */
 export function shouldEmitSignal(
   signal: DetectedSignal,

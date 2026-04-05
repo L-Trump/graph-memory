@@ -21,13 +21,6 @@ import {
   getTopicNodes, getTopicToTopicEdges, getSemanticToTopicEdges,
   updateNodeBelief, recordBeliefSignal,
 } from "./src/store/store.ts";
-import {
-  detectSignals,
-  extractTextFromContent,
-  getSignalWeight,
-  shouldEmitSignal,
-  type DetectedSignal,
-} from "./src/signal-detector.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Recaller, type TieredNode } from "./src/recaller/recall.ts";
@@ -168,9 +161,7 @@ const graphMemoryPlugin = {
 
     // ── Belief 追踪状态 ────────────────────────────────────────
     // 追踪每个 session 中本轮 recall 的节点
-    const recalledNodesPerTurn = new Map<string, TieredNode[]>();
-    // 追踪最近 N 轮已发射的信号（去重用）
-    const recentSignalsPerTurn = new Map<string, DetectedSignal[]>();
+
 
     // ── 提取串行化（同 session Promise chain，不同 session 并行）────
     const extractChain = new Map<string, Promise<void>>();
@@ -251,12 +242,42 @@ const graphMemoryPlugin = {
           const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
           markExtracted(db, sessionId, maxTurn);
 
+          // ── 处理置信度更新（beliefUpdates）────────────────────────
+          if (result.beliefUpdates && result.beliefUpdates.length > 0) {
+            for (const update of result.beliefUpdates) {
+              const node = findByName(db, update.nodeName);
+              if (!node) continue;
+
+              try {
+                // verdict 直接存储：supported=正例，contradicted=反例
+                recordBeliefSignal(db, node.id, node.name, update.verdict, sessionId, update.weight, {
+                  source: "extract_llm",
+                  reason: update.reason,
+                });
+
+                // updateNodeBelief 直接用 verdict 判断正负，用 LLM 给出的 weight 累加
+                const updateResult = updateNodeBelief(db, node.id, update.verdict, update.weight);
+                if (updateResult && Math.abs(updateResult.delta) > 0.001) {
+                  api.logger.info(
+                    `[graph-memory] belief ${node.name}: ${updateResult.beliefBefore.toFixed(3)} → ${updateResult.beliefAfter.toFixed(3)} (Δ=${updateResult.delta >= 0 ? "+" : ""}${updateResult.delta.toFixed(3)}) [${update.verdict} weight=${update.weight.toFixed(1)}]`,
+                  );
+                  invalidateGraphCache();
+                }
+              } catch (err) {
+                api.logger.warn(`[graph-memory] record belief for ${node.name} failed: ${err}`);
+              }
+            }
+          }
+
           if (result.nodes.length || result.edges.length) {
             invalidateGraphCache();
             const nodeDetails = result.nodes.map((n: any) => `${n.type}:${n.name}`).join(", ");
             const edgeDetails = result.edges.map((e: any) => `${e.from}→[${e.name}]→${e.to}`).join(", ");
+            const signalDetails = result.beliefUpdates?.length
+              ? `, ${result.beliefUpdates.length} belief updates [${result.beliefUpdates.map(u => `${u.nodeName}:${u.verdict}`).join(", ")}]`
+              : "";
             api.logger.info(
-              `[graph-memory] extracted ${result.nodes.length} nodes [${nodeDetails}], ${result.edges.length} edges [${edgeDetails}]`,
+              `[graph-memory] extracted ${result.nodes.length} nodes [${nodeDetails}], ${result.edges.length} edges [${edgeDetails}]${signalDetails}`,
             );
           }
         } catch (err) {
@@ -288,9 +309,7 @@ const graphMemoryPlugin = {
           if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) {
             recalled.set(ctx.sessionKey, stored);
           }
-          // 追踪本轮 recall 的节点（用于 belief 信号检测）
-          const sid = ctx?.sessionKey ?? ctx?.sessionId;
-          if (sid) recalledNodesPerTurn.set(sid, res.nodes);
+
           api.logger.info(
             `[graph-memory] recalled ${res.nodes.length} nodes, ${res.edges.length} edges`,
           );
@@ -499,92 +518,6 @@ const graphMemoryPlugin = {
           `[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
         );
 
-        // ── Belief 信号检测与更新 ──────────────────────────────
-        if (newMessages.length > 0) {
-          try {
-            const recalledNodes = recalledNodesPerTurn.get(sessionId) ?? [];
-            const recentSignals = recentSignalsPerTurn.get(sessionId) ?? [];
-
-            // 提取用户消息
-            const userMsgs = newMessages
-              .filter((m: any) => m.role === "user")
-              .map((m: any) => ({
-                text: extractTextFromContent(m.content),
-                turnIndex: m.turn_index ?? 0,
-              }))
-              .filter((m: any) => m.text.trim());
-
-            // 提取工具结果
-            const toolResults = newMessages
-              .filter((m: any) => m.role === "tool" || m.role === "toolResult")
-              .map((m: any) => ({
-                toolName: (m as any).toolName ?? (m as any).name ?? "unknown",
-                text: extractTextFromContent(m.content),
-                isError: (m.content ?? "").toString().includes("error") ||
-                  (m.content ?? "").toString().includes("failed") ||
-                  (m.content ?? "").toString().includes("权限"),
-              }));
-
-            // 组合上下文
-            const userText = userMsgs.map((m: any) => m.text).join("\n");
-
-            if (userText || toolResults.length > 0) {
-              const signals = detectSignals({
-                turnMessages: newMessages,
-                recalledNodes,
-                userText,
-                toolResults,
-                sessionId,
-              });
-
-              let emittedCount = 0;
-              for (const signal of signals) {
-                if (!shouldEmitSignal(signal, recentSignals)) continue;
-
-                // 找到对应的节点（优先用 recall 的节点匹配）
-                const targetNodeIds = signal.nodeIds.length > 0
-                  ? signal.nodeIds
-                  : recalledNodes.map(n => n.id);
-
-                const weight = getSignalWeight(signal.type);
-
-                for (const nodeId of targetNodeIds) {
-                  // 记录信号
-                  const node = recalledNodes.find(n => n.id === nodeId);
-                  const nodeName = node?.name ?? signal.nodeName ?? "unknown";
-                  try {
-                    recordBeliefSignal(db, nodeId, nodeName, signal.type, sessionId, weight, {
-                      confidence: signal.confidence,
-                      triggerText: signal.triggerText.slice(0, 100),
-                    });
-                  } catch { /* belief may not be migrated yet */ }
-
-                  // 更新置信度
-                  try {
-                    const result = updateNodeBelief(db, nodeId, signal.type);
-                    if (result && Math.abs(result.delta) > 0.001) {
-                      api.logger.info(
-                        `[graph-memory] belief ${nodeName}: ${result.beliefBefore.toFixed(3)} → ${result.beliefAfter.toFixed(3)} (Δ=${result.delta >= 0 ? "+" : ""}${result.delta.toFixed(3)}) [${signal.type}]`,
-                      );
-                      emittedCount++;
-                    }
-                  } catch { /* belief may not be migrated yet */ }
-                }
-              }
-
-              // 保存本轮信号（用于后续去重）
-              const updatedRecent = [...recentSignals, ...signals].slice(-20);
-              recentSignalsPerTurn.set(sessionId, updatedRecent);
-
-              if (emittedCount > 0) {
-                invalidateGraphCache();
-              }
-            }
-          } catch (err) {
-            api.logger.warn(`[graph-memory] belief signal detection failed: ${err}`);
-          }
-        }
-
         // ★ 每轮直接提取
         runTurnExtract(sessionId, newMessages).catch((err) => {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
@@ -642,16 +575,12 @@ const graphMemoryPlugin = {
       async onSubagentEnded({ childSessionKey }: { childSessionKey: string }) {
         recalled.delete(childSessionKey);
         msgSeq.delete(childSessionKey);
-        recalledNodesPerTurn.delete(childSessionKey);
-        recentSignalsPerTurn.delete(childSessionKey);
       },
 
       async dispose() {
         extractChain.clear();
         msgSeq.clear();
         recalled.clear();
-        recalledNodesPerTurn.clear();
-        recentSignalsPerTurn.clear();
       },
     };
 
@@ -757,11 +686,11 @@ const graphMemoryPlugin = {
           const sessionBeliefNodes = getBySession(db, sid);
           for (const node of sessionBeliefNodes) {
             try {
-              recordBeliefSignal(db, node.id, node.name, "belief_increase", sid, 1.0, {
+              recordBeliefSignal(db, node.id, node.name, "supported", sid, 1.0, {
                 source: "session_end",
                 nodeCount: sessionBeliefNodes.length,
               });
-              updateNodeBelief(db, node.id, "belief_increase");
+              updateNodeBelief(db, node.id, "supported");
             } catch { /* belief may not be migrated */ }
           }
           if (sessionBeliefNodes.length > 0) {
