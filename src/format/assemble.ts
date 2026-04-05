@@ -19,7 +19,7 @@
 
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import type { GmNode, GmEdge } from "../types.ts";
-import { getCommunitySummary, getEpisodicMessages, graphWalk } from "../store/store.ts";
+import { getEpisodicMessages } from "../store/store.ts";
 import type { GmConfig } from "../types.ts";
 import type { TieredNode, RecallTier } from "../recaller/recall.ts";
 
@@ -82,37 +82,6 @@ function shouldRenderEdge(fromTier: RecallTier, toTier: RecallTier): boolean {
 function edgeHasDescription(fromTier: RecallTier, toTier: RecallTier): boolean {
   return fromTier === "hot" || fromTier === "active" || fromTier === "L1" ||
          toTier === "hot" || toTier === "active" || toTier === "L1";
-}
-
-// ─── 节点输出（按 tier）────────────────────────────────────
-// L1: 完整 content；L2: description；L3: name；filtered: 不渲染
-function formatNode(n: MergedNode): string {
-  if (n.tier === "filtered") return "";
-
-  const tag = n.type.toLowerCase();
-  const srcAttr = ` source="recalled"`;
-  const tierAttr = ` tier="${n.tier.toLowerCase()}"`;
-  const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-
-  if (n.tier === "L3") {
-    return `    <${tag} name="${escapeXml(n.name)}"${srcAttr}${tierAttr}${timeAttr}/>`;
-  } else if (n.tier === "L2") {
-    return `    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}/>`;
-  } else {
-    // L1
-    return `    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}>\n${n.content.trim()}\n    </${tag}>`;
-  }
-}
-
-// ─── 邻居输出 ────────────────────────────────────────────────
-
-function formatNeighbor(neighbor: GmNode, tier: RecallTier): string {
-  if (tier === "L1") {
-    return `      <neighbor name="${neighbor.name}" desc="${escapeXml(neighbor.description)}">\n${neighbor.content.trim()}\n      </neighbor>`;
-  } else {
-    // L2: 邻居只有 description
-    return `      <neighbor name="${neighbor.name}" desc="${escapeXml(neighbor.description)}"/>`;
-  }
 }
 
 // ─── 边输出 ─────────────────────────────────────────────────
@@ -189,42 +158,6 @@ export function buildSystemPromptAddition(params: {
   return sections.join("\n");
 }
 
-// ─── 邻居扩展 ─────────────────────────────────────────────────
-
-/**
- * 为 L1/L2 节点扩展邻居
- * L1: 邻居完整 content；L2: 邻居 description
- */
-function expandNeighbors(
-  db: DatabaseSyncInstance,
-  nodes: TieredNode[],
-  depth = 1,
-): Map<string, { node: GmNode; edges: GmEdge[] }> {
-  const result = new Map<string, { node: GmNode; edges: GmEdge[] }>();
-
-  // L1/L2 需要邻居扩展
-  const needExpand = nodes.filter(n => n.tier === "L1" || n.tier === "L2");
-  if (!needExpand.length) return result;
-
-  const seedIds = needExpand.map(n => n.id);
-  const { nodes: neighborNodes, edges: neighborEdges } = graphWalk(db, seedIds, depth);
-
-  // 构建邻居映射
-  for (const nn of neighborNodes) {
-    if (!result.has(nn.id)) {
-      result.set(nn.id, { node: nn, edges: [] });
-    }
-  }
-  for (const e of neighborEdges) {
-    const fromEntry = result.get(e.fromId);
-    const toEntry = result.get(e.toId);
-    if (fromEntry) fromEntry.edges.push(e);
-    if (toEntry) toEntry.edges.push(e);
-  }
-
-  return result;
-}
-
 // ─── 组装主函数 ──────────────────────────────────────────────
 
 export interface AssembleParams {
@@ -278,62 +211,24 @@ export function assembleContext(
   const idToName = new Map<string, string>();
   for (const n of passNodes) idToName.set(n.id, n.name);
 
-  // ── 按社区分组 ──────────────────────────────────────────
-  const byCommunity = new Map<string, typeof passNodes>();
-  const noCommunity: typeof passNodes = [];
-
-  for (const n of passNodes) {
-    if ((n as any).communityId) {
-      const cid = (n as any).communityId;
-      if (!byCommunity.has(cid)) byCommunity.set(cid, []);
-      byCommunity.get(cid)!.push(n);
-    } else {
-      noCommunity.push(n);
-    }
-  }
-
-  // ── 构建节点 XML ─────────────────────────────────────────
+  // ── 构建节点 XML（统一渲染，不分社区）──────────────────────
   const xmlParts: string[] = [];
 
-  for (const [cid, members] of byCommunity) {
-    const summary = getCommunitySummary(db, cid);
-    const label = summary ? escapeXml(summary.summary) : cid;
-    xmlParts.push(`  <community id="${cid}" desc="${label}">`);
-
-    for (const n of members) {
-      const tag = n.type.toLowerCase();
-      const tier = n.tier;
-      const srcAttr = tier === "active" ? ` source="active"` : ` source="recalled"`;
-      const tierAttr = ` tier="${tier.toLowerCase()}"`;
-      const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-
-      if (tier === "L3") {
-        xmlParts.push(`    <${tag} name="${escapeXml(n.name)}"${srcAttr}${tierAttr}${timeAttr}/>`);
-      } else if (tier === "L2" || tier === "active") {
-        xmlParts.push(`    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}/>`);
-      } else {
-        // L1
-        xmlParts.push(`    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}>\n${n.content.trim()}\n    </${tag}>`);
-      }
-    }
-
-    xmlParts.push(`  </community>`);
-  }
-
-  for (const n of noCommunity) {
+  for (const n of passNodes) {
     const tag = n.type.toLowerCase();
     const tier = n.tier;
     const srcAttr = tier === "active" ? ` source="active"` : ` source="recalled"`;
     const tierAttr = ` tier="${tier.toLowerCase()}"`;
     const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
+    const beliefAttr = n.belief !== undefined ? ` confidence="${n.belief.toFixed(2)}"` : "";
 
     if (tier === "L3") {
-      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}"${srcAttr}${tierAttr}${timeAttr}/>`);
-    } else if (tier === "L2" || tier === "active") {
-      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}/>`);
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}/>`);
+    } else if (tier === "L2") {
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}/>`);
     } else {
-      // L1
-      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${timeAttr}>\n${n.content.trim()}\n  </${tag}>`);
+      // L1 / active
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}>\n${n.content.trim()}\n  </${tag}>`);
     }
   }
 
@@ -473,55 +368,27 @@ export function buildExtractKnowledgeGraph(
 
   if (!passNodes.length) return "";
 
-  // ── 按社区分组 ─────────────────────────────────────────
-  const byCommunity = new Map<string, Entry[]>();
-  const noCommunity: Entry[] = [];
-
-  for (const entry of passNodes) {
-    const cid = entry.node.communityId;
-    if (cid) {
-      if (!byCommunity.has(cid)) byCommunity.set(cid, []);
-      byCommunity.get(cid)!.push(entry);
-    } else {
-      noCommunity.push(entry);
-    }
-  }
-
   // ── id → name 映射 ──────────────────────────────────────
   const idToName = new Map<string, string>();
   for (const { node } of passNodes) idToName.set(node.id, node.name);
 
-  // ── 构建节点 XML ─────────────────────────────────────────
+  // ── 构建节点 XML（统一渲染，不分社区）──────────────────────
   // L1: 完整 content；L2: description；L3: name
-  const renderNode = (entry: Entry): string => {
+  const xmlParts: string[] = [];
+
+  for (const entry of passNodes) {
     const n = entry.node;
     const tag = n.type.toLowerCase();
     const tierAttr = ` tier="${entry.tier.toLowerCase()}"`;
 
     if (entry.tier === "L3") {
-      return `    <${tag} name="${escapeXml(n.name)}"${tierAttr}/>`;
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}"${tierAttr}/>`);
     } else if (entry.tier === "L2") {
-      return `    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${tierAttr}/>`;
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${tierAttr}/>`);
     } else {
       // L1
-      return `    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${tierAttr}>\n${n.content.trim()}\n    </${tag}>`;
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${tierAttr}>\n${n.content.trim()}\n  </${tag}>`);
     }
-  };
-
-  const xmlParts: string[] = [];
-
-  for (const [cid, members] of byCommunity) {
-    const summary = getCommunitySummary(db, cid);
-    const label = summary ? escapeXml(summary.summary) : cid;
-    xmlParts.push(`  <community id="${cid}" desc="${label}">`);
-    for (const entry of members) {
-      xmlParts.push(renderNode(entry));
-    }
-    xmlParts.push(`  </community>`);
-  }
-
-  for (const entry of noCommunity) {
-    xmlParts.push(renderNode(entry));
   }
 
   // ── 构建边 XML ─────────────────────────────────────────
