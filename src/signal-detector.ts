@@ -17,7 +17,7 @@
  * 3. Semantic matching: associate signals with recalled nodes
  */
 
-import type { GmNode } from "./types.ts";
+import type { TieredNode } from "./recaller/recall.ts";
 
 // ─── Pattern Definitions ──────────────────────────────────────────
 
@@ -187,8 +187,8 @@ export interface DetectedSignal {
 export interface SignalDetectionContext {
   /** Messages from this turn (user + assistant + tools) */
   turnMessages: any[];
-  /** Nodes that were recalled in this session */
-  recalledNodes: GmNode[];
+  /** Nodes that were recalled in this turn (TieredNode with scores) */
+  recalledNodes: TieredNode[];
   /** The user's message text */
   userText: string;
   /** Tool results from this turn */
@@ -221,12 +221,12 @@ export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
   }
 
   if (correctionScore > 0) {
-    // Try to match with recalled nodes
-    const matchedNodes = matchNodesWithText(recalledNodes, userText);
+    // Target nodes: L1 nodes ranked by semantic + PPR (excluding PR/belief)
+    const targetNodes = rankTargetNodes(recalledNodes);
     signals.push({
       type: "user_correction",
-      nodeName: matchedNodes[0]?.name ?? null,
-      nodeIds: matchedNodes.map(n => n.id),
+      nodeName: targetNodes[0]?.name ?? null,
+      nodeIds: targetNodes.map(n => n.id),
       confidence: correctionScore,
       triggerText: userText.slice(0, 100),
       messages: turnMessages,
@@ -241,11 +241,11 @@ export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
     : Math.max(...CONFIRM_PATTERNS.map(p => p.test(userText) ? 0.7 : 0));
 
   if (confirmScore > 0) {
-    const matchedNodes = matchNodesWithText(recalledNodes, userText);
+    const targetNodes = rankTargetNodes(recalledNodes);
     signals.push({
       type: "explicit_confirm",
-      nodeName: matchedNodes[0]?.name ?? null,
-      nodeIds: matchedNodes.map(n => n.id),
+      nodeName: targetNodes[0]?.name ?? null,
+      nodeIds: targetNodes.map(n => n.id),
       confidence: confirmScore,
       triggerText: userText.slice(0, 100),
       messages: turnMessages,
@@ -254,13 +254,13 @@ export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
 
   // ── 3. Tool Result Analysis ────────────────────────────────
   for (const tool of toolResults) {
-    const matchedNodes = matchNodesWithText(recalledNodes, tool.text);
+    const targetNodes = rankTargetNodes(recalledNodes);
 
     if (tool.isError) {
       signals.push({
         type: "tool_error",
-        nodeName: matchedNodes[0]?.name ?? null,
-        nodeIds: matchedNodes.map(n => n.id),
+        nodeName: targetNodes[0]?.name ?? null,
+        nodeIds: targetNodes.map(n => n.id),
         confidence: 0.8,
         triggerText: tool.text.slice(0, 100),
         messages: turnMessages,
@@ -273,8 +273,8 @@ export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
       if (successScore > 0) {
         signals.push({
           type: "tool_success",
-          nodeName: matchedNodes[0]?.name ?? null,
-          nodeIds: matchedNodes.map(n => n.id),
+          nodeName: targetNodes[0]?.name ?? null,
+          nodeIds: targetNodes.map(n => n.id),
           confidence: successScore,
           triggerText: tool.text.slice(0, 100),
           messages: turnMessages,
@@ -284,28 +284,31 @@ export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
   }
 
   // ── 4. Recall Feedback ──────────────────────────────────────
-  // If nodes were recalled AND user didn't correct, it's implicit "recall_used"
-  // If nodes were recalled AND user corrected, it's "recall_rejected"
-  if (recalledNodes.length > 0) {
+  // Use targetNodes with rank decay — only L1 nodes ranked by semantic+PPR
+  // Confidence decreases with rank (top node is most likely the cause)
+  const targetNodes = rankTargetNodes(recalledNodes);
+  if (targetNodes.length > 0) {
     const hadCorrection = correctionScore > 0;
     const hadConfirm = confirmScore > 0;
 
-    for (const node of recalledNodes) {
+    for (let i = 0; i < targetNodes.length; i++) {
+      const rankDecay = 1.0 / (1.0 + i * 0.3);
+
       if (hadCorrection) {
         signals.push({
           type: "recall_rejected",
-          nodeName: node.name,
-          nodeIds: [node.id],
-          confidence: 0.6,
+          nodeName: targetNodes[i].name,
+          nodeIds: [targetNodes[i].id],
+          confidence: 0.6 * rankDecay,
           triggerText: userText.slice(0, 80),
           messages: turnMessages,
         });
       } else if (hadConfirm) {
         signals.push({
           type: "recall_used",
-          nodeName: node.name,
-          nodeIds: [node.id],
-          confidence: 0.5,
+          nodeName: targetNodes[i].name,
+          nodeIds: [targetNodes[i].id],
+          confidence: 0.5 * rankDecay,
           triggerText: userText.slice(0, 80),
           messages: turnMessages,
         });
@@ -320,114 +323,49 @@ export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
 }
 
 /**
- * Match recalled nodes against a piece of text.
- * Returns nodes whose name/description/content matches the text.
- * 
- * Matching strategy:
- * 1. Exact name match (highest score)
- * 2. Chinese keyword overlap (name hyphens → individual chars/words)
- * 3. Description keyword overlap
- * 4. Content keyword overlap (lower weight, noisier)
+ * Rank L1 recalled nodes by semantic + PPR (excluding PageRank/belief influence).
+ *
+ * This determines which recalled nodes are most likely to have driven
+ * the agent's behavior this turn — the natural targets for belief signals.
+ *
+ * Algorithm:
+ * 1. Filter to L1 tier nodes only (full content, most actionable)
+ * 2. Re-rank using normalized semantic score (0.7) + normalized PPR score (0.3)
+ * 3. Return top N nodes (default 5)
+ *
+ * Why exclude PageRank?
+ * - PR reflects global importance, not turn-specific relevance
+ * - A globally important node that was irrelevant this turn should not
+ *   receive credit/blame for this turn's outcome
  */
-function matchNodesWithText(nodes: GmNode[], text: string): GmNode[] {
-  if (!text.trim() || !nodes.length) return [];
+function rankTargetNodes(recalledNodes: TieredNode[], topN = 5): TieredNode[] {
+  const l1Nodes = recalledNodes.filter(n => n.tier === "L1");
+  if (l1Nodes.length === 0) return [];
 
-  const textLower = text.toLowerCase();
-  const scored: Array<{ node: GmNode; score: number }> = [];
+  // If only one L1 node, it's the obvious target
+  if (l1Nodes.length === 1) return l1Nodes;
 
-  // Extract meaningful keywords from the user text (Chinese and English)
-  const textKeywords = extractKeywords(textLower);
+  // Find min/max for normalization
+  const semScores = l1Nodes.map(n => n.semanticScore);
+  const pprScores = l1Nodes.map(n => n.pprScore);
+  const semMin = Math.min(...semScores);
+  const semMax = Math.max(...semScores);
+  const pprMin = Math.min(...pprScores);
+  const pprMax = Math.max(...pprScores);
 
-  for (const node of nodes) {
-    let score = 0;
+  const semRange = semMax - semMin || 1;
+  const pprRange = pprMax - pprMin || 1;
 
-    // ── Level 1: Name exact match (highest) ──
-    const nameLower = node.name.toLowerCase();
-    if (textLower.includes(nameLower)) {
-      score = Math.max(score, 0.95);
-    }
+  // Re-rank: 70% semantic + 30% PPR (both normalized to [0, 1])
+  const ranked = l1Nodes.map(n => {
+    const normSem = (n.semanticScore - semMin) / semRange;
+    const normPpr = (n.pprScore - pprMin) / pprRange;
+    const decisionScore = 0.7 * normSem + 0.3 * normPpr;
+    return { node: n, score: decisionScore };
+  });
 
-    // ── Level 2: Name keyword overlap ──
-    // e.g. "workspace-external-file-safety-rule" → keywords: workspace, external, file, safety, rule
-    // "don't touch files outside workspace" → workspace, file, external → overlap
-    const nameParts = nameLower
-      .split(/[-_\s]+/)
-      .filter(p => p.length >= 2);
-    
-    if (nameParts.length > 0 && textKeywords.length > 0) {
-      const nameOverlap = nameParts.filter(p => textKeywords.includes(p));
-      if (nameOverlap.length > 0) {
-        const overlapRatio = nameOverlap.length / nameParts.length;
-        score = Math.max(score, 0.5 + 0.3 * overlapRatio);
-      }
-    }
-
-    // ── Level 3: Description keyword overlap ──
-    if (node.description && node.description.length > 5) {
-      const descKeywords = extractKeywords(node.description.toLowerCase());
-      if (descKeywords.length > 0 && textKeywords.length > 0) {
-        const descOverlap = descKeywords.filter(k => textKeywords.includes(k));
-        if (descOverlap.length > 0) {
-          const overlapRatio = descOverlap.length / Math.min(descKeywords.length, 10);
-          score = Math.max(score, 0.3 + 0.4 * overlapRatio);
-        }
-      }
-    }
-
-    // ── Level 4: Content keyword overlap (lower weight) ──
-    if (node.content && node.content.length > 10 && score < 0.5) {
-      const contentLower = node.content.toLowerCase();
-      const contentKeywords = extractKeywords(contentLower).slice(0, 30); // Limit to top 30
-      if (contentKeywords.length > 0) {
-        const contentOverlap = contentKeywords.filter(k => textKeywords.includes(k));
-        if (contentOverlap.length >= 2) {
-          score = Math.max(score, 0.2 + 0.2 * (contentOverlap.length / contentKeywords.length));
-        }
-      }
-    }
-
-    if (score > 0.3) {
-      scored.push({ node, score });
-    }
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored.map(s => s.node);
-}
-
-/**
- * Extract meaningful keywords from text.
- * Handles both English (word split) and Chinese (char bigrams + common words).
- */
-function extractKeywords(text: string): string[] {
-  const keywords = new Set<string>();
-
-  // English words (>= 3 chars)
-  for (const word of text.match(/[a-z]{3,}/g) ?? []) {
-    keywords.add(word);
-  }
-
-  // Chinese characters: extract common meaningful 2-char combinations
-  const chinese = text.replace(/[^\u4e00-\u9fff]/g, "");
-  if (chinese.length >= 2) {
-    // Bigrams
-    for (let i = 0; i < chinese.length - 1; i++) {
-      keywords.add(chinese.slice(i, i + 2));
-    }
-    // Also add common meaningful words (3-4 chars)
-    for (let len = 3; len <= 4; len++) {
-      for (let i = 0; i <= chinese.length - len; i++) {
-        const word = chinese.slice(i, i + len);
-        // Only add if it's likely a real word (not random char combo)
-        // Simple heuristic: if the word appears multiple times, it's likely meaningful
-        if (chinese.split(word).length > 1) {
-          keywords.add(word);
-        }
-      }
-    }
-  }
-
-  return [...keywords];
+  ranked.sort((a, b) => b.score - a.score);
+  return ranked.slice(0, topN).map(r => r.node);
 }
 
 /**
