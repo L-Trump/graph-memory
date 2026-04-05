@@ -33,10 +33,41 @@ const CORRECTION_PATTERNS_MEDIUM = [
   /doesn'?t work|didn?'?t work|failed|i don'?t think so/i,
 ];
 
-/** Confirmation patterns (user explicitly agrees) */
+/**
+ * Confirmation patterns (user explicitly agrees)
+ * Note: "好" requires word boundary — avoids matching inside "谢谢你的帮助"
+ * "谢谢" requires clear context — gratitude ≠ confirmation
+ */
 const CONFIRM_PATTERNS = [
-  /对的|可以|好|行|明白了|知道了|谢谢|正确|成功|完成了|好的/i,
-  /correct|right|yes|ok|okay|sounds good|that works|i agree/i,
+  // Chinese: explicit confirm at word boundary (positive lookahead)
+  /(?:^|[\s,。!?])对的(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])可以(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])好的(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])行(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])行吧(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])好(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])好吧(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])明白(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])知道了(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])正确(?:[\s,。!?]|$)/,
+  /(?:^|[\s,。!?])谢谢(?:[\s,。!?]|$)/i,
+  // English
+  /(?:^|[\s,])ok(?:[\s,!?.]|$)/i,
+  /(?:^|[\s,])yes(?:[\s,!?.]|$)/i,
+  /(?:^|[\s,])correct(?:[\s,!?.]|$)/i,
+  /(?:^|[\s,])right(?:[\s,!?.]|$)/i,
+  /(?:^|[\s,])sounds good/i,
+  /(?:^|[\s,])that works/i,
+  /(?:^|[\s,])i agree/i,
+];
+
+/** Patterns that negate a confirmation — NOT a confirm signal */
+const NEGATE_CONFIRM_PATTERNS = [
+  /^谢谢你/im,           // gratitude at start — not confirmation
+  /好不好|好吗|好不/i,   // question form
+  /^呃/im,               // hesitation at line start
+  /^那[,.。!?\s]/m,     // "那" at line start → follow-up, not confirm
+  /怎么.*\?$|为什么.*\?$/i,  // question ending → not confirm
 ];
 
 /** Tool error indicators */
@@ -158,9 +189,11 @@ export function detectSignals(ctx: SignalDetectionContext): DetectedSignal[] {
   }
 
   // ── 2. User Confirmation Detection ──────────────────────────
-  const confirmScore = Math.max(
-    ...CONFIRM_PATTERNS.map(p => p.test(userText) ? 0.7 : 0),
-  );
+  // Check if any negation pattern fires — gratitude ≠ confirmation
+  const negatedByGratitude = NEGATE_CONFIRM_PATTERNS.some(p => p.test(userText));
+  const confirmScore = negatedByGratitude
+    ? 0
+    : Math.max(...CONFIRM_PATTERNS.map(p => p.test(userText) ? 0.7 : 0));
 
   if (confirmScore > 0) {
     const matchedNodes = matchNodesWithText(recalledNodes, userText);
