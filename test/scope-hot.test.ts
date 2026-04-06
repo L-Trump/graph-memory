@@ -4,7 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { getDb, resetDb } from "../src/store/db.ts";
 import {
-  upsertNode, setNodeFlags, upsertEdge,
+  upsertNode, setNodeFlags, upsertEdge, findByName,
   setScopesForSession, getScopesForSession, getScopeHotNodes, listScopes,
   getEdgesForNodes,
 } from "../src/store/store.ts";
@@ -189,5 +189,40 @@ describe("assemble with scope_hot tier", () => {
   it.skip("scope_hot edges are included in output", () => {
     // This test verifies edge rendering but the migration system has edge cases
     // in the test environment. Edge functionality is exercised in integration tests.
+  });
+
+  // ── setNodeFlags 追加模式验证 ────────────────────────────────
+  it("setNodeFlags appends hot without removing other flags", () => {
+    upsertNode(db, { type: "KNOWLEDGE", name: "test-node", description: "", content: "" }, "sid");
+    // 先设一个普通 flag
+    setNodeFlags(db, findByName(db, "test-node")!.id, ["scope_hot:foo"]);
+    // 再追加 hot（模拟 gm_set_hot 的追加逻辑）
+    const node = findByName(db, "test-node")!;
+    setNodeFlags(db, node.id, [...node.flags, "hot"]);
+    const after = findByName(db, "test-node")!;
+    expect(after.flags).toContain("scope_hot:foo");
+    expect(after.flags).toContain("hot");
+    expect(after.flags).toHaveLength(2);
+  });
+
+  it("setNodeFlags appends scope_hot without removing hot or other scope_hot", () => {
+    upsertNode(db, { type: "KNOWLEDGE", name: "test-node", description: "", content: "" }, "sid");
+    // 先设 hot
+    setNodeFlags(db, findByName(db, "test-node")!.id, ["hot"]);
+    // 再追加 scope_hot:foo（模拟 gm_set_scope_hot 的追加逻辑）
+    const node = findByName(db, "test-node")!;
+    setNodeFlags(db, node.id, [...node.flags, "scope_hot:foo"]);
+    const after = findByName(db, "test-node")!;
+    expect(after.flags).toContain("hot");
+    expect(after.flags).toContain("scope_hot:foo");
+    expect(after.flags).toHaveLength(2);
+    // 再追加 scope_hot:bar，也不应移除 scope_hot:foo
+    const node2 = findByName(db, "test-node")!;
+    setNodeFlags(db, node2.id, [...node2.flags, "scope_hot:bar"]);
+    const after2 = findByName(db, "test-node")!;
+    expect(after2.flags).toContain("hot");
+    expect(after2.flags).toContain("scope_hot:foo");
+    expect(after2.flags).toContain("scope_hot:bar");
+    expect(after2.flags).toHaveLength(3);
   });
 });

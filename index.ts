@@ -1207,10 +1207,14 @@ const graphMemoryPlugin = {
           if (!node) {
             return { content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }], details: { success: false } };
           }
-          setNodeFlags(db, node.id, ["hot"]);
+          // 追加 "hot"，不去除已有 flags
+          if ((node.flags || []).includes("hot")) {
+            return { content: [{ type: "text", text: `节点 "${name}" 已经是 hot 节点（flags: [${(node.flags || []).map((f: string) => `"${f}"`).join(", ")}]）。` }], details: { success: true, name, already: true } };
+          }
+          setNodeFlags(db, node.id, [...(node.flags || []), "hot"]);
           invalidateGraphCache();
           return {
-            content: [{ type: "text", text: `节点 "${name}" 已设为 hot 节点（每次 assemble 时必定渲染）。` }],
+            content: [{ type: "text", text: `节点 "${name}" 已追加 hot flag（原 flags: [${(node.flags || []).map((f: string) => `"${f}"`).join(", ")}]）。` }],
             details: { success: true, name },
           };
         },
@@ -1235,11 +1239,14 @@ const graphMemoryPlugin = {
             return { content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }], details: { success: false } };
           }
           const flag = `scope_hot:${scope}`;
-          const existingFlags = (node.flags || []).filter((f: string) => f !== "hot" && !f.startsWith("scope_hot:"));
-          setNodeFlags(db, node.id, [...existingFlags, flag]);
+          // 只对自己去重，保留其他 scope_hot 和 hot
+          if ((node.flags || []).includes(flag)) {
+            return { content: [{ type: "text", text: `节点 "${name}" 已经是 ${flag}（flags: [${(node.flags || []).map((f: string) => `"${f}"`).join(", ")}]）。` }], details: { success: true, name, already: true } };
+          }
+          setNodeFlags(db, node.id, [...(node.flags || []), flag]);
           invalidateGraphCache();
           return {
-            content: [{ type: "text", text: `节点 "${name}" 已设为 scope_hot:${scope}。` }],
+            content: [{ type: "text", text: `节点 "${name}" 已追加 ${flag}（原 flags: [${(node.flags || []).map((f: string) => `"${f}"`).join(", ")}]）。` }],
             details: { success: true, name, flag },
           };
         },
