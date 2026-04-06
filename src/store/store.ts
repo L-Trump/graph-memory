@@ -967,6 +967,55 @@ export function listScopes(db: DatabaseSyncInstance): Array<{ scopeName: string;
 }
 
 /**
+ * 获取节点的完整信息：节点本身 + 所有出边/入边 + Belief 历史信号。
+ */
+export function getNodeFullInfo(
+  db: DatabaseSyncInstance,
+  name: string,
+): {
+  node: GmNode | null;
+  edgesFrom: GmEdge[];
+  edgesTo: GmEdge[];
+  beliefHistory: Array<{ verdict: "supported" | "contradicted"; weight: number; createdAt: number }>;
+} {
+  const node = findByName(db, name);
+  if (!node) return { node: null, edgesFrom: [], edgesTo: [], beliefHistory: [] };
+  const edgesF = edgesFrom(db, node.id);
+  const edgesT = edgesTo(db, node.id);
+  const beliefHistory = getBeliefHistory(db, node.id);
+  return { node, edgesFrom: edgesF, edgesTo: edgesT, beliefHistory };
+}
+
+/**
+ * 直接更新节点的 description 和/或 content（覆盖式，不做合并）。
+ * 返回更新后的节点，或 null（节点不存在）。
+ */
+export function updateNodeFields(
+  db: DatabaseSyncInstance,
+  name: string,
+  fields: { description?: string; content?: string },
+): GmNode | null {
+  const node = findByName(db, name);
+  if (!node) return null;
+  const sets: string[] = [];
+  const vals: any[] = [];
+  if (fields.description !== undefined) {
+    sets.push("description = ?");
+    vals.push(fields.description);
+  }
+  if (fields.content !== undefined) {
+    sets.push("content = ?");
+    vals.push(fields.content);
+  }
+  if (!sets.length) return node;
+  sets.push("updated_at = ?");
+  vals.push(Date.now());
+  vals.push(node.id);
+  db.prepare(`UPDATE gm_nodes SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
+  return findByName(db, name);
+}
+
+/**
  * 获取 topic → topic 边（两端都是 TOPIC 节点，且两端都是 active 的边）
  */
 export function getTopicToTopicEdges(db: DatabaseSyncInstance): GmEdge[] {

@@ -21,6 +21,7 @@ import {
   getTopicNodes, getTopicToTopicEdges, getSemanticToTopicEdges,
   updateNodeBelief, recordBeliefSignal,
   setScopesForSession, getScopesForSession, getScopeHotNodes, listScopes,
+  getNodeFullInfo, updateNodeFields,
 } from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
@@ -1099,6 +1100,209 @@ const graphMemoryPlugin = {
             content: [{
               type: "text",
               text: `节点 "${name}" 的 flags 已更新为 [${flags.map(f => `"${f}"`).join(", ")}]${flags.includes("hot") ? "（hot 节点，每次 assemble 时必定渲染）" : ""}`,
+            }],
+            details: { success: true, name, flags },
+          };
+        },
+      }),
+      { name: "gm_set_flags" },
+    );
+
+    // ── gm_get_node ───────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_get_node",
+        label: "Get Full Node Info from Graph Memory",
+        description: "获取指定节点的完整信息，包括名称、类型、描述、内容、置信度、flags，以及该节点所有出边和入边。适用于查看节点详情。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点名称，精确匹配" }),
+        }),
+        async execute(_toolCallId: string, params: { name: string }) {
+          const { name } = params;
+          const { node, edgesFrom, edgesTo, beliefHistory } = getNodeFullInfo(db, name);
+          if (!node) {
+            return { content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }], details: { success: false } };
+          }
+          const flagsStr = node.flags?.length ? `[${node.flags.map((f: string) => `"${f}"`).join(", ")}]` : "[]";
+          const lines = [
+            `[${node.type}] ${node.name}`,
+            `  描述: ${node.description || "(无)"}`,
+            `  内容: ${(node.content || "(无)").slice(0, 800)}${(node.content || "").length > 800 ? "..." : ""}`,
+            `  状态: ${node.status} | 验证次数: ${node.validatedCount} | PageRank: ${node.pagerank?.toFixed(4) ?? "N/A"}`,
+            `  flags: ${flagsStr}`,
+            `  置信度: ${node.belief?.toFixed(3) ?? "N/A"} (成功: ${node.successCount ?? 0}, 失败: ${node.failureCount ?? 0})`,
+            `  创建: ${new Date(node.createdAt).toLocaleString("zh-CN")} | 更新: ${new Date(node.updatedAt).toLocaleString("zh-CN")}`,
+            `  出边 (${edgesFrom.length}):`,
+            ...edgesFrom.slice(0, 20).map((e: any) =>
+              `    → [${e.type}] ${e.name} → ${e.toId}`
+            ),
+            `  入边 (${edgesTo.length}):`,
+            ...edgesTo.slice(0, 20).map((e: any) =>
+              `    ← [${e.type}] ${e.name} ← ${e.fromId}`
+            ),
+            `  Belief 历史信号 (${beliefHistory.length} 条):`,
+            ...beliefHistory.slice(0, 10).map((s: any) =>
+              `    ${s.verdict === "supported" ? "✅" : "❌"} weight=${s.weight.toFixed(2)} at ${new Date(s.createdAt).toLocaleString("zh-CN")}`
+            ),
+          ];
+          return {
+            content: [{ type: "text", text: lines.join("\n") }],
+            details: { success: true, node, edgesFrom, edgesTo, beliefHistory },
+          };
+        },
+      }),
+      { name: "gm_get_node" },
+    );
+
+    // ── gm_edit_node ──────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_edit_node",
+        label: "Edit Node Content and Description",
+        description: "编辑指定节点的描述和内容（覆盖式更新，不做合并）。编辑完成后自动重新计算语义嵌入向量。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点名称，精确匹配" }),
+          description: Type.Optional(Type.String({ description: "新的描述文本（可选）" })),
+          content: Type.Optional(Type.String({ description: "新的内容文本（可选）" })),
+        }),
+        async execute(_toolCallId: string, params: { name: string; description?: string; content?: string }) {
+          const { name, description, content } = params;
+          if (!description && !content) {
+            return { content: [{ type: "text", text: "至少需要提供 description 或 content 之一。" }], details: { success: false } };
+          }
+          const updated = updateNodeFields(db, name, { description, content });
+          if (!updated) {
+            return { content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }], details: { success: false } };
+          }
+          // Re-embed
+          let embedMsg = "";
+          if (recaller.isEmbedReady()) {
+            await recaller.syncEmbed(updated, true);
+            embedMsg = "，嵌入向量已重新计算";
+          } else {
+            embedMsg = "（embedding 未配置，跳过重新嵌入）";
+          }
+          invalidateGraphCache();
+          return {
+            content: [{ type: "text", text: `节点 "${name}" 已更新${embedMsg}。` }],
+            details: { success: true, node: updated },
+          };
+        },
+      }),
+      { name: "gm_edit_node" },
+    );
+
+    // ── gm_set_hot ───────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_set_hot",
+        label: "Set Node as Hot",
+        description: "将指定节点设置为 hot 节点。hot 节点在每次 assemble 时必定渲染，拥有最高优先级。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点名称，精确匹配" }),
+        }),
+        async execute(_toolCallId: string, params: { name: string }) {
+          const { name } = params;
+          const node = findByName(db, name);
+          if (!node) {
+            return { content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }], details: { success: false } };
+          }
+          setNodeFlags(db, node.id, ["hot"]);
+          invalidateGraphCache();
+          return {
+            content: [{ type: "text", text: `节点 "${name}" 已设为 hot 节点（每次 assemble 时必定渲染）。` }],
+            details: { success: true, name },
+          };
+        },
+      }),
+      { name: "gm_set_hot" },
+    );
+
+    // ── gm_set_scope_hot ──────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_set_scope_hot",
+        label: "Set Node as Scope Hot",
+        description: "将指定节点设置为指定 scope 的 scope hot 节点。在对应 scope 的 session 中 assemble 时会优先渲染。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点名称，精确匹配" }),
+          scope: Type.String({ description: "scope 名称，如 \"gm开发\" 或 \"飞书群oc_xxx\"" }),
+        }),
+        async execute(_toolCallId: string, params: { name: string; scope: string }) {
+          const { name, scope } = params;
+          const node = findByName(db, name);
+          if (!node) {
+            return { content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }], details: { success: false } };
+          }
+          const flag = `scope_hot:${scope}`;
+          const existingFlags = (node.flags || []).filter((f: string) => f !== "hot" && !f.startsWith("scope_hot:"));
+          setNodeFlags(db, node.id, [...existingFlags, flag]);
+          invalidateGraphCache();
+          return {
+            content: [{ type: "text", text: `节点 "${name}" 已设为 scope_hot:${scope}。` }],
+            details: { success: true, name, flag },
+          };
+        },
+      }),
+      { name: "gm_set_scope_hot" },
+    );
+
+    // ── gm_get_flags ──────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_get_flags",
+        label: "Get Node Flags",
+        description: "获取指定节点的所有 flags。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点名称，精确匹配" }),
+        }),
+        async execute(_toolCallId: string, params: { name: string }) {
+          const { name } = params;
+          const node = findByName(db, name);
+          if (!node) {
+            return { content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }], details: { success: false } };
+          }
+          const flags = node.flags || [];
+          return {
+            content: [{ type: "text", text: `节点 "${name}" 的 flags: ${flags.length ? flags.map((f: string) => `"${f}"`).join(", ") : "（无）"}` }],
+            details: { success: true, name, flags },
+          };
+        },
+      }),
+      { name: "gm_get_flags" },
+    );
+
+    // ── gm_set_flags ───────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_set_flags",
+        label: "Set Flags on Graph Memory Node",
+        description: "为已有节点设置 flags（覆盖而非追加）。传入空数组清除所有 flags。",
+        parameters: Type.Object({
+          name: Type.String({ description: "节点名称，精确匹配" }),
+          flags: Type.Array(Type.String(), { description: "flags 数组，例如 scope_hot:gm开发 或空数组（清除所有 flags）" }),
+        }),
+        async execute(_toolCallId: string, params: { name: string; flags: string[] }) {
+          const { name, flags } = params;
+          const node = findByName(db, name);
+          if (!node) {
+            return {
+              content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }],
+              details: { success: false, name },
+            };
+          }
+          const ok = setNodeFlags(db, node.id, flags);
+          if (!ok) {
+            return {
+              content: [{ type: "text", text: `更新节点 "${name}" 的 flags 失败。` }],
+              details: { success: false, name },
+            };
+          }
+          invalidateGraphCache();
+          return {
+            content: [{
+              type: "text",
+              text: `节点 "${name}" 的 flags 已更新为 [${flags.map(f => `"${f}"`).join(", ")}]`,
             }],
             details: { success: true, name, flags },
           };
