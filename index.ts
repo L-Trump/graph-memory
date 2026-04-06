@@ -530,6 +530,38 @@ const graphMemoryPlugin = {
 
         if (turns % maintainInterval === 0) {
           try {
+            // ★ 主题归纳：先对当前 session 的语义节点归纳主题
+            const sessionNodes = getBySession(db, sessionId);
+            const sessionSemanticNodes = sessionNodes.filter(n =>
+              ["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"].includes(n.type)
+            );
+            if (sessionSemanticNodes.length > 0) {
+              try {
+                const induction = await induceTopics({
+                  db,
+                  sessionNodes: sessionSemanticNodes,
+                  llm,
+                  recaller,
+                });
+                const total =
+                  induction.createdTopics.length +
+                  induction.updatedTopics.length +
+                  induction.semanticToTopicEdges.length +
+                  induction.topicToTopicEdges.length;
+                if (total > 0) {
+                  invalidateGraphCache();
+                }
+                api.logger.info(
+                  `[graph-memory] periodic topic induction (turn ${turns}): ` +
+                  `created=${induction.createdTopics.length}, updated=${induction.updatedTopics.length}, ` +
+                  `sem→topic=${induction.semanticToTopicEdges.length}, topic↔topic=${induction.topicToTopicEdges.length}`,
+                );
+              } catch (err) {
+                api.logger.error(`[graph-memory] periodic topic induction failed: ${err}`);
+              }
+            }
+
+            // ★ 社区维护
             invalidateGraphCache();
             const pr = computeGlobalPageRank(db, cfg);
             const comm = detectCommunities(db);
