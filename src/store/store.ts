@@ -906,6 +906,66 @@ export function getBeliefHistory(
   }
 }
 
+// ─── Scope 管理 ──────────────────────────────────────────────
+
+/**
+ * 设置 session 的 scope（覆盖式：先删再插）。
+ * scopeNames 为空数组时 = 清除该 session 的所有 scope。
+ */
+export function setScopesForSession(db: DatabaseSyncInstance, sessionId: string, scopeNames: string[]): void {
+  db.exec("BEGIN");
+  try {
+    db.prepare("DELETE FROM gm_scopes WHERE session_id = ?").run(sessionId);
+    const now = Date.now();
+    for (const name of scopeNames) {
+      if (name.trim()) {
+        db.prepare(
+          "INSERT OR IGNORE INTO gm_scopes (scope_name, session_id, created_at) VALUES (?, ?, ?)"
+        ).run(name.trim(), sessionId, now);
+      }
+    }
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+/**
+ * 获取 session 绑定的所有 scope。
+ */
+export function getScopesForSession(db: DatabaseSyncInstance, sessionId: string): string[] {
+  const rows = db.prepare(
+    "SELECT scope_name FROM gm_scopes WHERE session_id = ? ORDER BY scope_name"
+  ).all(sessionId) as any[];
+  return rows.map(r => r.scope_name);
+}
+
+/**
+ * 获取拥有 scope_hot:xxx flag 的节点（匹配任一 given scopeNames）。
+ * flags 存储为 JSON 数组 like `["hot", "scope_hot:gm开发"]`，
+ * 所以匹配 `"scope_hot:xxx"` 这个完整的字符串即可。
+ */
+export function getScopeHotNodes(db: DatabaseSyncInstance, scopeNames: string[]): GmNode[] {
+  if (!scopeNames.length) return [];
+  const conditions = scopeNames.map(() => 'flags LIKE ?').join(' OR ');
+  const args = scopeNames.map(s => `%"scope_hot:${s}"%`);
+  const rows = db.prepare(
+    `SELECT * FROM gm_nodes WHERE status='active' AND (${conditions})`
+  ).all(...args) as any[];
+  return rows.map(toNode);
+}
+
+/**
+ * 列出所有 scope 及其绑定 session 数量。
+ */
+export function listScopes(db: DatabaseSyncInstance): Array<{ scopeName: string; sessionCount: number }> {
+  const rows = db.prepare(
+    "SELECT scope_name, COUNT(*) as session_count FROM gm_scopes GROUP BY scope_name ORDER BY scope_name"
+  ).all() as any[];
+  return rows.map(r => ({ scopeName: r.scope_name, sessionCount: Number(r.session_count) }));
+}
+
 /**
  * 获取 topic → topic 边（两端都是 TOPIC 节点，且两端都是 active 的边）
  */

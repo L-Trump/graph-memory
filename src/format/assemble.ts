@@ -25,16 +25,18 @@ import type { TieredNode, RecallTier } from "../recaller/recall.ts";
 
 const CHARS_PER_TOKEN = 3;
 
-// ─── 统一节点合并去重（tier 优先级：hot > active > L1 > L2 > L3 > filtered）────────────
-const TIER_PRIORITY: Record<RecallTier, number> = { hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
+// ─── 统一节点合并去重（tier 优先级：scope_hot > hot > active > L1 > L2 > L3 > filtered）────────────
+const TIER_PRIORITY: Record<RecallTier, number> = { scope_hot: 6, hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
 
 /** mergeNodes 的输出类型：GmNode + tier，不含 TieredNode 的 score 字段 */
 type MergedNode = GmNode & { tier: RecallTier };
 
-// hotNodes: GmNode → tier强制为"hot"（优先级最高）
+// scopeHotNodes: GmNode → tier强制为"scope_hot"（优先级最高 above hot）
+// hotNodes: GmNode → tier强制为"hot"（优先级次高）
 // recalledNodes: TieredNode（有tier）→ 保留原有tier
 // activeNodes: GmNode（无tier）→ tier强制为"active"
 function mergeNodes(
+  scopeHotNodes: GmNode[],
   hotNodes: GmNode[],
   recalledNodes: TieredNode[],
   activeNodes: GmNode[],
@@ -42,8 +44,16 @@ function mergeNodes(
   type Entry = { node: GmNode; tier: RecallTier; _priority: number };
   const map = new Map<string, Entry>();
 
+  // scope_hot tier（最高优先）
+  for (const n of scopeHotNodes) {
+    map.set(n.id, { node: n, tier: "scope_hot", _priority: TIER_PRIORITY.scope_hot });
+  }
+
+  // hot tier
   for (const n of hotNodes) {
-    map.set(n.id, { node: n, tier: "hot", _priority: TIER_PRIORITY.hot });
+    if (!map.has(n.id) || TIER_PRIORITY.hot > (map.get(n.id)?._priority ?? 0)) {
+      map.set(n.id, { node: n, tier: "hot", _priority: TIER_PRIORITY.hot });
+    }
   }
 
   for (const n of recalledNodes) {
@@ -99,8 +109,9 @@ function formatEdge(e: GmEdge, fromName: string, toName: string, hasDescription:
 export function buildSystemPromptAddition(params: {
   selectedNodes: Array<{ type: string; src: "active" | "recalled"; tier: string }>;
   edgeCount: number;
+  scopeHotCount?: number;
 }): string {
-  const { selectedNodes, edgeCount } = params;
+  const { selectedNodes, edgeCount, scopeHotCount = 0 } = params;
   if (selectedNodes.length === 0) return "";
 
   const recalledCount = selectedNodes.filter(n => n.src === "recalled").length;
@@ -120,9 +131,9 @@ export function buildSystemPromptAddition(params: {
     "Below `<knowledge_graph>` is your accumulated experience from past conversations.",
     "It contains structured knowledge — NOT raw conversation history.",
     "",
-    "**⚠️ Real-time state takes priority over memory.** The knowledge graph provides memories — for "current code content, file state, directory structure, or system environment," always verify with actual commands. Memory tells you "how things were done before," not "what is true right now."" ,
+    '**⚠️ Real-time state takes priority over memory.** The knowledge graph provides memories — for current code content, file state, directory structure, or system environment — always verify with actual commands. Memory tells you how things were done before, not what is true right now.',
     "",
-    `Current graph: ${taskCount} tasks, ${skillCount} skills, ${eventCount} events, ${knowledgeCount} knowledge, ${statusCount} status, ${edgeCount} relationships.`,
+    `Current graph: ${scopeHotCount > 0 ? `${scopeHotCount} scope_hot, ` : ""}${taskCount} tasks, ${skillCount} skills, ${eventCount} events, ${knowledgeCount} knowledge, ${statusCount} status, ${edgeCount} relationships.`,
   );
 
   if (hasRecalled) {
@@ -164,6 +175,8 @@ export function buildSystemPromptAddition(params: {
 
 export interface AssembleParams {
   tokenBudget: number;
+  scopeHotNodes: GmNode[];   // scope_hot tier nodes (from current session's scopes)
+  scopeHotEdges: GmEdge[];   // edges for scope_hot nodes
   hotNodes: GmNode[];
   hotEdges: GmEdge[];
   activeNodes: GmNode[];
@@ -193,10 +206,10 @@ export function assembleContext(
   cfg: GmConfig | null,
   params: AssembleParams,
 ): { xml: string | null; systemPrompt: string; tokens: number; episodicXml: string; episodicTokens: number } {
-  const { recalledNodes, hotNodes, hotEdges } = params;
+  const { recalledNodes, hotNodes, hotEdges, scopeHotNodes, scopeHotEdges } = params;
 
-  // ── 节点合并去重（hot → recalled → active）─────────────────
-  const mergedNodes = mergeNodes(hotNodes, recalledNodes, params.activeNodes);
+  // ── 节点合并去重（scope_hot → hot → recalled → active）─────────────────
+  const mergedNodes = mergeNodes(scopeHotNodes, hotNodes, recalledNodes, params.activeNodes);
 
   // 过滤 filtered
   const passNodes = mergedNodes.filter(n => n.tier !== "filtered");
@@ -206,8 +219,8 @@ export function assembleContext(
     return { xml: null, systemPrompt: "", tokens: 0, episodicXml: "", episodicTokens: 0 };
   }
 
-  // ── 边合并去重（hot → active → recalled）────────────────────
-  const allEdges = mergeEdges(hotEdges, mergeEdges(params.activeEdges, params.recalledEdges));
+  // ── 边合并去重（scope_hot → hot → active → recalled）────────────────────
+  const allEdges = mergeEdges(scopeHotEdges, mergeEdges(hotEdges, mergeEdges(params.activeEdges, params.recalledEdges)));
 
   // ── 构建节点 id → name 映射 ───────────────────────────────
   const idToName = new Map<string, string>();
@@ -219,7 +232,7 @@ export function assembleContext(
   for (const n of passNodes) {
     const tag = n.type.toLowerCase();
     const tier = n.tier;
-    const srcAttr = tier === "active" ? ` source="active"` : ` source="recalled"`;
+    const srcAttr = tier === "active" ? ` source="active"` : ` source="recalled"`;  // scope_hot/hot/recalled all use "recalled"
     const tierAttr = ` tier="${tier.toLowerCase()}"`;
     const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
     const beliefAttr = n.belief !== undefined ? ` confidence="${n.belief.toFixed(2)}"` : "";
@@ -229,8 +242,9 @@ export function assembleContext(
     } else if (tier === "L2") {
       xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}/>`);
     } else {
-      // L1 / active
-      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}>\n${n.content.trim()}\n  </${tag}>`);
+      // scope_hot / hot / active / L1 → full content
+      const scopeAttr = tier === "scope_hot" ? ` scope_hot="true"` : "";
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}${scopeAttr}>\n${n.content.trim()}\n  </${tag}>`);
     }
   }
 
@@ -271,6 +285,8 @@ export function assembleContext(
     return shouldRenderEdge(fromTier, toTier);
   });
 
+  const scopeHotCount = passNodes.filter(n => n.tier === "scope_hot").length;
+
   const systemPrompt = buildSystemPromptAddition({
     selectedNodes: passNodes.map(n => ({
       type: n.type,
@@ -278,6 +294,7 @@ export function assembleContext(
       tier: n.tier.toLowerCase(),
     })),
     edgeCount: relevantEdges.length,
+    scopeHotCount,
   });
 
   // ── 溯源片段：组合评分 top 3 节点 ─────────────────────────

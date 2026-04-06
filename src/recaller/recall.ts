@@ -45,7 +45,7 @@ const SEMANTIC_WEIGHT = 0.5;   // α：语义相关性权重
 const PPR_WEIGHT = 0.3;        // β：局部关联性权重（PPR）
 const PAGERANK_WEIGHT = 0.2;   // γ：全局重要性权重（PageRank）
 
-export type RecallTier = "L1" | "L2" | "L3" | "filtered" | "active" | "hot";
+export type RecallTier = "L1" | "L2" | "L3" | "filtered" | "active" | "hot" | "scope_hot";
 
 export interface TieredNode extends GmNode {
   tier: RecallTier;
@@ -208,7 +208,7 @@ export class Recaller {
     const tiered = this.assignTiers(scoredNodes);
 
     if (process.env.GM_DEBUG) {
-      const byTier: Record<RecallTier, number> = { hot: 0, L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
+      const byTier: Record<RecallTier, number> = { scope_hot: 0, hot: 0, L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
       for (const n of tiered) byTier[n.tier]++;
       console.log(`  [DEBUG] preciseV2 tiers: L1=${byTier.L1} L2=${byTier.L2} L3=${byTier.L3} filtered=${byTier.filtered}`);
     }
@@ -283,7 +283,7 @@ export class Recaller {
     const tiered = this.assignTiers(scoredNodes);
 
     if (process.env.GM_DEBUG) {
-      const byTier: Record<RecallTier, number> = { hot: 0, L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
+      const byTier: Record<RecallTier, number> = { scope_hot: 0, hot: 0, L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
       for (const n of tiered) byTier[n.tier]++;
       console.log(`  [DEBUG] generalizedV2 tiers: L1=${byTier.L1} L2=${byTier.L2} L3=${byTier.L3} filtered=${byTier.filtered}`);
     }
@@ -375,7 +375,7 @@ export class Recaller {
   }
 
   private tierPriority(tier: RecallTier): number {
-    const p: Record<RecallTier, number> = { hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
+    const p: Record<RecallTier, number> = { scope_hot: 6, hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
     return p[tier];
   }
 

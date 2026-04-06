@@ -20,6 +20,7 @@ import {
   deprecate, getStats, getHotNodes, getEdgesForNodes, setNodeFlags,
   getTopicNodes, getTopicToTopicEdges, getSemanticToTopicEdges,
   updateNodeBelief, recordBeliefSignal,
+  setScopesForSession, getScopesForSession, getScopeHotNodes, listScopes,
 } from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
@@ -365,10 +366,15 @@ const graphMemoryPlugin = {
         const hotNodes = getHotNodes(db);
         const hotEdges = hotNodes.length > 0 ? getEdgesForNodes(db, hotNodes.map(n => n.id)) : [];
 
+        // scope_hot 节点（当前 session 的 scope 匹配）
+        const sessionScopes = getScopesForSession(db, sessionId);
+        const scopeHotNodes = sessionScopes.length > 0 ? getScopeHotNodes(db, sessionScopes) : [];
+        const scopeHotEdges = scopeHotNodes.length > 0 ? getEdgesForNodes(db, scopeHotNodes.map(n => n.id)) : [];
+
         const rec = recalled.get(sessionId) ?? { nodes: [], edges: [], pprScores: {} };
         const totalGmNodes = activeNodes.length + rec.nodes.length;
 
-        if (totalGmNodes === 0 && hotNodes.length === 0) {
+        if (totalGmNodes === 0 && hotNodes.length === 0 && scopeHotNodes.length === 0) {
           return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
         }
 
@@ -379,6 +385,8 @@ const graphMemoryPlugin = {
         // ── 2. 图谱 + 溯源 ─────────────────────────────
         const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, cfg, {
           tokenBudget: 0,
+          scopeHotNodes,
+          scopeHotEdges,
           hotNodes,
           hotEdges,
           activeNodes,
@@ -393,6 +401,7 @@ const graphMemoryPlugin = {
           api.logger.info(
             `[graph-memory] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
             `dropped ${lastTurn.dropped} older msgs, graph ~${gmTokens} tok` +
+            (scopeHotNodes.length > 0 ? `, scope_hot=${scopeHotNodes.length}` : "") +
             (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
           );
         }
@@ -1096,6 +1105,90 @@ const graphMemoryPlugin = {
         },
       }),
       { name: "gm_set_flags" },
+    );
+
+    // ── gm_set_scope ──────────────────────────────────────────
+    api.registerTool(
+      (ctx: any) => ({
+        name: "gm_set_scope",
+        label: "Set Scope for Current Session",
+        description: "为当前 session 绑定一个或多个 scope（覆盖式替换）。传入空数组 [] 可清除该 session 的所有 scope 绑定。设置后，当前 session 在 assemble 时会加载匹配这些 scope 的 scope_hot 节点。",
+        parameters: Type.Object({
+          scopes: Type.Array(Type.String(), { description: "scope 名称列表，如 [\"gm开发\", \"飞书群oc_xxx\"]。空数组 [] 表示清除所有 scope 绑定（覆盖式）。" }),
+        }),
+        async execute(_toolCallId: string, params: { scopes: string[] }) {
+          const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
+          setScopesForSession(db, sid, params.scopes);
+          const current = getScopesForSession(db, sid);
+          const scopeText = current.length
+            ? `当前 session 绑定的 scope：[${current.map(s => `"${s}"`).join(", ")}]`
+            : "当前 session 没有任何 scope 绑定。";
+          return {
+            content: [{
+              type: "text",
+              text: `scope 绑定已更新。${scopeText}`,
+            }],
+            details: { sessionId: sid, scopes: current },
+          };
+        },
+      }),
+      { name: "gm_set_scope" },
+    );
+
+    // ── gm_get_scope ──────────────────────────────────────────
+    api.registerTool(
+      (ctx: any) => ({
+        name: "gm_get_scope",
+        label: "Get Scopes for Current Session",
+        description: "获取当前 session 绑定的所有 scope。",
+        parameters: Type.Object({}),
+        async execute(_toolCallId: string, _params: any) {
+          const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
+          const scopes = getScopesForSession(db, sid);
+          if (!scopes.length) {
+            return {
+              content: [{ type: "text", text: "当前 session 没有绑定任何 scope。" }],
+              details: { sessionId: sid, scopes: [] },
+            };
+          }
+          return {
+            content: [{
+              type: "text",
+              text: `当前 session 绑定的 scope：[${scopes.map(s => `"${s}"`).join(", ")}]`,
+            }],
+            details: { sessionId: sid, scopes },
+          };
+        },
+      }),
+      { name: "gm_get_scope" },
+    );
+
+    // ── gm_list_scopes ────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_list_scopes",
+        label: "List All Scopes",
+        description: "列出当前所有 scope 及其绑定的 session 数量。",
+        parameters: Type.Object({}),
+        async execute(_toolCallId: string, _params: any) {
+          const scopes = listScopes(db);
+          if (!scopes.length) {
+            return {
+              content: [{ type: "text", text: "当前没有任何 scope。" }],
+              details: { scopes: [] },
+            };
+          }
+          const lines = scopes.map(s => `  - "${s.scopeName}": ${s.sessionCount} 个 session`);
+          return {
+            content: [{
+              type: "text",
+              text: `当前共有 ${scopes.length} 个 scope：\n${lines.join("\n")}`,
+            }],
+            details: { scopes },
+          };
+        },
+      }),
+      { name: "gm_list_scopes" },
     );
 
     // ── gm_remove ─────────────────────────────────────────────

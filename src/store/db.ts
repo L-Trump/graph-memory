@@ -44,15 +44,33 @@ export function getDb(dbPath: string): DatabaseSyncInstance {
   return _db;
 }
 
-/** 仅用于测试：关闭并重置单例 */
-export function closeDb(): void {
-  if (_db) { _db.close(); _db = null; }
+/** 仅用于测试：重置单例（不清空文件，以便下次 getDb 重建）*/
+export function resetDb(): void {
+  if (_db) { try { _db.close(); } catch {} _db = null; }
 }
 
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes];
+
+function m11_scopes(db: DatabaseSyncInstance): void {
+  try {
+    db.prepare("SELECT scope_name FROM gm_scopes LIMIT 1").get();
+    return; // already migrated
+  } catch { /* table doesn't exist */ }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_scopes (
+      scope_name  TEXT NOT NULL,
+      session_id  TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (scope_name, session_id)
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_scopes_session ON gm_scopes(session_id);
+  `);
+}
+
 function m10_belief(db: DatabaseSyncInstance): void {
   try {
     db.prepare("SELECT belief FROM gm_nodes LIMIT 1").get();
