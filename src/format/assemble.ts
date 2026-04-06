@@ -120,6 +120,8 @@ export function buildSystemPromptAddition(params: {
     "Below `<knowledge_graph>` is your accumulated experience from past conversations.",
     "It contains structured knowledge — NOT raw conversation history.",
     "",
+    "**⚠️ Real-time state takes priority over memory.** The knowledge graph provides memories — for "current code content, file state, directory structure, or system environment," always verify with actual commands. Memory tells you "how things were done before," not "what is true right now."" ,
+    "",
     `Current graph: ${taskCount} tasks, ${skillCount} skills, ${eventCount} events, ${knowledgeCount} knowledge, ${statusCount} status, ${edgeCount} relationships.`,
   );
 
