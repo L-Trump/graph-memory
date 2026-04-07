@@ -52,7 +52,7 @@ export function resetDb(): void {
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes, m12_recalled];
 
 function m11_scopes(db: DatabaseSyncInstance): void {
   try {
@@ -68,6 +68,31 @@ function m11_scopes(db: DatabaseSyncInstance): void {
       PRIMARY KEY (scope_name, session_id)
     );
     CREATE INDEX IF NOT EXISTS ix_gm_scopes_session ON gm_scopes(session_id);
+  `);
+}
+
+function m12_recalled(db: DatabaseSyncInstance): void {
+  try {
+    db.prepare("SELECT node_id FROM gm_recalled LIMIT 1").get();
+    return; // already migrated
+  } catch { /* table doesn't exist */ }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_recalled (
+      id            TEXT PRIMARY KEY,
+      session_id    TEXT NOT NULL,
+      turn_index   INTEGER NOT NULL,
+      node_id      TEXT NOT NULL,
+      node_name    TEXT NOT NULL,
+      node_type    TEXT NOT NULL,
+      tier         TEXT NOT NULL,
+      semantic     REAL,
+      ppr          REAL,
+      combined     REAL,
+      created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_session ON gm_recalled(session_id, turn_index);
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_node ON gm_recalled(node_id);
   `);
 }
 

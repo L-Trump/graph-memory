@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { createTestDb } from "./helpers.ts";
 
 // ─────────────────────────────────────────────────────────────────
 // 辅助：从 index.ts 复制的 gm_search 过滤+渲染逻辑
@@ -263,5 +264,49 @@ describe("tierLabel", () => {
     expect(l3Line).toContain("【L3-名称】");
     expect(hotLine).toContain("【🔥HOT】");
     expect(lines[3]).toContain("【🔥HOT】");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// 测试：gm_recalled 表记录
+// ─────────────────────────────────────────────────────────────────
+describe("gm_recalled 记录召回节点", () => {
+  it("saveRecalledNodes 写入数据库", async () => {
+    const { saveRecalledNodes, getRecalledNodes } = await import("../src/store/store.ts");
+    const db = createTestDb();
+
+    saveRecalledNodes(db, "session-A", 1, [
+      { id: "n1", name: "节点1", type: "KNOWLEDGE", tier: "L1", semanticScore: 0.9, pprScore: 0.5, combinedScore: 0.7 },
+      { id: "n2", name: "节点2", type: "SKILL", tier: "L2", semanticScore: 0.6, pprScore: 0.3, combinedScore: 0.4 },
+    ]);
+
+    const rows = getRecalledNodes(db, "session-A", 1);
+    expect(rows).toHaveLength(2);
+    expect(rows.map(r => r.nodeName)).toContain("节点1");
+    expect(rows.map(r => r.nodeName)).toContain("节点2");
+    expect(rows[0].tier).toBe("L1");
+    expect(rows[1].tier).toBe("L2");
+  });
+
+  it("空节点列表不写入", async () => {
+    const { saveRecalledNodes, getRecalledNodes } = await import("../src/store/store.ts");
+    const db = createTestDb();
+
+    saveRecalledNodes(db, "session-B", 1, []);
+    const rows = getRecalledNodes(db, "session-B", 1);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("不同 session/turn 互不干扰", async () => {
+    const { saveRecalledNodes, getRecalledNodes } = await import("../src/store/store.ts");
+    const db = createTestDb();
+
+    saveRecalledNodes(db, "s1", 1, [{ id: "n1", name: "S1T1", type: "KNOWLEDGE", tier: "L1" }]);
+    saveRecalledNodes(db, "s1", 2, [{ id: "n2", name: "S1T2", type: "SKILL", tier: "L2" }]);
+    saveRecalledNodes(db, "s2", 1, [{ id: "n3", name: "S2T1", type: "TASK", tier: "L3" }]);
+
+    expect(getRecalledNodes(db, "s1", 1).map(r => r.nodeName)).toEqual(["S1T1"]);
+    expect(getRecalledNodes(db, "s1", 2).map(r => r.nodeName)).toEqual(["S1T2"]);
+    expect(getRecalledNodes(db, "s2", 1).map(r => r.nodeName)).toEqual(["S2T1"]);
   });
 });

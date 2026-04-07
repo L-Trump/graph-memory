@@ -269,6 +269,20 @@ export function assembleContext(
     edgesXmlParts.push(formatEdge(e, fromName, toName, hasDesc));
   }
 
+  // ── 节点/边统计日志 ─────────────────────────────────────
+  const tierCount = (tier: string) => passNodes.filter(n => n.tier === tier).length;
+  const edgeCount = allEdges.length;
+  console.log(
+    `[graph-memory] assemble: ` +
+    `scope_hot=${tierCount("scope_hot")} ` +
+    `hot=${tierCount("hot")} ` +
+    `active=${tierCount("active")} ` +
+    `L1=${tierCount("L1")} ` +
+    `L2=${tierCount("L2")} ` +
+    `L3=${tierCount("L3")} ` +
+    `renderedEdges=${seenEdgeIds.size} (raw=${edgeCount})`
+  );
+
   const nodesXml = xmlParts.join("\n");
   const edgesXml = edgesXmlParts.length
     ? `\n  <edges>\n${edgesXmlParts.join("\n")}\n  </edges>`
@@ -318,6 +332,13 @@ export function assembleContext(
     : "";
 
   const fullContent = systemPrompt + "\n\n" + xml + (episodicXml ? "\n\n" + episodicXml : "");
+  console.log(
+    `[graph-memory] assemble tokens: ` +
+    `sysPrompt=${Math.ceil(systemPrompt.length / 3)} ` +
+    `xml=${Math.ceil(xml.length / 3)} ` +
+    `episodic=${Math.ceil(episodicXml.length / 3)} ` +
+    `total=${Math.ceil(fullContent.length / 3)}`
+  );
   return {
     xml,
     systemPrompt,

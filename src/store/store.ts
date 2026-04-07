@@ -1061,3 +1061,67 @@ export function getSemanticNodes(db: DatabaseSyncInstance): GmNode[] {
   ).all() as any[];
   return rows.map(toNode);
 }
+/**
+ * 保存当前轮次召回的节点到 gm_recalled 表（过滤掉 filtered 节点）
+ */
+export function saveRecalledNodes(
+  db: DatabaseSyncInstance,
+  sessionId: string,
+  turnIndex: number,
+  nodes: Array<{
+    id: string;
+    name: string;
+    type: string;
+    tier: string;
+    semanticScore?: number;
+    pprScore?: number;
+    combinedScore?: number;
+  }>
+): void {
+  // 过滤掉 filtered 节点
+  const displayNodes = nodes.filter(n => n.tier !== "filtered");
+  if (!displayNodes.length) return;
+
+  const now = Date.now();
+  const insert = db.prepare(`
+    INSERT INTO gm_recalled (id, session_id, turn_index, node_id, node_name, node_type, tier, semantic, ppr, combined, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const n of displayNodes) {
+    insert.run(
+      `recalled-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      sessionId,
+      turnIndex,
+      n.id,
+      n.name,
+      n.type,
+      n.tier,
+      n.semanticScore ?? null,
+      n.pprScore ?? null,
+      n.combinedScore ?? null,
+      now,
+    );
+  }
+}
+
+/**
+ * 查询某 session 某 turn 召回的节点
+ */
+export function getRecalledNodes(
+  db: DatabaseSyncInstance,
+  sessionId: string,
+  turnIndex: number
+): Array<{ nodeId: string; nodeName: string; nodeType: string; tier: string; semantic: number; ppr: number; combined: number }> {
+  const rows = db.prepare(
+    "SELECT node_id, node_name, node_type, tier, semantic, ppr, combined FROM gm_recalled WHERE session_id=? AND turn_index=?"
+  ).all(sessionId, turnIndex) as any[];
+  return rows.map(r => ({
+    nodeId: r.node_id,
+    nodeName: r.node_name,
+    nodeType: r.node_type,
+    tier: r.tier,
+    semantic: r.semantic ?? 0,
+    ppr: r.ppr ?? 0,
+    combined: r.combined ?? 0,
+  }));
+}

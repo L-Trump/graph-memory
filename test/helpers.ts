@@ -133,6 +133,25 @@ export function createTestDb(): DatabaseSyncInstance {
     );
   `);
 
+  // m12: recalled 记录
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_recalled (
+      id          TEXT PRIMARY KEY,
+      session_id  TEXT NOT NULL,
+      turn_index INTEGER NOT NULL,
+      node_id    TEXT NOT NULL,
+      node_name  TEXT NOT NULL,
+      node_type  TEXT NOT NULL,
+      tier       TEXT NOT NULL,
+      semantic   REAL,
+      ppr        REAL,
+      combined   REAL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_session ON gm_recalled(session_id, turn_index);
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_node ON gm_recalled(node_id);
+  `);
+
   return db;
 }
 
