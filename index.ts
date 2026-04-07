@@ -119,6 +119,15 @@ function normalizeMessageContent(messages: any[]): any[] {
   });
 }
 
+// ─── 全局初始化守卫 ─────────────────────────────────────────
+// 防止多个 session 并发调用 register() 时重复初始化核心模块
+let _gmInitialized = false;
+let _gmDb: ReturnType<typeof getDb> | null = null;
+let _gmRecaller: Recaller | null = null;
+let _gmExtractor: Extractor | null = null;
+type LlmCompleteFn = (system: string, user: string) => Promise<string>;
+let _gmLlm: LlmCompleteFn | null = null;
+
 // ─── 插件对象 ─────────────────────────────────────────────────
 
 const graphMemoryPlugin = {
@@ -136,25 +145,47 @@ const graphMemoryPlugin = {
     const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
     const { provider, model } = readProviderModel(api.config);
 
-    // ── 初始化核心模块 ──────────────────────────────────────
-    const db = getDb(cfg.dbPath);
-    const llm = createCompleteFn(provider, model, cfg.llm);
-    const recaller = new Recaller(db, cfg);
-    const extractor = new Extractor(cfg, llm);
+    // ── 初始化核心模块（幂等，仅首次执行）──────────────────────
+    const isFirstInit = !_gmInitialized;
+    let recaller: Recaller;
+    let llm: LlmCompleteFn;
+    let extractor: Extractor;
+    let db: ReturnType<typeof getDb>;
+    if (isFirstInit) {
+      db = getDb(cfg.dbPath);
+      _gmDb = db;
+      llm = createCompleteFn(provider, model, cfg.llm);
+      _gmLlm = llm;
+      _gmRecaller = new Recaller(db, cfg);
+      extractor = new Extractor(cfg, llm);
+      _gmExtractor = extractor;
 
-    // ── 初始化 embedding ────────────────────────────────────
-    createEmbedFn(cfg.embedding)
-      .then((fn) => {
-        if (fn) {
-          recaller.setEmbedFn(fn);
-          api.logger.info("[graph-memory] vector search ready");
-        } else {
-          api.logger.info("[graph-memory] FTS5 search mode (配置 embedding 可启用语义搜索)");
-        }
-      })
-      .catch(() => {
-        api.logger.info("[graph-memory] FTS5 search mode");
-      });
+      // 异步初始化 embedding（仅首次执行）
+      createEmbedFn(cfg.embedding)
+        .then((fn) => {
+          if (fn) {
+            _gmRecaller!.setEmbedFn(fn);
+            api.logger.info("[graph-memory] vector search ready");
+          } else {
+            api.logger.info("[graph-memory] FTS5 search mode (配置 embedding 可启用语义搜索)");
+          }
+        })
+        .catch(() => {
+          api.logger.info("[graph-memory] FTS5 search mode");
+        });
+
+      api.logger.info(
+        `[graph-memory] ready | db=${cfg.dbPath} | provider=${provider} | model=${model}`,
+      );
+
+      _gmInitialized = true;
+    } else {
+      // 复用首次初始化的模块（均为无状态或已内部缓存）
+      db = _gmDb!;
+      llm = _gmLlm!;
+      extractor = _gmExtractor!;
+      recaller = _gmRecaller!;
+    }
 
     // ── Session 运行时状态 ──────────────────────────────────
     const msgSeq = new Map<string, number>();
@@ -302,9 +333,27 @@ const graphMemoryPlugin = {
 
         const sid = ctx?.sessionId ?? ctx?.sessionKey;
 
-        api.logger.info(`[graph-memory] recall query: "${prompt.slice(0, 80)}"`);
+        // ── 只取最近 3 轮 user+assistant 消息作为 recall query ────────
+        const recallSlice = sliceLastTurn(event.messages ?? [], RECALL_KEEP_TURNS);
+        const recallQuery = recallSlice.messages
+          .map((m: any) => {
+            const text = typeof m.content === "string" ? m.content :
+              (Array.isArray(m.content)
+                ? m.content.filter((b: any) => b?.type === "text" && typeof b.text === "string").map((b: any) => b.text).join("\n")
+                : String(m.content ?? ""));
+            // 去掉 OpenClaw metadata wrapper
+            const fenceEnd = text.lastIndexOf("```");
+            const cleaned = fenceEnd >= 0 && text.includes("Sender") ? text.slice(fenceEnd + 3).trim() : text;
+            return `[${m.role}] ${cleaned}`;
+          })
+          .join("\n")
+          .replace(/^\[[\w\s\-:]*\]\s*/, "")
+          .trim();
 
-        const res = await recaller.recallV2(prompt);
+        const query = recallQuery || prompt;
+        api.logger.info(`[graph-memory] recall query (${RECALL_KEEP_TURNS} turns): "${query.slice(0, 80)}"`);
+
+        const res = await recaller.recallV2(query);
         if (res.nodes.length) {
           const stored = { nodes: res.nodes, edges: res.edges, pprScores: res.pprScores };
           if (ctx?.sessionId) recalled.set(ctx.sessionId, stored);
@@ -312,8 +361,13 @@ const graphMemoryPlugin = {
             recalled.set(ctx.sessionKey, stored);
           }
 
+          const tierCounts: Record<string, number> = {};
+          for (const n of res.nodes) {
+            tierCounts[n.tier ?? "?"] = (tierCounts[n.tier ?? "?"] ?? 0) + 1;
+          }
+          const tierStr = ["L1", "L2", "L3"].map(t => `${t}=${tierCounts[t] ?? 0}`).join(" ");
           api.logger.info(
-            `[graph-memory] recalled ${res.nodes.length} nodes, ${res.edges.length} edges`,
+            `[graph-memory] recalled ${res.nodes.length} nodes [${tierStr}], ${res.edges.length} edges`,
           );
         }
       } catch (err) {
@@ -781,7 +835,7 @@ const graphMemoryPlugin = {
             if (n.pprScore != null) scores.push(`PPR=${n.pprScore.toFixed(3)}`);
             if (n.pagerankScore != null) scores.push(`PR=${n.pagerankScore.toFixed(3)}`);
             if (n.combinedScore != null) scores.push(`综合=${n.combinedScore.toFixed(3)}`);
-            if (n.belief != null) scores.push(`信念=${n.belief.toFixed(3)}`);
+            if (n.belief != null) scores.push(`置信度=${n.belief.toFixed(3)}`);
             const scoreStr = scores.length ? ` (${scores.join(", ")})` : "";
             return `${tierLabel} [${n.type}] ${n.name}${hotFlag}${scoreStr}\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
           });
@@ -1279,45 +1333,6 @@ const graphMemoryPlugin = {
       { name: "gm_get_flags" },
     );
 
-    // ── gm_set_flags ───────────────────────────────────────────
-    api.registerTool(
-      (_ctx: any) => ({
-        name: "gm_set_flags",
-        label: "Set Flags on Graph Memory Node",
-        description: "为已有节点设置 flags（覆盖而非追加）。传入空数组清除所有 flags。",
-        parameters: Type.Object({
-          name: Type.String({ description: "节点名称，精确匹配" }),
-          flags: Type.Array(Type.String(), { description: "flags 数组，例如 scope_hot:gm开发 或空数组（清除所有 flags）" }),
-        }),
-        async execute(_toolCallId: string, params: { name: string; flags: string[] }) {
-          const { name, flags } = params;
-          const node = findByName(db, name);
-          if (!node) {
-            return {
-              content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }],
-              details: { success: false, name },
-            };
-          }
-          const ok = setNodeFlags(db, node.id, flags);
-          if (!ok) {
-            return {
-              content: [{ type: "text", text: `更新节点 "${name}" 的 flags 失败。` }],
-              details: { success: false, name },
-            };
-          }
-          invalidateGraphCache();
-          return {
-            content: [{
-              type: "text",
-              text: `节点 "${name}" 的 flags 已更新为 [${flags.map(f => `"${f}"`).join(", ")}]`,
-            }],
-            details: { success: true, name, flags },
-          };
-        },
-      }),
-      { name: "gm_set_flags" },
-    );
-
     // ── gm_set_scope ──────────────────────────────────────────
     api.registerTool(
       (ctx: any) => ({
@@ -1631,10 +1646,6 @@ const graphMemoryPlugin = {
       }),
       { name: "gm_induce_topics" },
     );
-
-    api.logger.info(
-      `[graph-memory] ready | db=${cfg.dbPath} | provider=${provider} | model=${model}`,
-    );
   },
 };
 
@@ -1647,7 +1658,8 @@ function estimateMsgTokens(msg: any): number {
   return Math.ceil(text.length / 3);
 }
 
-const KEEP_TURNS = 5;  // 保留最近 5 轮用户交互
+const DEFAULT_KEEP_TURNS = 5;  // assemble 阶段保留最近 5 轮
+const RECALL_KEEP_TURNS = 3;   // recall 阶段只取最近 3 轮
 
 /**
  * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema
@@ -1694,8 +1706,17 @@ function extractUserText(msg: any): string {
   return raw;
 }
 
+/**
+ * 截取最近 N 轮对话。
+ * - lastTurnUserIdx 之前的所有轮次：只保留 user 纯文本 + assistant 纯文本
+ * - lastTurnUserIdx 起始的最后一轮：完整保留（含 toolResult）
+ *
+ * @param messages  完整消息数组
+ * @param keepTurns 保留最近几轮（默认 5，供 assemble 使用）
+ */
 function sliceLastTurn(
   messages: any[],
+  keepTurns: number = DEFAULT_KEEP_TURNS,
 ): { messages: any[]; tokens: number; dropped: number } {
   if (!messages.length) {
     return { messages: [], tokens: 0, dropped: 0 };
@@ -1706,7 +1727,7 @@ function sliceLastTurn(
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "user") {
       userIndices.push(i);
-      if (userIndices.length >= KEEP_TURNS) break;
+      if (userIndices.length >= keepTurns) break;
     }
   }
   if (!userIndices.length) {

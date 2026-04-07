@@ -16,7 +16,7 @@ export interface Scored<T> {
   semantic: number;     // 原始语义分数（向量相似度，0-1）
   ppr: number;          // 原始 PPR 分数
   pagerank: number;     // 原始 PageRank 分数（全局重要性）
-  belief?: number;     // 原始信念分数（0-1）
+  belief?: number;     // 原始置信度分数（0-1）
 }
 
 /** 归一化到 [0,1]：min-max */
@@ -35,7 +35,7 @@ function minMax(scores: number[]): number[] {
  * @param getPageRank 每个候选的全局 PageRank 分数
  * @param alpha semantic 权重，默认 0.40
  * @param gamma pagerank 权重，默认 0.20
- * @param getBelief 每个候选的信念分数（0-1），可选
+ * @param getBelief 每个候选的置信度分数（0-1），可选
  * @param delta belief 权重，默认 0.15
  */
 export function combinedScore<T>(

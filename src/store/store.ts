@@ -159,9 +159,18 @@ export function mergeNodes(db: DatabaseSyncInstance, keepId: string, mergeId: st
   const content = keep.content.length >= merge.content.length ? keep.content : merge.content;
   const desc = keep.description.length >= merge.description.length ? keep.description : merge.description;
 
+  // 合并 belief 信号
+  const keepBelief = getBeliefInfo(db, keepId);
+  const mergeBelief = getBeliefInfo(db, mergeId);
+  const totalSuccess = (keepBelief?.successCount ?? 0) + (mergeBelief?.successCount ?? 0);
+  const totalFailure = (keepBelief?.failureCount ?? 0) + (mergeBelief?.failureCount ?? 0);
+  const mergedBelief = totalSuccess + totalFailure > 0
+    ? computeBeliefA(totalSuccess, totalFailure)
+    : keep.belief ?? 0.5;
+
   db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
-    source_sessions=?, flags=?, updated_at=? WHERE id=?`)
-    .run(content, desc, count, sessions, flags, Date.now(), keepId);
+    source_sessions=?, flags=?, belief=?, success_count=?, failure_count=?, updated_at=? WHERE id=?`)
+    .run(content, desc, count, sessions, flags, mergedBelief, totalSuccess, totalFailure, Date.now(), keepId);
 
   // 迁移边：mergeId 的边指向 keepId
   db.prepare("UPDATE gm_edges SET from_id=? WHERE from_id=?").run(keepId, mergeId);
