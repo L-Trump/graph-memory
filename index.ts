@@ -22,6 +22,7 @@ import {
   updateNodeBelief, recordBeliefSignal,
   setScopesForSession, getScopesForSession, getScopeHotNodes, listScopes,
   getNodeFullInfo, updateNodeFields,
+  saveRecalledNodes,
 } from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
@@ -370,6 +371,18 @@ const graphMemoryPlugin = {
           api.logger.info(
             `[graph-memory] recalled ${res.nodes.length} nodes [${tierStr}], ${res.edges.length} edges`,
           );
+
+          // ── 记录召回节点到 gm_recalled 表 ────────────────────────
+          const currentTurn = msgSeq.get(sid) ?? 1;
+          saveRecalledNodes(db, sid, currentTurn, res.nodes.map((n: any) => ({
+            id: n.id,
+            name: n.name,
+            type: n.type,
+            tier: n.tier,
+            semanticScore: n.semanticScore ?? undefined,
+            pprScore: n.pprScore ?? undefined,
+            combinedScore: n.combinedScore ?? undefined,
+          })));
         }
 
         // ── 组装 KG 并注入 appendSystemContext（优先级低于 Claw 核心设定）──
@@ -588,13 +601,13 @@ const graphMemoryPlugin = {
               ["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"].includes(n.type)
             );
             if (sessionSemanticNodes.length > 0) {
-              try {
-                const induction = await induceTopics({
-                  db,
-                  sessionNodes: sessionSemanticNodes,
-                  llm,
-                  recaller,
-                });
+              // ★ 主题归纳：fire-and-forget，不阻塞 afterTurn
+              induceTopics({
+                db,
+                sessionNodes: sessionSemanticNodes,
+                llm,
+                recaller,
+              }).then((induction) => {
                 const total =
                   induction.createdTopics.length +
                   induction.updatedTopics.length +
@@ -608,9 +621,10 @@ const graphMemoryPlugin = {
                   `created=${induction.createdTopics.length}, updated=${induction.updatedTopics.length}, ` +
                   `sem→topic=${induction.semanticToTopicEdges.length}, topic↔topic=${induction.topicToTopicEdges.length}`,
                 );
-              } catch (err) {
-                api.logger.error(`[graph-memory] periodic topic induction failed: ${err}`);
-              }
+              }).catch((err) => {
+                const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
+                api.logger.error(`[graph-memory] periodic topic induction failed: ${msg}`);
+              });
             }
 
             // ★ 社区维护
@@ -720,38 +734,38 @@ const graphMemoryPlugin = {
           for (const id of fin.invalidations) deprecate(db, id);
         }
 
-        // ★ Topic Induction：基于 session 语义节点归纳主题
-        try {
+        // ★ Topic Induction：基于 session 语义节点归纳主题（fire-and-forget）
+        {
           const sessionNodes = getBySession(db, sid);
           const sessionSemanticNodes = sessionNodes.filter(n =>
             ["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"].includes(n.type)
           );
 
-          const induction = await induceTopics({
-            db,
-            sessionNodes: sessionSemanticNodes,
-            llm,
-            recaller,
-          });
-
-          const total =
-            induction.createdTopics.length +
-            induction.updatedTopics.length +
-            induction.semanticToTopicEdges.length +
-            induction.topicToTopicEdges.length;
-
-          if (total > 0) {
-            invalidateGraphCache();
+          if (sessionSemanticNodes.length > 0) {
+            induceTopics({
+              db,
+              sessionNodes: sessionSemanticNodes,
+              llm,
+              recaller,
+            }).then((induction) => {
+              const total =
+                induction.createdTopics.length +
+                induction.updatedTopics.length +
+                induction.semanticToTopicEdges.length +
+                induction.topicToTopicEdges.length;
+              if (total > 0) {
+                invalidateGraphCache();
+              }
+              api.logger.info(
+                `[graph-memory] session_end topic induction: ` +
+                `created=${induction.createdTopics.length}, updated=${induction.updatedTopics.length}, ` +
+                `sem→topic=${induction.semanticToTopicEdges.length}, topic↔topic=${induction.topicToTopicEdges.length}`,
+              );
+            }).catch((err) => {
+              const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
+              api.logger.error(`[graph-memory] session_end topic induction failed: ${msg}`);
+            });
           }
-
-          api.logger.info(
-            `[graph-memory] topic induction: created=${induction.createdTopics.length}, ` +
-            `updated=${induction.updatedTopics.length}, ` +
-            `sem→topic=${induction.semanticToTopicEdges.length}, ` +
-            `topic↔topic=${induction.topicToTopicEdges.length}`,
-          );
-        } catch (err) {
-          api.logger.error(`[graph-memory] topic induction failed: ${err}`);
         }
 
         const embedFn = (recaller as any).embed ?? undefined;
