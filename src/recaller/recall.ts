@@ -118,7 +118,7 @@ export class Recaller {
 
     if (process.env.GM_DEBUG) {
       const communities = new Set(merged.nodes.map(n => n.communityId).filter(Boolean));
-      console.log(`  [DEBUG] recallV2 merged: precise=${precise.nodes.length}, generalized=${generalized.nodes.length} → final=${merged.nodes.length} nodes, ${merged.edges.length} edges, ${communities.size} communities`);
+      console.log(`  [DEBUG] recallV2 merged: precise=${precise.nodes.length} → final=${merged.nodes.length} nodes, ${merged.edges.length} edges, ${communities.size} communities`);
     }
 
     return merged;

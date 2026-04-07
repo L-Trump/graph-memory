@@ -815,8 +815,12 @@ const graphMemoryPlugin = {
             };
           }
 
-          const lines = res.nodes.map((n: any) => {
-            const tierLabel = n.tier === "hot" ? "【🔥HOT】" : n.tier === "L1" ? "【L1-完整】" : n.tier === "L2" ? "【L2-描述】" : n.tier === "L3" ? "【L3-名称】" : "【过滤】";
+          // 过滤掉 filtered 节点
+          const displayNodes = res.nodes.filter((n: any) => n.tier !== "filtered");
+          const nodeMap = new Map(displayNodes.map((n: any) => [n.id, n]));
+
+          const lines = displayNodes.map((n: any) => {
+            const tierLabel = n.tier === "hot" ? "【🔥HOT】" : n.tier === "L1" ? "【L1-完整】" : n.tier === "L2" ? "【L2-描述】" : "【L3-名称】";
             const hotFlag = n.flags?.includes("hot") ? " 🔥" : "";
             const scores = [];
             if (n.semanticScore != null) scores.push(`语义=${n.semanticScore.toFixed(3)}`);
@@ -825,23 +829,33 @@ const graphMemoryPlugin = {
             if (n.combinedScore != null) scores.push(`综合=${n.combinedScore.toFixed(3)}`);
             if (n.belief != null) scores.push(`置信度=${n.belief.toFixed(3)}`);
             const scoreStr = scores.length ? ` (${scores.join(", ")})` : "";
-            return `${tierLabel} [${n.type}] ${n.name}${hotFlag}${scoreStr}\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
+            // L1: 完整内容，L2: description，L3/hot: 仅名字
+            let contentPart = "";
+            if (n.tier === "L1") {
+              contentPart = `\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
+            } else if (n.tier === "L2") {
+              contentPart = n.description ? `\n描述: ${n.description}` : "";
+            }
+            return `${tierLabel} [${n.type}] ${n.name}${hotFlag}${scoreStr}${contentPart}`;
           });
 
-          const edgeLines = res.edges.map((e: any) => {
-            const from = res.nodes.find((n: any) => n.id === e.fromId)?.name ?? e.fromId;
-            const to = res.nodes.find((n: any) => n.id === e.toId)?.name ?? e.toId;
+          const filteredEdges = res.edges.filter(
+            (e: any) => nodeMap.has(e.fromId) && nodeMap.has(e.toId),
+          );
+          const edgeLines = filteredEdges.map((e: any) => {
+            const from = nodeMap.get(e.fromId)?.name ?? e.fromId;
+            const to = nodeMap.get(e.toId)?.name ?? e.toId;
             return `  ${from} --[${e.name}]--> ${to}: ${e.description}`;
           });
 
           const text = [
-            `找到 ${res.nodes.length} 个节点：\n`,
+            `找到 ${displayNodes.length} 个节点：\n`,
             ...lines,
             ...(edgeLines.length ? ["\n关系：", ...edgeLines] : []),
           ].join("\n\n");
 
-          // 返回完整 TieredNode 信息（含层级、评分、原始字段）
-          const tieredInfo = res.nodes.map((n: any) => {
+          // 返回完整 TieredNode 信息（已过滤 filtered）
+          const tieredInfo = displayNodes.map((n: any) => {
             // Get belief info if available
             let belief: number | null = null;
             let successCount: number | null = null;
@@ -881,7 +895,7 @@ const graphMemoryPlugin = {
 
           return {
             content: [{ type: "text", text }],
-            details: { count: res.nodes.length, query, tieredInfo },
+            details: { count: displayNodes.length, query, tieredInfo },
           };
         },
       }),
