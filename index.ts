@@ -322,7 +322,7 @@ const graphMemoryPlugin = {
       return next;
     }
 
-    // ── before_prompt_build：召回 ────────────────────────────
+        // ── before_prompt_build：召回 + 渲染 KG（注入 appendSystemContext）───
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {
       try {
@@ -353,6 +353,7 @@ const graphMemoryPlugin = {
         const query = recallQuery || prompt;
         api.logger.info(`[graph-memory] recall query (${RECALL_KEEP_TURNS} turns): "${query.slice(0, 80)}"`);
 
+        // ── 召回 ────────────────────────────────────────────────
         const res = await recaller.recallV2(query);
         if (res.nodes.length) {
           const stored = { nodes: res.nodes, edges: res.edges, pprScores: res.pprScores };
@@ -370,8 +371,52 @@ const graphMemoryPlugin = {
             `[graph-memory] recalled ${res.nodes.length} nodes [${tierStr}], ${res.edges.length} edges`,
           );
         }
+
+        // ── 组装 KG 并注入 appendSystemContext（优先级低于 Claw 核心设定）──
+        const rec = recalled.get(sid) ?? { nodes: [], edges: [], pprScores: {} };
+        const activeNodes = getBySession(db, sid);
+        const activeEdges = activeNodes.flatMap((n) => [
+          ...edgesFrom(db, n.id),
+          ...edgesTo(db, n.id),
+        ]);
+        const hotNodes = getHotNodes(db);
+        const hotEdges = hotNodes.length > 0 ? getEdgesForNodes(db, hotNodes.map(n => n.id)) : [];
+        const sessionScopes = getScopesForSession(db, sid);
+        const scopeHotNodes = sessionScopes.length > 0 ? getScopeHotNodes(db, sessionScopes) : [];
+        const scopeHotEdges = scopeHotNodes.length > 0 ? getEdgesForNodes(db, scopeHotNodes.map(n => n.id)) : [];
+
+        if (activeNodes.length === 0 && rec.nodes.length === 0 && hotNodes.length === 0 && scopeHotNodes.length === 0) {
+          return;
+        }
+
+        const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, cfg, {
+          tokenBudget: 0,
+          scopeHotNodes,
+          scopeHotEdges,
+          hotNodes,
+          hotEdges,
+          activeNodes,
+          activeEdges,
+          recalledNodes: rec.nodes,
+          recalledEdges: rec.edges,
+          pprScores: rec.pprScores,
+          graphWalkDepth: cfg.recallMaxDepth,
+        });
+
+        if (gmTokens > 0 || episodicTokens > 0) {
+          api.logger.info(
+            `[graph-memory] bpb inject: graph ~${gmTokens} tok` +
+            (scopeHotNodes.length > 0 ? `, scope_hot=${scopeHotNodes.length}` : "") +
+            (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
+          );
+        }
+
+        const parts = [systemPrompt, xml, episodicXml].filter(Boolean);
+        if (parts.length) {
+          return { appendSystemContext: parts.join("\n\n") };
+        }
       } catch (err) {
-        api.logger.warn(`[graph-memory] recall failed: ${err}`);
+        api.logger.warn(`[graph-memory] before_prompt_build failed: ${err}`);
       }
     });
 
@@ -411,67 +456,10 @@ const graphMemoryPlugin = {
         messages: any[];
         tokenBudget?: number;
       }) {
-        const activeNodes = getBySession(db, sessionId);
-        const activeEdges = activeNodes.flatMap((n) => [
-          ...edgesFrom(db, n.id),
-          ...edgesTo(db, n.id),
-        ]);
-
-        // hot 节点始终渲染
-        const hotNodes = getHotNodes(db);
-        const hotEdges = hotNodes.length > 0 ? getEdgesForNodes(db, hotNodes.map(n => n.id)) : [];
-
-        // scope_hot 节点（当前 session 的 scope 匹配）
-        const sessionScopes = getScopesForSession(db, sessionId);
-        const scopeHotNodes = sessionScopes.length > 0 ? getScopeHotNodes(db, sessionScopes) : [];
-        const scopeHotEdges = scopeHotNodes.length > 0 ? getEdgesForNodes(db, scopeHotNodes.map(n => n.id)) : [];
-
-        const rec = recalled.get(sessionId) ?? { nodes: [], edges: [], pprScores: {} };
-        const totalGmNodes = activeNodes.length + rec.nodes.length;
-
-        if (totalGmNodes === 0 && hotNodes.length === 0 && scopeHotNodes.length === 0) {
-          return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
-        }
-
-        // ── 1. 最后一轮完整对话 ─────────────────────────
-        const lastTurn = sliceLastTurn(messages);
-        const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
-
-        // ── 2. 图谱 + 溯源 ─────────────────────────────
-        const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, cfg, {
-          tokenBudget: 0,
-          scopeHotNodes,
-          scopeHotEdges,
-          hotNodes,
-          hotEdges,
-          activeNodes,
-          activeEdges,
-          recalledNodes: rec.nodes,
-          recalledEdges: rec.edges,
-          pprScores: rec.pprScores,
-          graphWalkDepth: cfg.recallMaxDepth,
-        });
-
-        if (lastTurn.dropped > 0 || episodicTokens > 0) {
-          api.logger.info(
-            `[graph-memory] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
-            `dropped ${lastTurn.dropped} older msgs, graph ~${gmTokens} tok` +
-            (scopeHotNodes.length > 0 ? `, scope_hot=${scopeHotNodes.length}` : "") +
-            (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
-          );
-        }
-
-        // ── 3. 组装 systemPrompt ────────────────────────
-        let systemPromptAddition: string | undefined;
-        const parts = [systemPrompt, xml, episodicXml].filter(Boolean);
-        if (parts.length) {
-          systemPromptAddition = parts.join("\n\n");
-        }
-
+        // KG 渲染已移至 before_prompt_build（appendSystemContext），assemble 只透传消息
         return {
-          messages: normalizeMessageContent(repaired),
-          estimatedTokens: gmTokens + lastTurn.tokens,
-          ...(systemPromptAddition ? { systemPromptAddition } : {}),
+          messages: normalizeMessageContent(messages),
+          estimatedTokens: 0,
         };
       },
 
