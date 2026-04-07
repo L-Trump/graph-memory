@@ -110,10 +110,11 @@ export class Recaller {
 
     // ── 两条路径并行 ─────────────────────────────────────
     const precise = await this.recallPreciseV2(query, limit);
-    const generalized = await this.recallGeneralizedV2(query, limit);
+    // const generalized = await this.recallGeneralizedV2(query, limit);
 
     // ── 合并去重 ─────────────────────────────────────────
-    const merged = this.mergeResults(precise, generalized);
+    // const merged = this.mergeResults(precise, generalized);
+    const merged = precise;
 
     if (process.env.GM_DEBUG) {
       const communities = new Set(merged.nodes.map(n => n.communityId).filter(Boolean));
