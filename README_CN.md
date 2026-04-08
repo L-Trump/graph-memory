@@ -1,170 +1,192 @@
-<p align="center">
-  <img src="docs/images/banner.jpg" alt="graph-memory" width="100%" />
-</p>
-
-<h1 align="center">graph-memory</h1>
+# graph-memory
 
 <p align="center">
-  <strong>OpenClaw 知识图谱上下文引擎插件</strong><br>
-  作者 <a href="mailto:Wywelljob@gmail.com">adoresever</a> · MIT 许可证
-</p>
-
-<p align="center">
-  <a href="#安装">安装</a> ·
-  <a href="#工作原理">工作原理</a> ·
-  <a href="#配置参数">配置</a> ·
-  <a href="README.md">English</a>
+  <strong>OpenClaw 知识图谱上下文引擎插件</strong>
 </p>
 
 ---
 
-<p align="center">
-  <img src="docs/images/hero.png" alt="graph-memory 概览" width="90%" />
-</p>
+## 它解决什么问题
 
-## 记忆、Skills、Agent——难道不是一个东西吗？
+1. **上下文爆炸** — 对话轮次增加，消息堆积。graph-memory 用知识图谱替代原始消息，上下文长度收敛而非线性增长。
+2. **跨对话失忆** — 昨天的 bug 解法、踩过的坑，新对话全部归零。graph-memory 自动从历史对话中召回相关知识。
+3. **技能孤岛** — 孤立的学习条目之间没有关联。"装了 libgl1" 和 "ImportError: libGL.so.1" 本该通过一条 `解决` 边相连。
 
-大道至简——其实都是**上下文工程**。但现在有三个致命问题：
+**感觉像在和一个积累经验的 Agent 对话。因为它确实在积累。**
 
-🔴 **上下文爆炸** — Agent 执行任务反复试错，pip 日志、git 输出、报错堆栈疯狂堆积。174 条消息吃掉 95K token，噪音远大于信号，且无法祛除。
+## 架构
 
-🔴 **跨对话失忆** — 昨天踩过的坑、解过的 bug，新对话全部归零。MEMORY.md 全量加载？单次召回成本 49 万 token。不加载？同样的错误来一遍。
+```
+消息进入 → ingest()（同步，零 LLM）
+  └─ 所有消息存入 gm_messages
 
-🔴 **技能孤岛** — self-improving-agent 记录的学习条目是孤立的 markdown 列表，没有因果关系、没有依赖链、没有知识体系。"装了 libgl1" 和 "ImportError: libGL.so.1" 之间毫无关联。
+before_prompt_build hook（每次 LLM 调用前）
+  ├─ Input-layer 噪声过滤：跳过拒绝回复/元问题/Boilerplate 消息
+  ├─ recallV2()：精确召回 → 分层节点
+  ├─ saveRecalledNodes()：缓存召回节点到 gm_recalled
+  └─ assembleContext()：渲染 KG XML → 通过 appendSystemContext 注入
 
-**graph-memory 用一个方案同时解决这三个问题。**
+afterTurn hook（后台异步，不阻塞用户对话）
+  ├─ Input-layer 噪声过滤
+  ├─ extract()：LLM 提取三元组 → gm_nodes + gm_edges
+  ├─ recordBeliefSignal() + updateNodeBelief()：处理置信度更新
+  ├─ syncEmbed()：异步写入向量（非阻塞）
+  └─ 每 N 轮（compactTurnCount）：主题归纳 + 维护
 
-<p align="center">
-  <img src="docs/images/graph-ui.png" alt="graph-memory 知识图谱可视化与社区检测" width="95%" />
-</p>
+session_end hook
+  ├─ finalize()：EVENT → SKILL 升级、补充遗漏关系、标记失效节点
+  ├─ 主题归纳
+  ├─ runMaintenance()：去重 → PageRank → 社区检测
+  └─ session belief 信号（weight=0.3）
+```
 
-> *58 个节点、40 条边、3 个社区——全部从对话中自动提取。右侧面板展示知识图谱的社区聚类（GitHub 操作、B站 MCP、会话管理）。左侧面板展示 Agent 使用 `gm_stats` 和 `gm_search` 工具查询图谱。*
+### ContextEngine 接口
 
-## v2.0 新特性
+实现 OpenClaw 的 `ContextEngine` 接口：
 
-### 社区感知召回（双路径并行）
+| 方法 | 说明 |
+|------|------|
+| `bootstrap` | 轻量初始化（当前为空操作） |
+| `ingest` | 同步保存消息到 gm_messages（零 LLM） |
+| `assemble` | 仅透传消息（KG 渲染在 before_prompt_build hook 中） |
+| `compact` | 兜底提取路径（包含噪声过滤 + beliefUpdates 处理） |
+| `afterTurn` | 主提取入口（异步）：消息入库 → 提取 → 置信度更新 → 周期性维护 |
+| `prepareSubagentSpawn` | 共享召回上下文给子 Agent |
+| `onSubagentEnded` | 清理子 Agent session 数据 |
+| `dispose` | 清理 session 状态 |
 
-召回现在有**两条并行路径**，结果合并去重：
+### Hooks
 
-- **精确路径**：向量/FTS5 搜索 → 社区扩展 → 图遍历 → 个性化 PageRank 排序
-- **泛化路径**：查询向量 vs 社区摘要 embedding → 匹配社区成员 → 个性化 PageRank 排序
+| Hook | 时机 | 作用 |
+|------|------|------|
+| `before_prompt_build` | 每次 LLM 调用前 | 召回 → 渲染 KG XML → 注入 system prompt |
+| `session_end` | Session 结束时 | finalize + 主题归纳 + 维护 + 置信度信号 |
 
-社区摘要在每次社区检测（每 7 轮）后**立即生成**，泛化路径从第一个维护窗口开始就可用。
+## 核心功能
 
-### 溯源片段（Episodic Context）
+### 节点类型
 
-PPR 排名前 3 的节点会拉取**原始 user/assistant 对话片段**注入上下文。Agent 不仅看到结构化的三元组，还能看到产生这些知识的实际对话——提高复用过去方案时的准确性。
+| 类型 | 含义 |
+|------|------|
+| `TASK` | 用户要求完成的任务，含目标、步骤、结果 |
+| `SKILL` | 可复用技能，含触发条件、步骤、常见错误 |
+| `EVENT` | 一次性错误，含现象、原因、解决方法 |
+| `KNOWLEDGE` | 领域知识，有明确适用范围和注意事项 |
+| `STATUS` | 时效性快照（永不合并，每次新建带时间戳） |
 
-### 通用 Embedding 兼容
+### 置信度系统
 
-Embedding 模块改用原生 `fetch` 替代 `openai` SDK，开箱即用兼容**所有 OpenAI 兼容端点**：
+每个节点有 `belief` 分数 ∈ [0, 1]：
+- `1.00` = 完全可信（多次验证）
+- `0.7~0.99` = 可信，直接应用
+- `0.4~0.69` = 参考，谨慎验证
+- `0.00~0.39` = 低可信，使用前必须验证
 
-- OpenAI、Azure OpenAI
-- 阿里云 DashScope（`text-embedding-v4`）
-- MiniMax（`embo-01`）
-- Ollama、llama.cpp、vLLM（本地模型）
-- 任何实现了 `POST /embeddings` 的端点
+**信号来源：**
+- **Extract LLM**：提取结果中的 `beliefUpdates`（supported/contradicted）
+- **Session end**：对所有 session 节点记录 `task_completed` 信号（weight=0.3）
+- **gm_record 工具**：不处理 beliefUpdates（有意跳过）
 
-### Windows 一键安装包
+### 边类型
 
-v2.0 提供 **Windows 安装包**（`.exe`）。从 [Releases](https://github.com/adoresever/graph-memory/releases) 页面下载：
+边类型由 LLM 自由生成（如 `解决`、`使用`、`依赖`、`扩展`、`冲突`），每条边有 `description`（一句话描述关系）。
 
-1. 下载 `graph-memory-installer-win-x64.exe`
-2. 运行安装包——自动检测 OpenClaw 安装路径
-3. 安装包自动配置 `plugins.slots.contextEngine`、添加插件条目、重启 gateway
+### 分层召回（渲染优先级）
 
-## 实测数据
+| Tier | 优先级 | 输出内容 |
+|------|--------|----------|
+| `scope_hot` | 1（最高） | 完整 content — scope 下永久加载，永远可见 |
+| `hot` | 2 | 完整 content — 每个 session 必定注入 |
+| `active` | 3 | 完整 content — 本轮对话新产生，compact 后需参考上下文 |
+| `L1` | 4 | 完整 content（Top 0~15 按综合分数） |
+| `L2` | 5 | 仅 description（Top 15~30） |
+| `L3` | 6 | 仅 name（Top 30~45） |
+| `filtered` | 7 | 不传递，不渲染 |
 
-<p align="center">
-  <img src="docs/images/token-comparison.png" alt="7 轮对话 Token 逐轮对比" width="85%" />
-</p>
-
-7 轮对话实测（安装 bilibili-mcp + 登录 + 查询）：
-
-| 轮次 | 无 graph-memory | 有 graph-memory |
-|------|----------------|-----------------|
-| R1 | 14,957 | 14,957 |
-| R4 | 81,632 | 29,175 |
-| R7 | **95,187** | **23,977** |
-
-**压缩 75%。** 红色 = 无 graph-memory（线性增长）。蓝色 = 有 graph-memory（图谱替代后收敛）。
-
-<p align="center">
-  <img src="docs/images/token-sessions.png" alt="跨对话召回" width="85%" />
-</p>
-
-## 工作原理
-
-### 知识图谱
-
-graph-memory 从对话中构建类型化属性图：
-
-- **5 种节点**: `TASK`（做了什么）、`SKILL`（怎么做的）、`EVENT`（出了什么问题）、`KNOWLEDGE`（有明确适用范围的领域知识）、`STATUS`（时效性强的快照状态）
-- **5 种边**: `USED_SKILL`、`SOLVED_BY`、`REQUIRES`、`PATCHES`、`CONFLICTS_WITH`
-- **个性化 PageRank**: 根据当前查询动态排序，不是全局固定排名
-- **社区检测**: 自动将相关技能分组（Docker 集群、Python 集群等）
-- **社区摘要**: LLM 生成每个社区的描述 + embedding，实现语义级社区召回
-- **溯源片段**: 链接到图谱节点的原始对话片段，忠实还原上下文
-- **向量去重**: 通过余弦相似度合并语义重复的节点
-
-### 双路径召回
+### 精确召回路径
 
 ```
 用户查询
   │
-  ├─ 精确路径（实体级）
-  │    向量/FTS5 搜索 → 种子节点
-  │    → 社区同伴扩展
-  │    → 图遍历（N 跳）
-  │    → 个性化 PageRank 排序
-  │
-  ├─ 泛化路径（社区级）
-  │    查询 embedding vs 社区摘要 embedding
-  │    → 匹配社区的成员节点
-  │    → 图遍历（1 跳）
-  │    → 个性化 PageRank 排序
-  │
-  └─ 合并去重 → 最终上下文
+  └─ 精确路径（泛化路径已禁用）
+       向量/FTS5 搜索 → 种子节点
+       → 社区同伴扩展
+       → 图遍历（N 跳）
+       → 个性化 PageRank 排序
+       → 关键词混合语义评分
 ```
 
-两条路径并行执行。精确路径结果优先，泛化路径补充精确路径未覆盖的知识域。
+> 注：泛化（社区级）路径当前禁用，仅精确路径运行。
 
-### 数据流
+### 组合评分
+
+三维评分，min-max 归一化后加权求和：
 
 ```
-消息进入 → ingest（零 LLM）
-  ├─ 所有消息存入 gm_messages
-  └─ turn_index 从数据库最大值续接（重启不归零）
-
-assemble（零 LLM）
-  ├─ 图谱节点 → 按社区分组的 XML 注入 systemPrompt
-  ├─ PPR 排序决定注入优先级
-  ├─ PPR Top 3 节点拉取溯源片段
-  ├─ Content 规范化（防止 OpenClaw content.filter 崩溃）
-  └─ 保留最后一轮完整对话
-
-afterTurn（后台异步，不阻塞用户对话）
-  ├─ LLM 提取三元组 → gm_nodes + gm_edges
-  ├─ 每 7 轮：PageRank + 社区检测 + 社区摘要生成
-  └─ 用户发新消息时自动中断提取
-
-session_end
-  ├─ finalize（LLM）：EVENT → SKILL 升级
-  └─ maintenance：去重 → PageRank → 社区检测
-
-下次新对话 → before_prompt_build
-  ├─ 双路径召回（精确 + 泛化）
-  └─ 个性化 PageRank 排序 → 注入上下文
+combinedScore = semantic_weight × norm_semantic
+              + ppr_weight × norm_ppr
+              + pagerank_weight × norm_pagerank
 ```
 
-### 个性化 PageRank (PPR)
+**关键词混合召回**：语义分数由向量相似度和关键词重叠度混合：
 
-区别于全局 PageRank，PPR **根据你当前的问题动态排序**：
+```
+hybridSemantic = vectorSim × (1 + keywordScore × KEYWORD_WEIGHT)
+```
 
-- 问 "Docker 部署" → Docker 相关 SKILL 分数最高
-- 问 "conda 环境" → conda 相关 SKILL 分数最高
-- 同一个图谱，完全不同的排名
-- 召回时实时计算（几千节点 < 5ms）
+默认权重：α=0.5（语义）、β=0.3（PPR）、γ=0.2（PageRank）、KEYWORD_WEIGHT=0.4。
+
+### 主题归纳
+
+周期性触发（`compactTurnCount` 轮一次 + session_end 时），过程：
+1. 取 session 节点作为 `sessionNodes`
+2. 跨 session 召回相关节点
+3. 形成局部子图
+4. LLM 归纳 `TOPIC` 节点，含：
+   - `semantic → TOPIC` 边（节点归属主题）
+   - `TOPIC ↔ TOPIC` 边（主题间关系）
+
+也可手动调用 `gm_induce_topics(name)`。
+
+### 噪声过滤（双层）
+
+**Input-layer**（`src/extractor/noise-filter.ts`）：消息进入提取流程前过滤
+- Agent 拒绝回复（"I don't have any information"）
+- 关于记忆的元问题（"do you remember"）
+- 严格 Boilerplate（招呼语、HEARTBEAT）
+- 短文本 Boilerplate（≤10字）
+
+**Output-layer**（`src/extractor/extract.ts`）：LLM 提取结果写入数据库前过滤
+- 同名重复（保留第一个）
+- 幻觉占位符（content of X、纯标点、长重复字符）
+- 内容近似重复（词重叠 >65%）
+
+## Agent 工具（17个）
+
+| 工具 | 说明 |
+|------|------|
+| `gm_search(query)` | 在图谱中语义搜索相关节点 |
+| `gm_record(content, flags?)` | 手动记录知识到图谱（不处理 beliefUpdates） |
+| `gm_stats()` | 图谱统计：节点数、边数、社区数、PageRank Top、置信度统计 |
+| `gm_get_hots()` | 获取所有 hot 节点 |
+| `gm_maintain()` | 手动触发图维护：去重 → PageRank → 社区检测 |
+| `gm_embedding(name, force?)` | 重新计算单个节点的向量 |
+| `gm_reembedding_all(confirm, force?)` | 重新计算所有节点的向量（需 confirm=true） |
+| `gm_remove(name, reason?)` | 软删除节点（标记为 deprecated） |
+| `gm_induce_topics(name)` | 以指定节点为中心进行主题归纳 |
+| `gm_get_node(name)` | 获取节点完整信息：description、content、置信度、flags、边 |
+| `gm_edit_node(name, description?, content?)` | 编辑节点（自动重算向量） |
+| `gm_set_hot(name)` | 添加 "hot" flag |
+| `gm_set_scope_hot(name, scope)` | 添加 "scope_hot:scope" flag |
+| `gm_get_flags(name)` | 获取节点所有 flags |
+| `gm_set_flags(name, flags)` | 设置（替换）节点 flags |
+| `gm_set_scope(scopes)` | 将 scope 绑定到当前 session |
+| `gm_get_scope()` | 获取当前 session 绑定的 scope |
+| `gm_list_scopes()` | 列出所有 scope 及其 session 数量 |
+
+### Scope Hot
+
+Scope 将上下文绑定到 session。通过 `gm_set_scope` 设置 scope。带有匹配 `scope_hot:scope` flag 的节点在 assemble 时优先于普通 hot 节点渲染。
 
 ## 安装
 
@@ -173,77 +195,20 @@ session_end
 - [OpenClaw](https://github.com/openclaw/openclaw)（v2026.3.x+）
 - Node.js 22+
 
-### Windows 用户
-
-从 [Releases](https://github.com/adoresever/graph-memory/releases) 下载安装包：
-
-```
-graph-memory-installer-win-x64.exe
-```
-
-安装包自动完成：插件安装、上下文引擎激活、gateway 重启。运行后直接跳到[第三步：配置 LLM 和 Embedding](#第三步配置-llm-和-embedding)。
-
 ### 第一步：安装插件
-
-三种方式任选：
-
-**方式 A — 从 npm 仓库安装**（推荐）：
 
 ```bash
 pnpm openclaw plugins install graph-memory
 ```
 
-不需要 `node-gyp`，不需要手动编译。SQLite 驱动（`@photostructure/sqlite`）将预编译二进制打包在 npm tarball 内。
+### 第二步：激活上下文引擎（关键步骤）
 
-**方式 B — 从 GitHub 安装**：
-
-```bash
-pnpm openclaw plugins install github:adoresever/graph-memory
-```
-
-**方式 C — 从源码安装**（开发或自定义修改时使用）：
-
-```bash
-git clone https://github.com/adoresever/graph-memory.git
-cd graph-memory
-npm install
-npx vitest run   # 验证 80 个测试通过
-pnpm openclaw plugins install .
-```
-
-### 第二步：激活上下文引擎（关键！）
-
-这是**最容易遗漏的一步**。graph-memory 必须被注册为上下文引擎，否则 OpenClaw 只会用它做召回，**不会触发消息入库和知识提取**。
-
-编辑 `~/.openclaw/openclaw.json`，在 `plugins` 中添加 `slots`：
+编辑 `~/.openclaw/openclaw.json`：
 
 ```json
 {
   "plugins": {
-    "slots": {
-      "contextEngine": "graph-memory"
-    },
-    "entries": {
-      "graph-memory": {
-        "enabled": true
-      }
-    }
-  }
-}
-```
-
-如果没有 `plugins.slots.contextEngine`，插件虽然注册成功，但 `ingest` / `assemble` / `compact` 管线不会启动——你会在日志里看到 `recall`，但数据库里没有任何数据。
-
-### 第三步：配置 LLM 和 Embedding
-
-在 `plugins.entries.graph-memory.config` 中添加 API 密钥：
-
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "graph-memory"
-    },
+    "slots": { "contextEngine": "graph-memory" },
     "entries": {
       "graph-memory": {
         "enabled": true,
@@ -266,116 +231,41 @@ pnpm openclaw plugins install .
 }
 ```
 
-**LLM**（`config.llm`）— 必填。用于知识提取和社区摘要生成。支持任何 OpenAI 兼容端点。建议用便宜/快速的模型。
-
-**Embedding**（`config.embedding`）— 可选但推荐。启用语义向量搜索、社区级召回和向量去重。不配则降级为 FTS5 全文搜索（仍然可用，只是基于关键词匹配）。
-
-> **⚠️ 注意**：`pnpm openclaw plugins install` 可能会重置你的配置。每次重装插件后请检查 `config.llm` 和 `config.embedding` 是否还在。
-
-如果不配 `config.llm`，graph-memory 会回退到环境变量 `ANTHROPIC_API_KEY` + Anthropic API。
-
-### 支持的 Embedding 服务商
-
-| 服务商 | baseURL | 模型 | dimensions |
-|--------|---------|------|------------|
-| OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` | 512 |
-| 阿里云 DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4` | 1024 |
-| MiniMax | `https://api.minimax.chat/v1` | `embo-01` | 1024 |
-| Ollama | `http://localhost:11434/v1` | `nomic-embed-text` | 768 |
-| llama.cpp | `http://127.0.0.1:8080/v1` | 你的模型名 | 视模型而定 |
-
-模型不支持 `dimensions` 参数时，设为 `0` 或直接不填。
-
-### 重启并验证
+### 第三步：重启并验证
 
 ```bash
 pnpm openclaw gateway --verbose
 ```
 
-启动日志中应该看到这两行：
+日志中应看到：
 
 ```
 [graph-memory] ready | db=~/.openclaw/graph-memory.db | provider=... | model=...
 [graph-memory] vector search ready
 ```
 
-如果看到 `FTS5 search mode` 而不是 `vector search ready`，说明 embedding 配置缺失或 API Key 无效。
-
-对话几轮后验证：
-
-```bash
-# 检查消息是否入库
-sqlite3 ~/.openclaw/graph-memory.db "SELECT COUNT(*) FROM gm_messages;"
-
-# 检查知识三元组是否提取成功
-sqlite3 ~/.openclaw/graph-memory.db "SELECT type, name, description FROM gm_nodes LIMIT 10;"
-
-# 检查社区是否被检测和描述
-sqlite3 ~/.openclaw/graph-memory.db "SELECT id, summary FROM gm_communities;"
-
-# 在 gateway 日志中确认：
-# [graph-memory] extracted N nodes, M edges
-# [graph-memory] recalled N nodes, M edges
-```
-
-### 常见问题
-
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| `recall` 正常但 `gm_messages` 为空 | 没设置 `plugins.slots.contextEngine` | 在 `plugins.slots` 中添加 `"contextEngine": "graph-memory"` |
-| 显示 `FTS5 search mode` | Embedding 未配置或 API Key 无效 | 检查 `config.embedding` 的密钥和地址 |
-| `No LLM available` 错误 | 重装插件后 LLM 配置丢失 | 重新添加 `config.llm` 到 `plugins.entries.graph-memory` |
-| `afterTurn` 后没有 `extracted` 日志 | 重启导致 turn_index 重叠 | 升级到 v2.0（修复了 msgSeq 持久化） |
-| `content.filter is not a function` | OpenClaw 要求 content 为数组 | 升级到 v2.0（添加了 content 规范化） |
-| 对话很多轮但节点为空 | 消息数未达到提取阈值 | 默认需要积累消息。继续对话或调低 `compactTurnCount` |
-
-## Agent 工具
-
-| 工具 | 用途 |
-|------|------|
-| `gm_search` | 搜索图谱中的相关经验、技能和解决方案 |
-| `gm_record` | 手动记录经验到图谱 |
-| `gm_stats` | 查看图谱统计：节点数、边数、社区数、PageRank Top 节点 |
-| `gm_maintain` | 手动触发图维护：去重 → PageRank → 社区检测 + 摘要生成 |
-
 ## 配置参数
-
-所有参数都有默认值，只需设置想要覆盖的。
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `dbPath` | `~/.openclaw/graph-memory.db` | 数据库路径 |
-| `compactTurnCount` | `7` | 维护周期（每隔多少轮触发 PageRank + 社区检测 + 摘要） |
-| `recallMaxNodes` | `6` | 每次召回最多注入的节点数 |
+| `dbPath` | `~/.openclaw/graph-memory.db` | SQLite 数据库路径 |
+| `compactTurnCount` | `6` | 维护周期（每隔多少轮触发主题归纳 + 维护） |
+| `recallMaxNodes` | `45` | 每次召回最多注入的节点数 |
 | `recallMaxDepth` | `2` | 图遍历跳数 |
+| `freshTailCount` | `10` | assemble 时始终保留的最新节点数 |
 | `dedupThreshold` | `0.90` | 向量去重的余弦相似度阈值 |
 | `pagerankDamping` | `0.85` | PPR 阻尼系数 |
 | `pagerankIterations` | `20` | PPR 迭代次数 |
+| `extractionRecentTurns` | `3` | 注入到提取 prompt 的最近 session 轮数 |
 
-## 数据库
+### 支持的 Embedding 服务商
 
-SQLite 通过 `@photostructure/sqlite`（预编译二进制，零编译）。默认路径：`~/.openclaw/graph-memory.db`。
-
-| 表 | 用途 |
-|----|------|
-| `gm_nodes` | 知识节点（含 pagerank + community_id） |
-| `gm_edges` | 类型化关系 |
-| `gm_nodes_fts` | FTS5 全文索引 |
-| `gm_messages` | 原始对话消息 |
-| `gm_signals` | 检测到的信号 |
-| `gm_vectors` | Embedding 向量（可选） |
-| `gm_communities` | 社区摘要 + embedding |
-
-## 与 lossless-claw 的对比
-
-| | lossless-claw | graph-memory |
-|--|---|---|
-| **方法** | 摘要 DAG | 知识图谱（三元组） |
-| **召回** | FTS grep + 子代理展开 | 双路径：实体 PPR + 社区向量匹配 |
-| **跨会话** | 仅当前对话 | 自动跨会话召回 |
-| **压缩** | 摘要（有损文本） | 结构化三元组（无损语义） |
-| **图算法** | 无 | PageRank、社区检测、向量去重 |
-| **上下文溯源** | 无 | 溯源片段（原始对话片段） |
+| 服务商 | baseURL | 模型 |
+|--------|---------|------|
+| OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` |
+| 阿里云 DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4` |
+| MiniMax | `https://api.minimax.chat/v1` | `embo-01` |
+| Ollama | `http://localhost:11434/v1` | `nomic-embed-text` |
 
 ## 开发
 
@@ -383,26 +273,62 @@ SQLite 通过 `@photostructure/sqlite`（预编译二进制，零编译）。默
 git clone https://github.com/adoresever/graph-memory.git
 cd graph-memory
 npm install
-npm test        # 80 个测试
-npx vitest      # 监听模式
+npx vitest run   # 所有测试通过
 ```
 
 ### 项目结构
 
 ```
 graph-memory/
-├── index.ts                     # 插件入口
-├── openclaw.plugin.json         # 插件清单
+├── index.ts                     # 插件入口 + 所有 hooks + 17 个工具
 ├── src/
-│   ├── types.ts                 # 类型定义
-│   ├── store/                   # SQLite CRUD / FTS5 / CTE 遍历 / 社区 CRUD
-│   ├── engine/                  # LLM（fetch）+ Embedding（fetch，无 SDK 依赖）
-│   ├── extractor/               # 知识提取 prompt
-│   ├── recaller/                # 双路径召回（精确 + 泛化 + PPR）
-│   ├── format/                  # 上下文组装 + 消息修复 + content 规范化
-│   └── graph/                   # PageRank、社区检测 + 摘要、去重、维护
-└── test/                        # 80 个 vitest 测试
+│   ├── types.ts                 # 类型定义 + GmConfig
+│   ├── db.ts                    # DB 单例 + 迁移记录
+│   ├── store.ts               # SQLite CRUD（节点/边/消息/向量）
+│   ├── engine/
+│   │   ├── llm.ts            # LLM（原生 fetch，无 SDK 依赖）
+│   │   ├── embed.ts            # Embedding（原生 fetch）
+│   │   └── induction.ts        # 主题归纳引擎
+│   ├── extractor/
+│   │   ├── extract.ts        # 知识提取 + beliefUpdates
+│   │   └── noise-filter.ts   # Input-layer 噪声过滤（拒绝回复/元问题/Boilerplate）
+│   ├── format/
+│   │   └── assemble.ts       # 上下文组装 + KG XML 渲染 + system prompt
+│   ├── recaller/
+│   │   ├── recall.ts         # 召回（仅精确路径）+ 组合评分 + 关键词混合
+│   │   └── score.ts          # 组合评分函数
+│   └── graph/
+│       ├── pagerank.ts         # Personalized PageRank + 全局 PageRank
+│       ├── community.ts        # 社区检测 + 摘要
+│       ├── dedup.ts          # 向量去重
+│       └── maintenance.ts       # 编排去重 → PR → 社区检测
+└── test/                       # vitest 测试
 ```
+
+## 数据库
+
+SQLite WAL 模式，路径 `~/.openclaw/graph-memory.db`。
+
+| 表 | 用途 |
+|----|------|
+| `gm_nodes` | 知识节点（含置信度、pagerank、community_id、flags） |
+| `gm_edges` | 类型化关系 |
+| `gm_messages` | 原始对话消息 |
+| `gm_signals` | 信号记录（tool_error、skill_invoked 等） |
+| `gm_vectors` | Embedding 向量 |
+| `gm_communities` | 社区摘要 + embedding |
+| `gm_scopes` | Session ↔ scope 绑定 |
+| `gm_recalled` | 每 session 的召回节点缓存 |
+| `gm_belief_signals` | 置信度证据记录（verdict、weight、reason） |
+| `gm_recall_feedback` | 召回反馈信号 |
+| `_migrations` | 迁移记录 |
+
+### gm_nodes flags
+
+Flags 以 JSON 数组字符串存储：
+- `"hot"` — 每次 assemble 必定渲染
+- `"scope_hot:xxx"` — 当 session 绑定了 scope `xxx` 时渲染
+- 自定义字符串
 
 ## 许可证
 

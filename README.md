@@ -23,7 +23,6 @@ Message in
   └─ ingest(): save to gm_messages (synchronous, zero LLM)
 
 before_prompt_build hook
-  ├─ Input-layer noise filter: skip denial/meta-question/boilerplate messages
   ├─ recallV2(): dual-path recall → tiered nodes
   ├─ saveRecalledNodes(): cache recalled nodes to gm_recalled
   └─ assembleContext(): render KG XML → inject via appendSystemContext
@@ -66,18 +65,13 @@ Implements OpenClaw's `ContextEngine` interface:
 
 ## Features
 
-### Noise filter (dual-layer)
+### Noise filter
 
 **Input-layer** (`src/extractor/noise-filter.ts`): Filters messages before LLM extraction
 - Agent denial patterns ("I don't have any information")
 - Meta-question patterns ("do you remember")
 - Strict boilerplate (greetings, HEARTBEAT)
 - Short boilerplate (≤10 chars)
-
-**Output-layer** (`src/extractor/extract.ts`): Filters LLM extraction results before DB write
-- Duplicate name deduplication
-- Hallucination placeholders (content of X, pure punctuation)
-- Content similarity deduplication (>65% token overlap)
 
 ### Node types
 
@@ -286,7 +280,7 @@ graph-memory/
 │   │   ├── embed.ts             # Embedding (fetch-based)
 │   │   └── induction.ts         # Topic induction engine
 │   ├── extractor/
-│   │   ├── extract.ts          # Knowledge extraction + beliefUpdates + output-layer noise filter
+│   │   ├── extract.ts          # Knowledge extraction + beliefUpdates
 │   │   └── noise-filter.ts     # Input-layer noise filter (denial/meta/boilerplate)
 │   ├── format/
 │   │   └── assemble.ts         # Context assembly + KG XML rendering + system prompt
