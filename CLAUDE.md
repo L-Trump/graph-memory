@@ -9,9 +9,11 @@ graph-memory 是 OpenClaw 的知识图谱上下文引擎插件，从对话中自
 ## 开发命令
 
 ```bash
-npm test          # 运行所有测试
-npm run test:watch # 监听模式
-npm run build     # 编译 TypeScript
+npm test              # 运行所有测试
+npm run test:watch   # 监听模式
+npm run build         # 编译 TypeScript
+npx vitest run src/xxx.test.ts   # 运行单个测试文件
+npx vitest run --grep "recall"   # 按测试名运行
 ```
 
 ## 架构
@@ -19,17 +21,17 @@ npm run build     # 编译 TypeScript
 ### 核心模块
 
 - **index.ts** — 插件主入口，注册 ContextEngine、工具（gm_*）和生命周期钩子
-- **src/types.ts** — 核心类型：GmNode（节点）、GmEdge（边）、GmConfig、Signal、RecallResult
+- **src/types.ts** — 核心类型：GmNode、GmEdge、GmConfig、Signal、RecallResult
 - **src/score.ts** — 组合评分：semantic(α) + PPR(β) + PageRank(γ) 三维归一化加权
 
 ### 存储层 (src/store/)
 
 - **db.ts** — SQLite 初始化，创建 `gm_nodes` / `gm_edges` / `gm_messages` 表
-- **store.ts** — 节点/边的 CRUD、FTS5 搜索、向量存储（`gm_vectors` 表）
+- **store.ts** — 节点/边的 CRUD、FTS5 搜索、向量存储
 
 ### 召回 (src/recaller/recall.ts)
 
-**双路径并行召回**：
+**recallV2 双路径并行召回**：
 1. 精确路径：向量/FTS5 搜索 → 社区扩展 → 图遍历 → PPR 排序
 2. 泛化路径：社区摘要 embedding → 匹配社区成员 → PPR 排序
 
@@ -37,7 +39,7 @@ npm run build     # 编译 TypeScript
 
 ### 图算法 (src/graph/)
 
-- **pagerank.ts** — 全局 PageRank（写入 `gm_nodes.pagerank`）+ 个性化 PPR（recall 时实时计算）
+- **pagerank.ts** — 全局 PageRank（0-1 归一化, damping 0.85）+ 个性化 PPR（recall 时实时计算）
 - **community.ts** — Label Propagation 社区检测（无向边，O edges），写回 `gm_nodes.community_id`
 - **dedup.ts** — 向量余弦相似度去重
 - **maintenance.ts** — session_end 时运行去重+社区+PageRank+摘要
@@ -83,10 +85,16 @@ assemble
 
 ### 数据库 Schema
 
-- `gm_nodes` — id, type, name, description, content, status, validated_count, pagerank, community_id, flags, source_sessions, created_at, updated_at
-- `gm_edges` — id, from_id, to_id, name, description, session_id, created_at
+- `gm_nodes` — id, type, name, description, content, status, validated_count, source_sessions, community_id, pagerank, belief, success_count, failure_count, last_signal_at, created_at, updated_at
+- `gm_edges` — id, from_id, to_id, type, instruction, condition, session_id, created_at
 - `gm_messages` — id, session_id, turn_index, role, content, extracted, created_at
-- `gm_vectors` — node_id, content_hash, embedding（BLOB），建有 FTS5 虚拟列
+- `gm_signals` — id, session_id, turn_index, type, data, processed, created_at
+- `gm_nodes_fts` — FTS5 虚拟表（name, description, content）
+- `gm_vectors` — node_id, content_hash, embedding（BLOB）
+- `gm_communities` — id, summary, node_count, embedding, created_at, updated_at
+- `gm_scopes` — scope_name, session_id
+- `gm_recalled` — session_id, turn_index, recalled_ids, ...
+- `gm_belief_signals` — id, session_id, node_id, signal, weight, at
 
 ### 工具函数
 
@@ -96,8 +104,18 @@ assemble
 - `gm_maintain` — 手动触发维护
 - `gm_get_hots` — 获取 hot 节点
 - `gm_set_flags` — 设置节点 flags
+- `gm_get_node` — 获取节点详情
+- `gm_edit_node` — 编辑节点
+- `gm_set_hot` — 标记节点为 hot
+- `gm_set_scope_hot` — 设置 scope 级别的 hot
+- `gm_get_flags` — 获取节点 flags
+- `gm_set_scope` — 设置 scope
+- `gm_get_scope` — 获取 scope
+- `gm_list_scopes` — 列出所有 scope
 - `gm_remove` — 软删除节点
-- `gm_embedding` / `gm_reembedding_all` — 重新嵌入
+- `gm_embedding` — 计算单条 embedding
+- `gm_reembedding_all` — 重新嵌入所有节点
+- `gm_induce_topics` — 归纳主题
 
 ### 环境变量
 

@@ -401,7 +401,7 @@ const graphMemoryPlugin = {
         ]);
         const hotNodes = getHotNodes(db);
         const hotEdges = hotNodes.length > 0 ? getEdgesForNodes(db, hotNodes.map(n => n.id)) : [];
-        const sessionScopes = getScopesForSession(db, sid);
+        const sessionScopes = getScopesForSession(db, ctx?.sessionKey ?? ctx?.sessionId);
         const scopeHotNodes = sessionScopes.length > 0 ? getScopeHotNodes(db, sessionScopes) : [];
         const scopeHotEdges = scopeHotNodes.length > 0 ? getEdgesForNodes(db, scopeHotNodes.map(n => n.id)) : [];
 
@@ -723,10 +723,10 @@ const graphMemoryPlugin = {
 
     api.on("session_end", async (event: any, ctx: any) => {
       const sid =
-        ctx?.sessionKey ??
         ctx?.sessionId ??
-        event?.sessionKey ??
-        event?.sessionId;
+        ctx?.sessionKey ??
+        event?.sessionId ??
+        event?.sessionKey;
       if (!sid) return;
 
       try {
@@ -964,7 +964,7 @@ const graphMemoryPlugin = {
           _toolCallId: string,
           p: { content: string; flags?: string[] },
         ) {
-          const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
+          const sid = ctx?.sessionId ?? ctx?.sessionKey ?? "manual";
 
           // ── 1. 获取本 session 已有的节点 ─────────────────────
           const sessionNodes = getBySession(db, sid);
