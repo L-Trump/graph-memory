@@ -37,7 +37,7 @@ describe("buildSystemPromptAddition", () => {
     });
 
     expect(result).toContain("Graph Memory");
-    expect(result).toContain("1 nodes recalled from OTHER conversations");
+    expect(result).toContain("1 recalled nodes from other conversations");
   });
 
   it("丰富图谱包含导航说明", () => {

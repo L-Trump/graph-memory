@@ -106,6 +106,42 @@ function formatEdge(e: GmEdge, fromName: string, toName: string, hasDescription:
 
 // ─── System Prompt 引导文字 ──────────────────────────────────
 
+/**
+ * KG XML Schema（精确描述实际渲染格式）
+ *
+ * 节点格式（5种 type）：
+ *   <task name="..." desc="..." source="active|recalled" tier="scope_hot|hot|active|l1|l2|l3" confidence="0.00~1.00" updated="YYYY-MM-DD" [scope_hot="true"]>
+ *     content（完整知识内容）
+ *   </task>
+ *   <skill ...> 同上 </skill>
+ *   <event ...> 同上 </event>
+ *   <knowledge ...> 同上 </knowledge>
+ *   <status ...> 同上 </status>
+ *   自闭合标签（如 <task name="..." tier="l3" source="recalled"/>）表示仅含 name
+ *
+ * 节点 tier（重要度，从高到低）：
+ *  - **scope_hot**（scope 热记忆）：当前 session 所属 scope 下永久加载的记忆，永远可见
+ *  - **hot**（全局热记忆）：全局永久加载的记忆，每个 session 必定注入
+ *  - **active**（本 session 节点）：本轮对话中新产生的节点，compact 后需参考其上下文
+ *  - **L1**（recalled top 15）：完整 content，召回评分最高的节点
+ *  - **L2**（recalled 16~30）：仅 description，上下文参考
+ *  - **L3**（recalled 31~45）：仅 name，提示存在相关知识域
+ *  - **filtered**：不传递，不渲染
+ *
+ * 节点 confidence（置信度）：0.00~1.00
+ *  - 1.00：完全可信（多次验证）
+ *  - 0.7~0.99：可信，直接应用
+ *  - 0.4~0.69：参考，谨慎验证
+ *  - 0.00~0.39：低可信，使用前必须验证
+ *
+ * 边格式（位于 <edges> 父标签内）：
+ *   <e name="边类型名" from="起点name" to="终点name">描述</e>  （有描述）
+ *   <e name="边类型名" from="起点name" to="终点name"/>                     （仅边类型）
+ *
+ * 边类型名（部分示例）：解决、使用、依赖、扩展、冲突、触发、导致、互补、验证、修复
+ *   描述说明两端节点之间的关系语义
+ */
+
 export function buildSystemPromptAddition(params: {
   selectedNodes: Array<{ type: string; src: "active" | "recalled"; tier: string }>;
   edgeCount: number;
@@ -115,7 +151,6 @@ export function buildSystemPromptAddition(params: {
   if (selectedNodes.length === 0) return "";
 
   const recalledCount = selectedNodes.filter(n => n.src === "recalled").length;
-  const hasRecalled = recalledCount > 0;
   const skillCount = selectedNodes.filter(n => n.type === "SKILL").length;
   const eventCount = selectedNodes.filter(n => n.type === "EVENT").length;
   const taskCount = selectedNodes.filter(n => n.type === "TASK").length;
@@ -131,40 +166,72 @@ export function buildSystemPromptAddition(params: {
     "Below `<knowledge_graph>` is your accumulated experience from past conversations.",
     "It contains structured knowledge — NOT raw conversation history.",
     "",
-    '**⚠️ Real-time state takes priority over memory.** The knowledge graph provides memories — for current code content, file state, directory structure, or system environment — always verify with actual commands. Memory tells you how things were done before, not what is true right now.',
+    "**⚠️ Real-time state takes priority over memory.** For current code, file state, directory structure, system environment, or version numbers — always verify with actual commands. Memory tells you how things were done before, not what is true right now.",
     "",
-    `Current graph: ${scopeHotCount > 0 ? `${scopeHotCount} scope_hot, ` : ""}${taskCount} tasks, ${skillCount} skills, ${eventCount} events, ${knowledgeCount} knowledge, ${statusCount} status, ${edgeCount} relationships.`,
+    `Current: ${scopeHotCount > 0 ? `${scopeHotCount} scope_hot, ` : ""}${taskCount} tasks, ${skillCount} skills, ${eventCount} events, ${knowledgeCount} knowledge, ${statusCount} status, ${edgeCount} relationships.`,
   );
 
-  if (hasRecalled) {
+  if (recalledCount > 0) {
     sections.push(
       "",
-      `**${recalledCount} nodes recalled from OTHER conversations** — these are proven solutions that worked before.`,
-      "Apply them directly when the current situation matches their trigger conditions.",
+      `**${recalledCount} recalled nodes from other conversations** — proven solutions that worked before. Apply them directly when the current situation matches their trigger conditions.`,
     );
   }
 
   sections.push(
     "",
-    "## Recalled context for this query",
+    "## KG 节点 tier 说明",
     "",
-    "This is a context engine. The following was retrieved by semantic search for the current message:",
+    "- **scope_hot**：当前 session scope 下永久加载，永远可见",
+    "- **hot**：全局热记忆，每个 session 必定注入",
+    "- **active**：本 session 新产生的节点，compact 后需参考上下文",
+    "- **L1**：recalled top 级，完整 content，召回评分最高的节点",
+    "- **L2**：recalled 中级，仅 description，上下文参考",
+    "- **L3**：recalled 基础级，仅 name，提示存在相关知识域",
+    "- **filtered**：不传递，不渲染",
     "",
-    "- **`<episodic_context>`** — Trimmed conversation traces from sessions that produced the knowledge nodes, ordered by time.",
-    "- **`<knowledge_graph>`** — Relevant triples (TASK/SKILL/EVENT/KNOWLEDGE/STATUS) and edges, grouped by community.",
-    "- **Recent 5 turns** — Last turn in full, previous 4 turns as user+assistant text only.",
+    "## KG XML 节点格式",
     "",
-    "Read this context first. Use `gm_search` only if insufficient. Use `gm_record` to save new knowledge.",
+    '节点格式（5种 type）：',
+    '  <task name="..." desc="..." source="active|recalled" tier="scope_hot|hot|active|l1|l2|l3" confidence="0.00~1.00" updated="YYYY-MM-DD" [scope_hot="true"]>',
+    '    content（完整知识内容）',
+    '  </task>',
+    '  <skill ...> 同上 </skill>',
+    '  <event ...> 同上 </event>',
+    '  <knowledge ...> 同上 </knowledge>',
+    '  <status ...> 同上 </status>',
+    '  自闭合标签（如 <task name="..." tier="l3" source="recalled"/>）表示仅含 name',
+    "- **scope_hot / hot / active / L1**：完整 `content` + `description` + `confidence`（有完整闭合标签）",
+    "- **L2**：仅 `description`，无 content（自闭合标签）",
+    "- **L3**：仅 `name`（自闭合标签）",
+    "",
+    "## KG 置信度（confidence）说明",
+    "",
+    "- 1.00：完全可信，多次验证确认",
+    "- 0.7~0.99：可信，相信其中知识",
+    "- 0.4~0.69：参考，谨慎验证",
+    "- 0.00~0.39：低可信，使用前必须验证",
+    "",
+    "## 如何应用召回知识",
+    "",
+    "1. **匹配触发条件**：当前场景与节点 `description` 一致时，直接应用其 `content`",
+    "2. **检查置信度**：高置信度节点直接用，低置信度先验证",
+    "3. **边导航**：沿边找关联知识（如 `解决` 边：EVENT→SKILL，`使用` 边：TASK→SKILL）",
+    "4. **冲突处理**：两个 SKILL 有 `冲突` 边时，根据 description 中的互斥条件判断选哪个",
+    "5. **优先新近**：STATUS 节点含 `updated` 日期，优先用更新的快照",
+    "",
+    "## 上下文说明",
+    "",
+    "- **`<episodic_context>`**：召回节点的来源 session 片段，按时间排列",
+    "- **`<knowledge_graph>`**：结构化 KG，tier + confidence（格式见上方说明）",
+    "",
+    "主动应用召回知识。召回上下文不够时用 `gm_search` 查询，需要记录新知识时用 `gm_record`。",
   );
 
   if (isRich) {
     sections.push(
       "",
-      "**Graph navigation:** Edges show how knowledge connects (edge `name` is free-form, description explains the relation):",
-      "- `解决`: an EVENT was fixed by a SKILL — apply the skill when you see similar errors",
-      "- `使用`: a TASK used a SKILL — reuse the same approach for similar tasks",
-      "- `扩展`: a newer SKILL corrects an older one — prefer the newer version",
-      "- `冲突`: two SKILLs are mutually exclusive — check conditions before choosing",
+      "**边类型**：`解决`(EVENT→SKILL)、`使用`(TASK→SKILL)、`扩展`(SKILL更新)、`冲突`(互斥)、`依赖`、`触发`、`导致`、`互补`、`验证`、`修复` 等——description 解释具体关系语义。",
     );
   }
 
@@ -232,7 +299,7 @@ export function assembleContext(
   for (const n of passNodes) {
     const tag = n.type.toLowerCase();
     const tier = n.tier;
-    const srcAttr = tier === "active" ? ` source="active"` : ` source="recalled"`;  // scope_hot/hot/recalled all use "recalled"
+    const srcAttr = (tier !== "L1" && tier !== "L2" && tier !== "L3") ? ` source="${tier}"` : ` source="recalled"`;  // scope_hot/hot/recalled all use "recalled"
     const tierAttr = ` tier="${tier.toLowerCase()}"`;
     const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
     const beliefAttr = n.belief !== undefined ? ` confidence="${n.belief.toFixed(2)}"` : "";
