@@ -555,10 +555,30 @@ const graphMemoryPlugin = {
           const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
           markExtracted(db, sessionId, maxTurn);
 
+          // ── 处理置信度更新（beliefUpdates）────────────────────────
+          if (result.beliefUpdates && result.beliefUpdates.length > 0) {
+            for (const update of result.beliefUpdates) {
+              const node = findByName(db, update.nodeName);
+              if (!node) continue;
+              try {
+                recordBeliefSignal(db, node.id, node.name, update.verdict, sessionId, update.weight, {
+                  source: "compact_llm",
+                  reason: update.reason,
+                });
+                const updateResult = updateNodeBelief(db, node.id, update.verdict, update.weight);
+                if (updateResult && Math.abs(updateResult.delta) > 0.001) {
+                  invalidateGraphCache();
+                }
+              } catch (err) {
+                api.logger.warn(`[graph-memory] compact belief update for ${update.nodeName} failed: ${err}`);
+              }
+            }
+          }
+
           return {
             ok: true, compacted: true,
             result: {
-              summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
+              summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges, ${result.beliefUpdates?.length ?? 0} belief updates`,
               tokensBefore: currentTokenCount ?? 0,
             },
           };
@@ -796,7 +816,7 @@ const graphMemoryPlugin = {
           const sessionBeliefNodes = getBySession(db, sid);
           for (const node of sessionBeliefNodes) {
             try {
-              recordBeliefSignal(db, node.id, node.name, "supported", sid, 1.0, {
+              recordBeliefSignal(db, node.id, node.name, "supported", sid, 0.3, {
                 source: "session_end",
                 nodeCount: sessionBeliefNodes.length,
               });
