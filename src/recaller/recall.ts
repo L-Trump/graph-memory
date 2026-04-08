@@ -38,12 +38,102 @@ import {
 } from "../store/store.ts";
 import { getCommunityPeers } from "../graph/community.ts";
 import { personalizedPageRank } from "../graph/pagerank.ts";
-import { combinedScore, type Scored } from "../score.ts";
+import { combinedScore, type Scored } from "./score.ts";
 
 // ─── 组合评分权重 ────────────────────────────────────────────
 const SEMANTIC_WEIGHT = 0.5;   // α：语义相关性权重
 const PPR_WEIGHT = 0.3;        // β：局部关联性权重（PPR）
 const PAGERANK_WEIGHT = 0.2;   // γ：全局重要性权重（PageRank）
+
+// ─── 关键词混合召回 ────────────────────────────────────────────
+const KEYWORD_WEIGHT = 0.4;    // 关键词分数在语义组合中的权重上限（与向量相似度混合）
+
+/** 停用词表（中英文常见词） */
+const STOP_WORDS = new Set([
+  "the", "a", "an", "of", "to", "in", "on", "for", "with", "at",
+  "by", "from", "as", "is", "was", "are", "were", "be", "been",
+  "being", "have", "has", "had", "do", "does", "did", "will",
+  "would", "could", "should", "may", "might", "must", "can",
+  "this", "that", "these", "those", "i", "you", "he", "she",
+  "it", "we", "they", "what", "which", "who", "whom", "how",
+  "when", "where", "why", "not", "no", "yes", "and", "or",
+  "but", "if", "then", "so", "because", "although", "while",
+  "的", "了", "是", "在", "我", "有", "和", "就", "不", "人",
+  "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去",
+  "你", "会", "着", "没有", "看", "好", "自己", "这", "那",
+  "什么", "怎么", "如何", "为什么", "吗", "呢", "吧", "啊",
+]);
+
+/**
+ * 从查询字符串提取有意义的关键词 token（去除停用词、标点）
+ */
+function extractKeywords(query: string): Set<string> {
+  const tokens = query
+    .toLowerCase()
+    .split(/[\s\-_.,;:'"()（）【】《》[\]{}!?~`#$%^&*+=|\/<>]+/)
+    .filter(t => t.length > 1 && !STOP_WORDS.has(t) && !/^\d+$/.test(t));
+  return new Set(tokens);
+}
+
+/**
+ * 计算查询关键词在节点文本（name + description + content 前200字）中的覆盖得分
+ * 使用 TF-IDF 近似：log(1 + term_freq) * idf
+ * 返回 0~1 的归一化分数
+ */
+function computeKeywordScore(query: string, node: GmNode): number {
+  const keywords = extractKeywords(query);
+  if (keywords.size === 0) return 0;
+
+  const nodeText = `${node.name} ${node.description} ${node.content.slice(0, 200)}`.toLowerCase();
+
+  let weightedSum = 0;
+  let maxPossible = 0;
+  for (const kw of keywords) {
+    // Escape regex special chars
+    let escaped = kw.replace(/[.*+?^${}()|[\\]]/g, `$&`);
+    // Fix: if escaped ends with \, append another \ so RegExp doesn't treat it as escape sequence
+    if (escaped.endsWith("\\")) escaped += "\\";
+    let re: RegExp;
+    try {
+      re = new RegExp(escaped, 'g');
+    } catch {
+      // Fallback: escape all non-alphanumeric chars
+      escaped = kw.replace(/[^a-zA-Z0-9\\u4e00-\\u9fff]/g, `\\$&`);
+      if (escaped.endsWith("\\")) escaped += "\\";
+      re = new RegExp(escaped, 'g');
+    }
+    const tf = (nodeText.match(re) || []).length;
+    if (tf === 0) continue;
+    // log-weighted TF
+    const score = Math.log(1 + tf);
+    weightedSum += score;
+    maxPossible += Math.log(1 + nodeText.split(kw).length - 1);
+  }
+
+  if (maxPossible === 0) return 0;
+  return Math.min(1, weightedSum / maxPossible);
+}
+
+/**
+ * 混合语义评分：向量相似度 × (1 + keywordBoost × KEYWORD_WEIGHT)
+ */
+function makeHybridSemanticFn(
+  semanticScores: Map<string, number>,
+  query: string,
+): (n: GmNode) => number {
+  const kwScores = new Map<string, number>();
+  return (n: GmNode) => {
+    const vecSim = semanticScores.get(n.id) ?? 0;
+    if (vecSim === 0) return 0;
+    let kwScore = kwScores.get(n.id);
+    if (kwScore === undefined) {
+      kwScore = computeKeywordScore(query, n);
+      kwScores.set(n.id, kwScore);
+    }
+    const boost = 1 + kwScore * KEYWORD_WEIGHT;
+    return Math.min(1, vecSim * boost);
+  };
+}
 
 export type RecallTier = "L1" | "L2" | "L3" | "filtered" | "active" | "hot" | "scope_hot";
 
@@ -195,10 +285,11 @@ export class Recaller {
       this.db, seedIds, candidateIds, this.cfg,
     );
 
-    // 组合评分：语义 + PPR + PageRank
+    // 组合评分：语义（向量×关键词混合）+ PPR + PageRank
+    const hybridSemantic = makeHybridSemanticFn(semanticScores, query);
     const scoredNodes = combinedScore(
       nodes,
-      (n) => semanticScores.get(n.id) ?? 0,
+      hybridSemantic,
       (n) => pprScores.get(n.id) ?? 0,
       (n) => n.pagerank ?? 0,
       SEMANTIC_WEIGHT,
@@ -271,10 +362,11 @@ export class Recaller {
       this.db, seedIds, candidateIds, this.cfg,
     );
 
-    // 泛化路径：语义分数来自社区匹配，均匀分配
+    // 泛化路径：语义分数来自社区匹配 + 关键词混合
+    const hybridSemantic = makeHybridSemanticFn(semanticScores, query);
     const scoredNodes = combinedScore(
       nodes,
-      (n) => semanticScores.get(n.id) ?? 0.01, // fallback 低语义分
+      hybridSemantic,
       (n) => pprScores.get(n.id) ?? 0,
       (n) => n.pagerank ?? 0,
       SEMANTIC_WEIGHT,
