@@ -31,6 +31,7 @@ import { Extractor } from "./src/extractor/extract.ts";
 import { assembleContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
+import { filterNoiseMessages } from "./src/extractor/noise-filter.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
 import { detectCommunities } from "./src/graph/community.ts";
 import { induceTopics } from "./src/engine/induction.ts";
@@ -224,7 +225,10 @@ const graphMemoryPlugin = {
       const next = prev.then(async () => {
         try {
           const msgs = getUnextracted(db, sessionId, 50);
-          if (!msgs.length) return;
+
+          // ── Input-layer noise filter ───────────────────────
+          const filteredMsgs = filterNoiseMessages(msgs, extractUserText);
+          if (!filteredMsgs.length) return;
 
           // 获取最近 N 轮已提取消息作为上下文参考
           const recentTurns = cfg.extractionRecentTurns ?? 3;
@@ -244,7 +248,7 @@ const graphMemoryPlugin = {
           const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, sessionEdges, recalledEdges);
 
           const result = await extractor.extract({
-            messages: msgs,
+            messages: filteredMsgs,
             recentMessages: recentMsgs,
             knowledgeGraph,
           });
@@ -490,8 +494,16 @@ const graphMemoryPlugin = {
         // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
         const msgs = getUnextracted(db, sessionId, 50);
 
-        if (!msgs.length) {
-          return { ok: true, compacted: false, reason: "no messages" };
+        // ── Input-layer noise filter ───────────────────────
+        const filteredMsgs = filterNoiseMessages(msgs, extractUserText);
+        if (!filteredMsgs.length) {
+          return {
+            ok: true, compacted: true,
+            result: {
+              summary: `no messages after noise filter`,
+              tokensBefore: currentTokenCount ?? 0,
+            },
+          };
         }
 
         try {
@@ -512,7 +524,7 @@ const graphMemoryPlugin = {
           const recentMsgs = getRecentExtractedMessages(db, sessionId, recentTurns);
 
           const result = await extractor.extract({
-            messages: msgs,
+            messages: filteredMsgs,
             recentMessages: recentMsgs,
             knowledgeGraph,
           });
