@@ -4,10 +4,13 @@
  * By: adoresever
  * Email: Wywelljob@gmail.com
  *
- * v1.1.0：
- *   - 去掉 signals 机制，每轮直接提取
- *   - content 模板改为纯文本（无 markdown）
- *   - 提取规则放宽：讨论、分析、对比也会提取
+ * 实现：
+ *   - ContextEngine 接口：bootstrap / ingest / assemble / compact / afterTurn
+ *   - Hooks：before_prompt_build（召回+渲染）/ session_end（finalize+维护）
+ *   - 置信度系统：beliefUpdates（LLM 提取）+ session_end task_completed 信号
+ *   - 17 个 gm_* 工具
+ *   - 双层噪声过滤：input-layer（noise-filter.ts）+ output-layer（extract.ts）
+ *   - 关键词混合召回：向量相似度 × (1 + keywordScore × 0.4)
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";

@@ -1,20 +1,26 @@
 /**
- * graph-memory
+ * graph-memory — KG XML 渲染 + system prompt 组装
  *
  * By: adoresever
  * Email: Wywelljob@gmail.com
  *
- * 三级召回分层（基于组合评分 Top K，默认 k=45）：
- * - L1 (Top 15): 完整 content
- * - L2 (Top 15-30): description
- * - L3 (Top 30-45): name
- * - filtered: 不传递
+ * 七层召回分层（Top K=45）：
+ * - scope_hot: 完整 content（scope 下永久加载）
+ * - hot: 完整 content（全局热记忆）
+ * - active: 完整 content（session 新节点）
+ * - L1 (Top 0~15): 完整 content
+ * - L2 (Top 15~30): 仅 description
+ * - L3 (Top 30~45): 仅 name
+ * - filtered: 不传递，不渲染
  *
- * 节点三级：
- *   完整 content | description | name
+ * 节点 XML 格式：
+ *   scope_hot / hot / active / L1 → 完整 content + description + confidence
+ *   L2 → 仅 description（自闭合标签）
+ *   L3 → 仅 name（自闭合标签）
  *
- * 边二级：
- *   带 description | 仅 name
+ * 边 XML 格式：
+ *   带 description → <e name="..." from="..." to="...">描述</e>
+ *   无 description → <e name="..." from="..." to="..."/>
  */
 
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";

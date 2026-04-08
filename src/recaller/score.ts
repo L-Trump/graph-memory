@@ -13,7 +13,7 @@
 export interface Scored<T> {
   item: T;
   combined: number;
-  semantic: number;     // 原始语义分数（向量相似度，0-1）
+  semantic: number;     // 原始语义分数（keyword-boosted 混合语义分，向量相似度×(1+keywordScore×0.4)，0-1）
   ppr: number;          // 原始 PPR 分数
   pagerank: number;     // 原始 PageRank 分数（全局重要性）
   belief?: number;     // 原始置信度分数（0-1）

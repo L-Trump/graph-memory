@@ -4,26 +4,28 @@
  * By: adoresever
  * Email: Wywelljob@gmail.com
  *
- * 并行双路径召回（两条路径同时跑，合并去重）：
+ * 精确召回路径（泛化路径已禁用）：
  *
- * 精确路径（向量/FTS5 → 社区扩展 → 图遍历 → 组合评分排序）：
- *   找到和当前查询语义相关的具体三元组
+ *   向量/FTS5 搜索 → 种子节点
+ *   → 社区同伴扩展
+ *   → 图遍历（N 跳）
+ *   → Personalized PageRank 排序
+ *   → 关键词混合语义评分
  *
- * 泛化路径（社区代表节点 → 图遍历 → 组合评分排序）：
- *   提供跨领域的全局概览，覆盖精确路径可能遗漏的知识域
+ * 组合评分（min-max 归一化）：
+ *   combined = semantic_weight × norm_semantic
+ *           + ppr_weight × norm_ppr
+ *           + pagerank_weight × norm_pagerank
  *
- * 合并策略：精确路径的结果优先（组合分数更高），
- *           泛化路径补充精确路径未覆盖的社区。
+ * 关键词混合：semantic × (1 + keywordScore × KEYWORD_WEIGHT)
  *
- * 组合评分：semantic (α=0.6) + PPR (β=0.4) 归一化后加权求和
- *
- * 四级召回（Top K）：
- *   L1 (Top 15): 完整 content
- *   L2 (Top 15-30): description
- *   L3 (Top 30-45): name
+ * 分层召回（Top K = 45）：
+ *   L1 (Top 0~15): 完整 content
+ *   L2 (Top 15~30): 仅 description
+ *   L3 (Top 30~45): 仅 name
  *   其余：filtered（不传递）
  *
- * 分级后 PPR 重排（最终注入顺序）
+ * 默认权重：α=0.5（语义） β=0.3（PPR） γ=0.2（PageRank） KEYWORD_WEIGHT=0.4
  */
 
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";

@@ -1,8 +1,11 @@
 /**
- * graph-memory
+ * graph-memory — 知识提取引擎
  *
  * By: adoresever
  * Email: Wywelljob@gmail.com
+ *
+ * 提取流程：renderMsgs → LLM(EXTRACT_SYS, EXTRACT_USER) → parseExtract
+ * 输出：nodes + edges + beliefUpdates（置信度更新）
  */
 
 import type { GmConfig, ExtractionResult, FinalizeResult, BeliefUpdate } from "../types.ts";
