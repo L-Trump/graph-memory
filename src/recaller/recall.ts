@@ -89,20 +89,10 @@ function computeKeywordScore(query: string, node: GmNode): number {
   let weightedSum = 0;
   let maxPossible = 0;
   for (const kw of keywords) {
-    // Escape regex special chars
-    let escaped = kw.replace(/[.*+?^${}()|[\\]]/g, `$&`);
-    // Fix: if escaped ends with \, append another \ so RegExp doesn't treat it as escape sequence
-    if (escaped.endsWith("\\")) escaped += "\\";
-    let re: RegExp;
-    try {
-      re = new RegExp(escaped, 'g');
-    } catch {
-      // Fallback: escape all non-alphanumeric chars
-      escaped = kw.replace(/[^a-zA-Z0-9\\u4e00-\\u9fff]/g, `\\$&`);
-      if (escaped.endsWith("\\")) escaped += "\\";
-      re = new RegExp(escaped, 'g');
-    }
-    const tf = (nodeText.match(re) || []).length;
+    // Safely escape all regex special chars — split+map avoids trailing-backslash issue
+    const META_CHARS = new Set([...'.+*?^${}()|[\]\\']);
+    const escaped = [...kw].map(ch => META_CHARS.has(ch) ? '\\' + ch : ch).join('');
+    const tf = (nodeText.match(new RegExp(escaped, 'g')) || []).length;
     if (tf === 0) continue;
     // log-weighted TF
     const score = Math.log(1 + tf);
