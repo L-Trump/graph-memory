@@ -64,6 +64,16 @@ beforeAll(() => {
     console.log("✓ Belief schema migration completed");
   }
 
+  // m13 migration: access tracking columns
+  const tableInfo2 = testDb.prepare("PRAGMA table_info(gm_nodes)").all();
+  if (!tableInfo2.some((col: any) => col.name === "access_count")) {
+    testDb.exec(`
+      ALTER TABLE gm_nodes ADD COLUMN access_count INTEGER DEFAULT 0;
+      ALTER TABLE gm_nodes ADD COLUMN last_accessed_at INTEGER DEFAULT 0;
+    `);
+    console.log("✓ m13 access tracking migration completed");
+  }
+
   console.log(`Test database copied to: ${testDbPath}`);
 });
 

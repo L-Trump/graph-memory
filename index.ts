@@ -25,7 +25,7 @@ import {
   updateNodeBelief, recordBeliefSignal,
   setScopesForSession, getScopesForSession, getScopeHotNodes, listScopes,
   getNodeFullInfo, updateNodeFields,
-  saveRecalledNodes,
+  saveRecalledNodes, recordNodeAccessBatch,
 } from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
@@ -429,6 +429,12 @@ const graphMemoryPlugin = {
             (scopeHotNodes.length > 0 ? `, scope_hot=${scopeHotNodes.length}` : "") +
             (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
           );
+        }
+
+        // 记录已组装节点的访问（用于衰减引擎）- 仅 L1 节点
+        const l1NodeIds = rec.nodes.filter(n => n.tier === "L1").map(n => n.id);
+        if (l1NodeIds.length > 0) {
+          recordNodeAccessBatch(db, l1NodeIds);
         }
 
         const parts = [systemPrompt, xml, episodicXml].filter(Boolean);
@@ -862,6 +868,12 @@ const graphMemoryPlugin = {
               content: [{ type: "text", text: "图谱中未找到相关记录。" }],
               details: { count: 0, query },
             };
+          }
+
+          // 记录 L1 节点的访问（用于衰减引擎）
+          const l1NodeIds = res.nodes.filter((n: any) => n.tier === "L1").map((n: any) => n.id);
+          if (l1NodeIds.length > 0) {
+            recordNodeAccessBatch(db, l1NodeIds);
           }
 
           // 过滤掉 filtered 节点

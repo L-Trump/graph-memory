@@ -33,7 +33,13 @@ export function createTestDb(): DatabaseSyncInstance {
       pagerank        REAL NOT NULL DEFAULT 0,
       flags           TEXT NOT NULL DEFAULT '[]',
       created_at      INTEGER NOT NULL,
-      updated_at      INTEGER NOT NULL
+      updated_at      INTEGER NOT NULL,
+      belief         REAL NOT NULL DEFAULT 0.5,
+      success_count INTEGER NOT NULL DEFAULT 0,
+      failure_count INTEGER NOT NULL DEFAULT 0,
+      last_signal_at INTEGER NOT NULL DEFAULT 0,
+      access_count  INTEGER NOT NULL DEFAULT 0,
+      last_accessed_at INTEGER NOT NULL DEFAULT 0
     );
     CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_nodes_name ON gm_nodes(name);
     CREATE INDEX IF NOT EXISTS ix_gm_nodes_type_status ON gm_nodes(type, status);
@@ -170,12 +176,14 @@ export function insertNode(
     validatedCount?: number;
     sessions?: string[];
     flags?: string[];
+    accessCount?: number;
+    lastAccessedAt?: number;
   },
 ): string {
   const id = opts.id ?? `n-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   db.prepare(`
-    INSERT INTO gm_nodes (id, type, name, description, content, status, validated_count, source_sessions, flags, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO gm_nodes (id, type, name, description, content, status, validated_count, source_sessions, flags, created_at, updated_at, access_count, last_accessed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     opts.type ?? "SKILL",
@@ -188,6 +196,8 @@ export function insertNode(
     JSON.stringify(opts.flags ?? []),
     Date.now(),
     Date.now(),
+    opts.accessCount ?? 0,
+    opts.lastAccessedAt ?? 0,
   );
   return id;
 }

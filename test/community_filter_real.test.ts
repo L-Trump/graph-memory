@@ -19,6 +19,13 @@ describe("真实数据库社区过滤验证", () => {
     const tmpPath = path.join(tmpDir, `gm-test社区过滤-${process.pid}.db`);
     fs.copyFileSync(DB_PATH, tmpPath);
     const db = new DatabaseSync(tmpPath);
+
+    // m13 migration: ensure access tracking columns exist
+    const cols1 = db.prepare("PRAGMA table_info(gm_nodes)").all() as any[];
+    if (!cols1.map(c => c.name).includes("access_count")) {
+      db.exec(`ALTER TABLE gm_nodes ADD COLUMN access_count INTEGER DEFAULT 0; ALTER TABLE gm_nodes ADD COLUMN last_accessed_at INTEGER DEFAULT 0;`);
+    }
+
     try {
       const result = detectCommunities(db);
 
@@ -52,6 +59,13 @@ describe("真实数据库社区过滤验证", () => {
     const tmpPath = path.join(tmpDir, `gm-test社区汇总-${process.pid}.db`);
     fs.copyFileSync(DB_PATH, tmpPath);
     const db = new DatabaseSync(tmpPath);
+
+    // m13 migration: ensure access tracking columns exist
+    const cols2 = db.prepare("PRAGMA table_info(gm_nodes)").all() as any[];
+    if (!cols2.map(c => c.name).includes("access_count")) {
+      db.exec(`ALTER TABLE gm_nodes ADD COLUMN access_count INTEGER DEFAULT 0; ALTER TABLE gm_nodes ADD COLUMN last_accessed_at INTEGER DEFAULT 0;`);
+    }
+
     try {
       const result = detectCommunities(db);
       console.log(`\n直接传入 summarizeCommunities 的社区数: ${result.communities.size}`);

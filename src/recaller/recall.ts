@@ -41,6 +41,12 @@ import {
 import { getCommunityPeers } from "../graph/community.ts";
 import { personalizedPageRank } from "../graph/pagerank.ts";
 import { combinedScore, type Scored } from "./score.ts";
+import {
+  createDecayEngine,
+  toDecayableNode,
+  DEFAULT_DECAY_CONFIG,
+  type DecayConfig,
+} from "../engine/decay.ts";
 
 // ─── 组合评分权重 ────────────────────────────────────────────
 const SEMANTIC_WEIGHT = 0.5;   // α：语义相关性权重
@@ -149,6 +155,8 @@ export class Recaller {
   private embedReady = false;
   // 竞态队列：embedFn 未就绪时积压的节点，setEmbedFn 时一次性处理
   private pendingEmbedNodes: GmNode[] = [];
+  // Decay engine for access-based scoring
+  private decayEngine = createDecayEngine();
 
   constructor(private db: DatabaseSyncInstance, private cfg: GmConfig) {}
 
@@ -289,7 +297,12 @@ export class Recaller {
     );
 
     // 三级分级
-    const tiered = this.assignTiers(scoredNodes);
+    let tiered = this.assignTiers(scoredNodes);
+
+    // 应用衰减评分（access-based decay，调整 combined score）
+    if (this.cfg.decayEnabled !== false) {
+      tiered = this.applyDecayScoring(tiered);
+    }
 
     if (process.env.GM_DEBUG) {
       const byTier: Record<RecallTier, number> = { scope_hot: 0, hot: 0, L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
@@ -367,20 +380,26 @@ export class Recaller {
 
     const tiered = this.assignTiers(scoredNodes);
 
+    // 应用衰减评分（access-based decay）
+    let finalTiered = tiered;
+    if (this.cfg.decayEnabled !== false) {
+      finalTiered = this.applyDecayScoring(tiered);
+    }
+
     if (process.env.GM_DEBUG) {
       const byTier: Record<RecallTier, number> = { scope_hot: 0, hot: 0, L1: 0, L2: 0, L3: 0, filtered: 0, active: 0 };
-      for (const n of tiered) byTier[n.tier]++;
+      for (const n of finalTiered) byTier[n.tier]++;
       console.log(`  [DEBUG] generalizedV2 tiers: L1=${byTier.L1} L2=${byTier.L2} L3=${byTier.L3} filtered=${byTier.filtered}`);
     }
 
     const pprScoresFinal: Record<string, number> = {};
-    for (const n of tiered) pprScoresFinal[n.id] = n.pprScore;
+    for (const n of finalTiered) pprScoresFinal[n.id] = n.pprScore;
 
     return {
-      nodes: tiered,
-      edges: edges.filter(e => new Set(tiered.map(n => n.id)).has(e.fromId) && new Set(tiered.map(n => n.id)).has(e.toId)),
+      nodes: finalTiered,
+      edges: edges.filter(e => new Set(finalTiered.map(n => n.id)).has(e.fromId) && new Set(finalTiered.map(n => n.id)).has(e.toId)),
       pprScores: pprScoresFinal,
-      tokenEstimate: this.estimateTokens(tiered),
+      tokenEstimate: this.estimateTokens(finalTiered),
     };
   }
 
@@ -498,5 +517,103 @@ export class Recaller {
       const logErr = (process.env.GM_DEBUG ? console.error : undefined);
       logErr?.call(console, `[graph-memory] syncEmbed failed for node ${node.id}: ${err}`);
     }
+  }
+
+  /** Decay floor per node type — composite's floor */
+  private getDecayFloor(type: string): number {
+    switch (type) {
+      case "SKILL":    return 0.8;
+      case "TOPIC":    return 0.8;
+      case "KNOWLEDGE": return 0.65;
+      case "EVENT":    return 0.35;
+      case "TASK":     return 0.35;
+      case "STATUS":   return 0.2;
+      default:         return 0.5;
+    }
+  }
+
+  /**
+   * Apply decay scoring to tiered nodes.
+   *
+   * Decay composite = recencyWeight*recency + frequencyWeight*frequency + intrinsicWeight*intrinsic
+   *
+   * The decay composite is floored per node type (SKILL/TOPIC=0.8, KNOWLEDGE=0.65,
+   * EVENT/TASK=0.35, STATUS=0.2), then used to adjust the combined score:
+   *   adjustedScore = combinedScore * (baseWeight + (1-baseWeight) * max(floor, composite))
+   *
+   * where baseWeight = 0.3. This means:
+   * - Fresh/active nodes with high decayComposite (near 1.0) keep their full combined score
+   * - Old STATUS/EVENT/TASK nodes are capped at their type-specific floor
+   * - SKILL nodes barely decay due to high floor and long half-life
+   *
+   * After adjusting, nodes are re-sorted and re-tiered.
+   */
+  private applyDecayScoring(tiered: TieredNode[]): TieredNode[] {
+    if (tiered.length === 0) return tiered;
+
+    // Batch lookup: get access data for all candidate nodes
+    const nodeIds = tiered.map(n => n.id);
+    const accessRows = this.db.prepare(
+      "SELECT id, access_count, last_accessed_at, belief FROM gm_nodes WHERE id IN (" +
+      nodeIds.map(() => "?").join(",") + ")"
+    ).all(...nodeIds) as any[];
+
+    const accessMap = new Map<string, { accessCount: number; lastAccessedAt: number; belief: number }>();
+    for (const row of accessRows) {
+      accessMap.set(row.id, {
+        accessCount: row.access_count ?? 0,
+        lastAccessedAt: row.last_accessed_at ?? 0,
+        belief: row.belief ?? 0.5,
+      });
+    }
+
+    const now = Date.now();
+    const DECAY_BASE = 0.3; // minimum multiplier when decayComposite is 0
+
+    // Apply decay adjustment to each node's combined score
+    const adjusted = tiered.map(node => {
+      const access = accessMap.get(node.id);
+      const decayable = {
+        id: node.id,
+        type: node.type,
+        importance: 0.5, // will be set by decay engine from type
+        belief: access?.belief ?? node.belief ?? 0.5,
+        accessCount: access?.accessCount ?? 0,
+        createdAt: node.createdAt,
+        lastAccessedAt: access?.lastAccessedAt ?? 0,
+      };
+
+      const ds = this.decayEngine.score(decayable, now);
+      // Floor the composite so it can't drop below the type-specific floor
+      const flooredComposite = Math.max(this.getDecayFloor(node.type), ds.composite);
+      const decayFactor = DECAY_BASE + (1 - DECAY_BASE) * flooredComposite;
+      const adjustedScore = node.combinedScore * decayFactor;
+
+      if (process.env.GM_DEBUG) {
+        console.log(`  [DEBUG] decay: ${node.name} type=${node.type} ac=${decayable.accessCount} composite=${ds.composite.toFixed(3)} factor=${decayFactor.toFixed(3)} combined=${node.combinedScore.toFixed(3)} → ${adjustedScore.toFixed(3)}`);
+      }
+
+      return {
+        ...node,
+        combinedScore: adjustedScore,
+        decayComposite: ds.composite,
+      };
+    });
+
+    // Re-sort by adjusted combined score and re-assign tiers
+    const k = this.cfg.recallMaxNodes;
+    const t1 = Math.ceil(k / 3);
+    const t2 = Math.ceil(2 * k / 3);
+
+    return adjusted
+      .sort((a, b) => b.combinedScore - a.combinedScore)
+      .map((n, i) => {
+        let tier: RecallTier;
+        if (i < t1) tier = "L1";
+        else if (i < t2) tier = "L2";
+        else if (i < k) tier = "L3";
+        else tier = "filtered";
+        return { ...n, tier };
+      });
   }
 }

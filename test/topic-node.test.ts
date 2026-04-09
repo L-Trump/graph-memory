@@ -41,7 +41,7 @@ function createTestDbWithTopic(): DatabaseSyncInstance {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
-  // 核心表（包含 TOPIC 类型）
+  // 核心表（包含 TOPIC 类型，与 createTestDb 保持一致）
   db.exec(`
     CREATE TABLE IF NOT EXISTS gm_nodes (
       id              TEXT PRIMARY KEY,
@@ -56,7 +56,13 @@ function createTestDbWithTopic(): DatabaseSyncInstance {
       pagerank        REAL NOT NULL DEFAULT 0,
       flags           TEXT NOT NULL DEFAULT '[]',
       created_at      INTEGER NOT NULL,
-      updated_at      INTEGER NOT NULL
+      updated_at      INTEGER NOT NULL,
+      belief          REAL NOT NULL DEFAULT 0.5,
+      success_count   INTEGER NOT NULL DEFAULT 0,
+      failure_count   INTEGER NOT NULL DEFAULT 0,
+      last_signal_at  INTEGER NOT NULL DEFAULT 0,
+      access_count    INTEGER NOT NULL DEFAULT 0,
+      last_accessed_at INTEGER NOT NULL DEFAULT 0
     );
     CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_nodes_name ON gm_nodes(name);
     CREATE INDEX IF NOT EXISTS ix_gm_nodes_type_status ON gm_nodes(type, status);

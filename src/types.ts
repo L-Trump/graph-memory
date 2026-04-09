@@ -39,6 +39,10 @@ export interface GmNode {
   failureCount?: number;
   /** Timestamp of last belief signal */
   lastSignalAt?: number;
+  /** Number of times this node was recalled and assembled into context */
+  accessCount?: number;
+  /** Timestamp of last access (recall + assemble) */
+  lastAccessedAt?: number;
 }
 
 // ─── 边（两层：name自由命名 + description一句话描述）───────────
@@ -174,6 +178,8 @@ export interface GmConfig {
   pagerankIterations: number;
   /** 提取时传给 LLM 的本 session 历史消息轮次数（以 user 消息为边界），默认 3 */
   extractionRecentTurns: number;
+  /** 是否启用衰减引擎（access-based decay scoring），默认 true */
+  decayEnabled?: boolean;
 }
 
 export const DEFAULT_CONFIG: GmConfig = {
@@ -186,4 +192,5 @@ export const DEFAULT_CONFIG: GmConfig = {
   pagerankDamping: 0.85,
   pagerankIterations: 20,
   extractionRecentTurns: 3,
+  decayEnabled: true,
 };

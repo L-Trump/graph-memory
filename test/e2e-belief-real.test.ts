@@ -40,7 +40,7 @@ beforeAll(() => {
   fs.copyFileSync(PROD_DB, testDbPath);
   testDb = new DatabaseSync(testDbPath);
 
-  // 确保 belief schema 存在
+  // 确保 belief + m13 migration schema 存在
   const cols = testDb.prepare("PRAGMA table_info(gm_nodes)").all() as any[];
   if (!cols.some(c => c.name === "belief")) {
     testDb.exec(`
@@ -61,6 +61,15 @@ beforeAll(() => {
       );
       CREATE INDEX IF NOT EXISTS idx_belief_signals_node ON gm_belief_signals(node_id);
       CREATE INDEX IF NOT EXISTS idx_belief_signals_name ON gm_belief_signals(node_name);
+    `);
+  }
+
+  // m13 migration: access tracking columns
+  const colNames = cols.map(c => c.name);
+  if (!colNames.includes("access_count")) {
+    testDb.exec(`
+      ALTER TABLE gm_nodes ADD COLUMN access_count INTEGER DEFAULT 0;
+      ALTER TABLE gm_nodes ADD COLUMN last_accessed_at INTEGER DEFAULT 0;
     `);
   }
 

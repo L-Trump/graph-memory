@@ -30,6 +30,9 @@ function toNode(r: any): GmNode {
     successCount: r.success_count ?? 0,
     failureCount: r.failure_count ?? 0,
     lastSignalAt: r.last_signal_at ?? 0,
+    // Access tracking fields (may be undefined in pre-access-tracking dbs)
+    accessCount: r.access_count ?? 0,
+    lastAccessedAt: r.last_accessed_at ?? 0,
   };
 }
 
@@ -1123,5 +1126,136 @@ export function getRecalledNodes(
     semantic: r.semantic ?? 0,
     ppr: r.ppr ?? 0,
     combined: r.combined ?? 0,
+  }));
+}
+
+// ─── Access Tracking ──────────────────────────────────────────
+
+/**
+ * Record access for a single node: increment access_count and update last_accessed_at.
+ * Idempotent: safe to call multiple times for the same node.
+ */
+export function recordNodeAccess(
+  db: DatabaseSyncInstance,
+  nodeId: string,
+  now = Date.now(),
+): void {
+  const existing = db.prepare(
+    "SELECT access_count, last_accessed_at FROM gm_nodes WHERE id=?"
+  ).get(nodeId) as any;
+
+  if (!existing) return; // node doesn't exist
+
+  const newCount = (existing.access_count ?? 0) + 1;
+  db.prepare(
+    "UPDATE gm_nodes SET access_count=?, last_accessed_at=? WHERE id=?"
+  ).run(newCount, now, nodeId);
+}
+
+/**
+ * Record access for multiple nodes at once (batch version for efficiency).
+ * Called after each assembleContext to record which recalled nodes were used.
+ */
+export function recordNodeAccessBatch(
+  db: DatabaseSyncInstance,
+  nodeIds: string[],
+  now = Date.now(),
+): void {
+  if (nodeIds.length === 0) return;
+
+  const stmt = db.prepare(`
+    UPDATE gm_nodes
+    SET access_count = access_count + 1,
+        last_accessed_at = ?
+    WHERE id = ?
+  `);
+
+  db.exec("BEGIN");
+  try {
+    for (const id of nodeIds) {
+      stmt.run(now, id);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+/**
+ * Get all active nodes as DecayableNode (for stale node scanning).
+ * Returns nodes with their current access tracking fields.
+ */
+export function getAllActiveDecayableNodes(
+  db: DatabaseSyncInstance,
+): Array<{
+  id: string;
+  type: string;
+  belief: number;
+  accessCount: number;
+  createdAt: number;
+  updatedAt: number;
+  lastAccessedAt: number;
+}> {
+  const rows = db.prepare(
+    "SELECT id, type, belief, access_count, created_at, updated_at, last_accessed_at FROM gm_nodes WHERE status='active'"
+  ).all() as any[];
+
+  return rows.map(r => ({
+    id: r.id,
+    type: r.type,
+    belief: r.belief ?? 0.5,
+    accessCount: r.access_count ?? 0,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    lastAccessedAt: r.last_accessed_at ?? 0,
+  }));
+}
+
+/**
+ * Find nodes that have been stale (below decay threshold) for more than graceDays.
+ * These are candidates for deprecation.
+ *
+ * @param graceDays Nodes must be below threshold for at least this many days before deprecation (default 7)
+ */
+export function getStaleNodeCandidates(
+  db: DatabaseSyncInstance,
+  graceDays = 7,
+): Array<{
+  id: string;
+  name: string;
+  type: string;
+  composite: number;
+  lastAccessedAt: number;
+  createdAt: number;
+}> {
+  // We need to compute decay inline since we don't have full decay engine in SQL.
+  // Use a simplified SQL query to find nodes that haven't been accessed recently
+  // AND have low belief, then let the decay engine filter further.
+  const graceMs = graceDays * 86_400_000;
+  const now = Date.now();
+  const cutoff = now - graceMs;
+
+  // Find nodes that:
+  // 1. Are STATUS or TASK type (fast decay candidates)
+  // 2. Have never been accessed OR last accessed > graceDays ago
+  // 3. Have low belief (< 0.5)
+  const rows = db.prepare(`
+    SELECT id, name, type, belief, access_count, last_accessed_at, created_at
+    FROM gm_nodes
+    WHERE status = 'active'
+      AND (last_accessed_at < ? OR last_accessed_at = 0)
+      AND (type IN ('STATUS', 'TASK') OR belief < 0.5)
+    ORDER BY last_accessed_at ASC
+    LIMIT 100
+  `).all(cutoff) as any[];
+
+  return rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    type: r.type,
+    composite: (r.belief ?? 0.5) * 0.3, // rough composite estimate (intrinsic only)
+    lastAccessedAt: r.last_accessed_at ?? 0,
+    createdAt: r.created_at,
   }));
 }

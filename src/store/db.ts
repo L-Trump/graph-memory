@@ -52,7 +52,7 @@ export function resetDb(): void {
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes, m12_recalled];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes, m12_recalled, m13_access_tracking];
 
 function m11_scopes(db: DatabaseSyncInstance): void {
   try {
@@ -122,6 +122,20 @@ function m10_belief(db: DatabaseSyncInstance): void {
     CREATE INDEX IF NOT EXISTS ix_belief_sig_session ON gm_belief_signals(session_id);
   `);
 }
+
+function m13_access_tracking(db: DatabaseSyncInstance): void {
+  // Add access tracking columns if they don't exist (ALTER for existing dbs)
+  try {
+    db.prepare("SELECT access_count FROM gm_nodes LIMIT 1").get();
+    return; // already migrated
+  } catch { /* column doesn't exist */ }
+
+  db.exec(`
+    ALTER TABLE gm_nodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE gm_nodes ADD COLUMN last_accessed_at INTEGER NOT NULL DEFAULT 0;
+  `);
+}
+
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
