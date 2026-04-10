@@ -119,6 +119,20 @@ export interface ExtractionResult {
   }>;
   /** 本轮对话对已召回 L1 节点的置信度更新 */
   beliefUpdates?: BeliefUpdate[];
+  /** 需要顾问介入判断的建议（如：建议将某节点写成文档）*/
+  advisorySuggestions?: AdvisorySuggestion[];
+}
+
+/** 记忆顾问建议：某些知识节点建议写成文档等 */
+export interface AdvisorySuggestion {
+  /** 相关节点名称 */
+  nodeName: string;
+  /** 建议内容，如"建议写成文档" */
+  suggestion: string;
+  /** 建议的具体原因 */
+  reason: string;
+  /** 建议的文档标题（供顾问参考） */
+  suggestedDocTitle?: string;
 }
 
 export interface FinalizeResult {

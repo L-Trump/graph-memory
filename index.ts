@@ -221,7 +221,7 @@ const graphMemoryPlugin = {
     }
 
     /** 每轮结束后直接提取当前轮的消息（同 session 串行，不丢消息） */
-    async function runTurnExtract(sessionId: string, newMessages: any[]): Promise<void> {
+    async function runTurnExtract(sessionId: string, sessionKey: string, newMessages: any[]): Promise<void> {
       if (!newMessages.length) return;
 
       // Promise chain：上一次提取完了才跑下一次，不会跳过
@@ -259,12 +259,14 @@ const graphMemoryPlugin = {
 
           // ── 存储结果 ───────────────────────────────────────
           const nameToId = new Map<string, string>();
+          const newNodeNames = new Set<string>();
           for (const nc of result.nodes) {
-            const { node } = upsertNode(db, {
+            const { node, isNew } = upsertNode(db, {
               type: nc.type, name: nc.name,
               description: nc.description, content: nc.content,
             }, sessionId);
             nameToId.set(node.name, node.id);
+            if (isNew) newNodeNames.add(node.name);
             recaller.syncEmbed(node).catch(() => {});
           }
 
@@ -321,6 +323,85 @@ const graphMemoryPlugin = {
             api.logger.info(
               `[graph-memory] extracted ${result.nodes.length} nodes [${nodeDetails}], ${result.edges.length} edges [${edgeDetails}]${signalDetails}`,
             );
+          }
+
+          // ── 记忆顾问：处理 advisorySuggestions（仅本轮新建节点）─────────────
+          if (result.advisorySuggestions && result.advisorySuggestions.length > 0 && sessionKey) {
+            // 只保留本轮新建节点的建议
+            const validSuggestions = result.advisorySuggestions.filter(s => newNodeNames.has(s.nodeName));
+            if (validSuggestions.length === 0) return;
+
+            // 获取相关新建节点的内容
+            const nodeContents = new Map<string, string>();
+            for (const s of validSuggestions) {
+              const node = findByName(db, s.nodeName);
+              if (node) nodeContents.set(s.nodeName, node.content ?? "");
+            }
+
+            // 获取最近对话上下文
+            const recentMsgs = getRecentExtractedMessages(db, sessionId, 5);
+            const contextText = recentMsgs.map((m: any) => {
+              const text = typeof m.content === "string" ? m.content :
+                (Array.isArray(m.content) ? m.content.filter((b: any) => b?.type === "text").map((b: any) => b.text ?? "").join("\n") : JSON.stringify(m.content ?? ""));
+              return `[${m.role ?? "?"}] ${text.slice(0, 500)}`;
+            }).join("\n\n");
+
+            const suggestionsText = validSuggestions.map((s, i) =>
+              `[建议 ${i + 1}]
+节点名: ${s.nodeName}
+建议: ${s.suggestion}
+原因: ${s.reason}
+建议文档标题: ${s.suggestedDocTitle ?? "（未指定）"}
+节点内容摘要: ${nodeContents.get(s.nodeName)?.slice(0, 300) ?? "（未找到）"}`
+            ).join("\n\n");
+
+            const advisorTask = `【GM 记忆顾问任务】
+
+当前对话上下文（最近几轮）：
+${contextText || "（无）"}
+
+记忆顾问建议（共 ${validSuggestions.length} 条）：
+${suggestionsText}
+
+你的任务：
+1. 评估每条建议是否仍然有价值（对话已结束，部分内容可能已过时）
+2. 对于仍有价值的"建议写成文档"类建议：
+   - 将节点内容写成文档，写入 ~/.openclaw/workspace/memory/ 目录下
+   - 文件名使用建议的文档标题（如有），或自动生成合适的标题
+   - 完成后用 gm_edit_node 工具更新对应节点，在 content 或 description 中补充文档路径信息
+3. 如果建议已过时或无价值，输出 NO_REPLY 静默即可
+
+重要：你有完整的文件写入和 gm_edit_node 工具权限。
+
+输出规则：
+- 需要通知用户（如建议不合理、需要用户确认、文档已写成）→ 直接用自然语言描述，无需 JSON
+- 无需通知用户（建议已过时、自动处理完毕）→ 输出精确字符串 NO_REPLY（不要加任何其他文字或格式）`;
+
+            const advisorSystemPrompt = `你是 GM 记忆顾问。评估记忆顾问建议，判断是否执行或通知用户。
+deliver=true。输出 NO_REPLY 表示静默（无需通知用户）。输出其他内容会通知用户。`;
+
+            // Fire-and-forget
+            (async () => {
+              try {
+                if (!(api.runtime as any)?.subagent) {
+                  api.logger.warn("[graph-memory] advisor: api.runtime.subagent not available");
+                  return;
+                }
+
+                const { runId } = await (api.runtime as any).subagent.run({
+                  sessionKey,
+                  message: advisorTask,
+                  extraSystemPrompt: advisorSystemPrompt,
+                  deliver: true,
+                });
+
+                api.logger.info(
+                  `[graph-memory] advisor launched: runId=${runId}, suggestions=${validSuggestions.length} [${validSuggestions.map(s => s.nodeName).join(", ")}]`,
+                );
+              } catch (err) {
+                api.logger.warn(`[graph-memory] advisor launch failed: ${err}`);
+              }
+            })();
           }
         } catch (err) {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
@@ -635,7 +716,7 @@ const graphMemoryPlugin = {
         );
 
         // ★ 每轮直接提取
-        runTurnExtract(sessionId, newMessages).catch((err) => {
+        runTurnExtract(sessionId, sessionId, newMessages).catch((err) => {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
         });
 
