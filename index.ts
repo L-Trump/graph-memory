@@ -159,7 +159,8 @@ const graphMemoryPlugin = {
     if (isFirstInit) {
       db = getDb(cfg.dbPath);
       _gmDb = db;
-      llm = createCompleteFn(provider, model, cfg.llm);
+      const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+      llm = createCompleteFn(provider, model, cfg.llm, anthropicApiKey);
       _gmLlm = llm;
       _gmRecaller = new Recaller(db, cfg);
       extractor = new Extractor(cfg, llm);
@@ -343,7 +344,7 @@ const graphMemoryPlugin = {
 
         // ── 只取最近 3 轮 user+assistant 消息作为 recall query ────────
         const recallSlice = sliceLastTurn(event.messages ?? [], RECALL_KEEP_TURNS);
-        const recallQuery = recallSlice.messages
+        const recallQuery = [...(recallSlice.messages
           .map((m: any) => {
             const text = typeof m.content === "string" ? m.content :
               (Array.isArray(m.content)
@@ -353,7 +354,7 @@ const graphMemoryPlugin = {
             const fenceEnd = text.lastIndexOf("```");
             const cleaned = fenceEnd >= 0 && text.includes("Sender") ? text.slice(fenceEnd + 3).trim() : text;
             return `[${m.role}] ${cleaned}`;
-          })
+          })), `[user] ${prompt}`]
           .join("\n")
           .replace(/^\[[\w\s\-:]*\]\s*/, "")
           .trim();
@@ -482,9 +483,18 @@ const graphMemoryPlugin = {
         messages: any[];
         tokenBudget?: number;
       }) {
-        // KG 渲染已移至 before_prompt_build（appendSystemContext），assemble 只透传消息
+        // KG 渲染已移至 before_prompt_build（appendSystemContext）
+        // assemble 只截断消息 (省token，按次数收费模型中可以考虑禁用，已禁用)
+        // const activeNodes = getBySession(db, sessionId);
+        // if (activeNodes.length === 0) {
+        //   return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
+        // }
+        // const lastTurn = sliceLastTurn(messages);
+        // const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
+        const repaired = messages;
+
         return {
-          messages: normalizeMessageContent(messages),
+          messages: normalizeMessageContent(repaired),
           estimatedTokens: 0,
         };
       },
@@ -967,10 +977,10 @@ const graphMemoryPlugin = {
       (ctx: any) => ({
         name: "gm_record",
         label: "Record to Graph Memory",
-        description: "手动记录经验到知识图谱。发现重要解法、踩坑经验或工作流程时调用。\n\n如需标记 hot，可在 flags 中传入 [\"hot\"]，例如：gm_record(content=\"...\", flags=[\"hot\"])。仅在用户明确说明时才打 hot 标记。",
+        description: "手动记录经验到知识图谱。发现重要解法、踩坑经验或工作流程时调用。",
         parameters: Type.Object({
           content: Type.String({ description: "用自然语言描述需要记忆的内容（会被当作待提取对话）" }),
-          flags: Type.Optional(Type.Array(Type.String(), { description: "节点标记数组。传 [\"hot\"] 将该节点标记为 hot（每次 assemble 时必定渲染）。" })),
+          flags: Type.Optional(Type.Array(Type.String(), { description: "节点标记数组。默认不传或者传空数组[]，可用的标记有\"hot\"和\"scope_hot:<scope_name>\"" })),
         }),
         async execute(
           _toolCallId: string,
@@ -1722,7 +1732,7 @@ function estimateMsgTokens(msg: any): number {
 }
 
 const DEFAULT_KEEP_TURNS = 5;  // assemble 阶段保留最近 5 轮
-const RECALL_KEEP_TURNS = 3;   // recall 阶段只取最近 3 轮
+const RECALL_KEEP_TURNS = 2;   // recall 阶段只取最近 2 轮
 
 /**
  * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema
