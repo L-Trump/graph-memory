@@ -290,7 +290,34 @@ export class Extractor {
 
   private parseExtract(raw: string): ExtractionResult {
     try {
-      const json = extractJson(raw);
+      let json = extractJson(raw);
+
+      // ── Fix: 修复 JSON 字符串内部的裸换行符 ──
+      // LLM 在 content 等多行文本字段中写入了实际换行符(\n)，而非转义的\\n
+      // 导致 JSON.parse 失败: "Bad control character in string literal"
+      try {
+        JSON.parse(json);
+      } catch {
+        let fixed = '';
+        let inString = false;
+        let i = 0;
+        while (i < json.length) {
+          const c = json[i];
+          // 跟踪是否在字符串内部（忽略转义引号）
+          if (c === '"' && (i === 0 || json[i - 1] !== '\\' || (json[i - 1] === '\\' && i > 1 && json[i - 2] === '\\'))) {
+            inString = !inString;
+          }
+          if (c === '\n' && inString) {
+            fixed += '\\n'; // 裸换行符 → 转义形式
+          } else {
+            fixed += c;
+          }
+          i++;
+        }
+        json = fixed;
+      }
+      // ────────────────────────────────────────────────
+
       const p = JSON.parse(json);
 
       const nodes = (p.nodes ?? []).filter((n: any) => {
@@ -311,11 +338,16 @@ export class Extractor {
       for (const n of nodes) nameToType.set(n.name, n.type);
 
       const edges = (p.edges ?? [])
-        .filter((e: any) => e.from && e.to && e.name && e.description)
+        .filter((e: any) => e && e.from && e.to && e.name && e.description)
         .map((e: any) => {
-          e.from = normalizeName(e.from);
-          e.to = normalizeName(e.to);
-          return { from: e.from, to: e.to, name: e.name, description: e.description };
+          if (typeof e.from !== 'string' || typeof e.to !== 'string' ||
+              typeof e.name !== 'string' || typeof e.description !== 'string') return null;
+          return {
+            from: normalizeName(e.from),
+            to: normalizeName(e.to),
+            name: e.name,
+            description: e.description,
+          };
         })
         .filter((e: any) => e !== null);
 
@@ -331,11 +363,9 @@ export class Extractor {
 
       return { nodes, edges, beliefUpdates };
     } catch (err) {
-      if (process.env.GM_DEBUG) {
-        console.log(`  [DEBUG] JSON parse failed: ${err}`);
-        console.log(`  [DEBUG] raw content: ${raw.slice(0, 500)}`);
-      }
-      return { nodes: [], edges: [] };
+      throw new Error(
+        `[graph-memory] extraction parse failed: ${err}\nraw: ${raw}`,
+      );
     }
   }
 
