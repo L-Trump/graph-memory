@@ -588,11 +588,12 @@ deliver=true。输出 NO_REPLY 表示静默（无需通知用户）。输出其�
         force?: boolean;
         currentTokenCount?: number;
         customInstructions?: string;
-        compactionTarget?: string;
+        compactionTarget?: "budget" | "threshold";
         runtimeContext?: Record<string, unknown>;
       }) {
         // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
         // 知识提取部分保持不变
+        const { sessionId, sessionFile, force, currentTokenCount } = params;
         const msgs = getUnextracted(db, sessionId, 50);
 
         // ── Input-layer noise filter ───────────────────────
