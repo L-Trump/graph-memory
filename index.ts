@@ -378,8 +378,7 @@ ${suggestionsText}
 - 需要通知用户（如建议不合理、需要用户确认、文档已写成）→ 直接用自然语言描述，无需 JSON
 - 无需通知用户（建议已过时、自动处理完毕）→ 输出精确字符串 NO_REPLY（不要加任何其他文字或格式）`;
 
-            const advisorSystemPrompt = `你是 GM 记忆顾问。评估记忆顾问建议，判断是否执行或通知用户。
-deliver=true。输出 NO_REPLY 表示静默（无需通知用户）。输出其他内容会通知用户。`;
+            const advisorSystemPrompt = `你是 GM 记忆顾问。静默评估记忆顾问建议，无需通知用户，始终输出 NO_REPLY。`;
 
             // Fire-and-forget
             (async () => {
@@ -390,10 +389,11 @@ deliver=true。输出 NO_REPLY 表示静默（无需通知用户）。输出其�
                 }
 
                 const { runId } = await (api.runtime as any).subagent.run({
+                  idempotencyKey: sessionKey,
                   sessionKey,
                   message: advisorTask,
                   extraSystemPrompt: advisorSystemPrompt,
-                  deliver: true,
+                  deliver: false,
                 });
 
                 api.logger.info(
@@ -535,7 +535,7 @@ deliver=true。输出 NO_REPLY 表示静默（无需通知用户）。输出其�
       info: {
         id: "graph-memory",
         name: "Graph Memory",
-        ownsCompaction: false,  // TODO: 测试 delegateCompactionToRuntime
+        ownsCompaction: true,
       },
 
       async bootstrap({ sessionId }: { sessionId: string }) {
@@ -599,17 +599,13 @@ deliver=true。输出 NO_REPLY 表示静默（无需通知用户）。输出其�
         // ── Input-layer noise filter ───────────────────────
         const filteredMsgs = filterNoiseMessages(msgs, extractUserText);
         if (!filteredMsgs.length) {
-          // 无有效消息，委托给 OpenClaw 内置 compaction
-          return await delegateCompactionToRuntime(params);
-
-          // ── 原返回值（保留注释）──
-          // return {
-          //   ok: true, compacted: true,
-          //   result: {
-          //     summary: `no messages after noise filter`,
-          //     tokensBefore: currentTokenCount ?? 0,
-          //   },
-          // };
+          return {
+            ok: true, compacted: true,
+            result: {
+              summary: `no messages after noise filter`,
+              tokensBefore: currentTokenCount ?? 0,
+            },
+          };
         }
 
         try {
@@ -681,17 +677,13 @@ deliver=true。输出 NO_REPLY 表示静默（无需通知用户）。输出其�
             }
           }
 
-          // 知识提取完成，现在委托给 OpenClaw 内置 compaction 处理 transcript 清理
-          return await delegateCompactionToRuntime(params);
-
-          // ── 原返回值（保留注释，供对比参考）──
-          // return {
-          //   ok: true, compacted: true,
-          //   result: {
-          //     summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges, ${result.beliefUpdates?.length ?? 0} belief updates`,
-          //     tokensBefore: currentTokenCount ?? 0,
-          //   },
-          // };
+          return {
+            ok: true, compacted: true,
+            result: {
+              summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges, ${result.beliefUpdates?.length ?? 0} belief updates`,
+              tokensBefore: currentTokenCount ?? 0,
+            },
+          };
         } catch (err) {
           api.logger.error(`[graph-memory] compact failed: ${err}`);
           return { ok: false, compacted: false, reason: String(err) };
