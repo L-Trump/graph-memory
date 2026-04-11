@@ -1,5 +1,7 @@
 # graph-memory
 
+> **Forked from** [adoresever/graph-memory](https://github.com/adoresever/graph-memory) · Original project with upstream changes merged in
+
 <p align="center">
   <strong>Knowledge Graph Context Engine for OpenClaw</strong>
 </p>
