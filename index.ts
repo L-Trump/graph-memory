@@ -592,7 +592,7 @@ ${suggestionsText}
         runtimeContext?: Record<string, unknown>;
       }) {
         // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
-        // 知识提取部分保持不变
+        // 知识提取使用 fire-and-forget，不阻塞 compaction 返回
         const { sessionId, sessionFile, force, currentTokenCount } = params;
         const msgs = getUnextracted(db, sessionId, 50);
 
@@ -608,86 +608,18 @@ ${suggestionsText}
           };
         }
 
-        try {
-          const sessionNodes = getBySession(db, sessionId);
-          const sessionNodeIds = new Set(sessionNodes.map(n => n.id));
-          const sessionEdges: any[] = [];
-          for (const node of sessionNodes) {
-            for (const edge of edgesFrom(db, node.id)) {
-              if (sessionNodeIds.has(edge.toId)) sessionEdges.push(edge);
-            }
-          }
-          const recalledData = recalled.get(sessionId) as any;
-          const recalledNodes = recalledData?.nodes ?? [];
-          const recalledEdges = recalledData?.edges ?? [];
-          const knowledgeGraph = buildExtractKnowledgeGraph(db, sessionNodes, recalledNodes, sessionEdges, recalledEdges);
+        // fire-and-forget：提取异步进行，不阻塞 compaction 返回
+        runTurnExtract(sessionId, sessionId, filteredMsgs).catch((err) => {
+          api.logger.error(`[graph-memory] compact extract failed: ${err}`);
+        });
 
-          const recentTurns = cfg.extractionRecentTurns ?? 3;
-          const recentMsgs = getRecentExtractedMessages(db, sessionId, recentTurns);
-
-          const result = await extractor.extract({
-            messages: filteredMsgs,
-            recentMessages: recentMsgs,
-            knowledgeGraph,
-          });
-
-          const nameToId = new Map<string, string>();
-          for (const nc of result.nodes) {
-            const { node } = upsertNode(db, {
-              type: nc.type, name: nc.name,
-              description: nc.description, content: nc.content,
-            }, sessionId);
-            nameToId.set(node.name, node.id);
-            recaller.syncEmbed(node).catch(() => {});
-          }
-
-          for (const ec of result.edges) {
-            const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
-            const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
-            if (fromId && toId) {
-              upsertEdge(db, {
-                fromId, toId,
-                name: ec.name,
-                description: ec.description,
-                sessionId,
-              });
-            }
-          }
-
-          const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
-          markExtracted(db, sessionId, maxTurn);
-
-          // ── 处理置信度更新（beliefUpdates）────────────────────────
-          if (result.beliefUpdates && result.beliefUpdates.length > 0) {
-            for (const update of result.beliefUpdates) {
-              const node = findByName(db, update.nodeName);
-              if (!node) continue;
-              try {
-                recordBeliefSignal(db, node.id, node.name, update.verdict, sessionId, update.weight, {
-                  source: "compact_llm",
-                  reason: update.reason,
-                });
-                const updateResult = updateNodeBelief(db, node.id, update.verdict, update.weight);
-                if (updateResult && Math.abs(updateResult.delta) > 0.001) {
-                  invalidateGraphCache();
-                }
-              } catch (err) {
-                api.logger.warn(`[graph-memory] compact belief update for ${update.nodeName} failed: ${err}`);
-              }
-            }
-          }
-
-          return {
-            ok: true, compacted: true,
-            result: {
-              summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges, ${result.beliefUpdates?.length ?? 0} belief updates`,
-              tokensBefore: currentTokenCount ?? 0,
-            },
-          };
-        } catch (err) {
-          api.logger.error(`[graph-memory] compact failed: ${err}`);
-          return { ok: false, compacted: false, reason: String(err) };
-        }
+        return {
+          ok: true, compacted: true,
+          result: {
+            summary: `extraction queued (fire-and-forget)`,
+            tokensBefore: currentTokenCount ?? 0,
+          },
+        };
       },
 
       async afterTurn({
