@@ -535,7 +535,7 @@ ${suggestionsText}
       info: {
         id: "graph-memory",
         name: "Graph Memory",
-        ownsCompaction: true,
+        ownsCompaction: false,
       },
 
       async bootstrap({ sessionId }: { sessionId: string }) {
