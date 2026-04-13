@@ -27,6 +27,7 @@ import {
   setScopesForSession, getScopesForSession, getScopeHotNodes, listScopes,
   getNodeFullInfo, updateNodeFields,
   saveRecalledNodes, recordNodeAccessBatch,
+  getRecentlyRecalledNodes, getRecentlyCreatedNodes,
 } from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
@@ -1733,6 +1734,298 @@ ${suggestionsText}
         },
       }),
       { name: "gm_induce_topics" },
+    );
+
+    // ── gm_explore ──────────────────────────────────────────
+    // 把子图格式化成对 LLM 友好的文字描述
+    function formatSubgraphForLLM(seeds: any[], subgraphs: any[]): string {
+      const lines: string[] = [];
+
+      for (const sg of subgraphs) {
+        lines.push(`== 关联记忆 ==`);
+
+        // 种子节点（锚点）
+        const seed = seeds.find((s: any) => s.name === sg.seed);
+        const lastAccessed = seed?.lastAccessedAt
+          ? new Date(seed.lastAccessedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+          : "从未";
+        lines.push(`【种子】${seed?.name || sg.seed}`);
+        lines.push(`  类型: ${seed?.type || "?"} | 置信度: ${((seed?.combinedScore ?? 0) * 100).toFixed(1)}% | 访问: ${lastAccessed}`);
+        if (seed?.description) lines.push(`  简介: ${seed.description}`);
+        lines.push(`  内容: ${seed?.content || "(无)"}`);
+        lines.push("");
+
+        // 关联节点（排除种子自身）
+        const relatedNodes = sg.nodes.filter((n: any) => n.id !== seed?.id && n.tier === "L1");
+
+        for (const n of relatedNodes) {
+          const lastAccessed = n.lastAccessedAt
+            ? new Date(n.lastAccessedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+            : "从未";
+          lines.push(`【关联】${n.name}`);
+          lines.push(`  类型: ${n.type} | 置信度: ${((n.combinedScore ?? 0) * 100).toFixed(1)}% | 访问: ${lastAccessed}`);
+          if (n.description) lines.push(`  简介: ${n.description}`);
+          lines.push(`  内容: ${n.content || "(无)"}`);
+          lines.push("");
+        }
+
+        if (sg.edges.length > 0) {
+          lines.push(`--- 关联 (${sg.edges.length} 条) ---`);
+          for (const e of sg.edges) {
+            const fromName = e.fromName || e.fromId;
+            const toName = e.toName || e.toId;
+            const desc = e.description ? ` — ${e.description}` : "";
+            lines.push(`  ${fromName} --[${e.name}]--> ${toName}${desc}`);
+          }
+          lines.push("");
+        }
+      }
+
+      return lines.join("\n").trim();
+    }
+
+    function buildSubgraphResult(
+      roots: any[],
+      nodes: any[],
+      edges: any[],
+    ): { seeds: any[]; subgraphs: any[] } {
+      // 只保留 L1 节点，排除 L2/L3/filtered
+      const tieredNodes = nodes.filter((n: any) => n.tier === "L1");
+      // 过滤出两端都在 tieredNodes 中的边
+      const nodeIds = new Set(tieredNodes.map((n: any) => n.id));
+      const filteredEdges = edges.filter(
+        (e: any) => nodeIds.has(e.fromId) && nodeIds.has(e.toId),
+      );
+
+      // 返回所有 L1/L2/L3 节点（图孤立但语义相关的节点也需要被梦到）
+      const allNodes = tieredNodes;
+      const allNodeIds = new Set(allNodes.map((n: any) => n.id));
+      // 边：只保留两端都在 allNodes 中的
+      const subgraphEdges = filteredEdges.filter(
+        (e: any) => allNodeIds.has(e.fromId) && allNodeIds.has(e.toId),
+      );
+
+      const subgraphs = roots.map((root: any) => {
+        return { seed: root.name, nodes: allNodes, edges: subgraphEdges };
+      });
+
+      return {
+        seeds: roots.map((r: any) => ({
+          id: r.id,
+          name: r.name,
+          type: r.type,
+          description: r.description ?? "",
+          content: r.content ?? "",
+          lastAccessedAt: r.lastAccessedAt ?? 0,
+          accessCount: r.accessCount ?? 0,
+          combinedScore: r.combinedScore ?? 1.0, // 种子节点固定为1.0
+        })),
+        subgraphs,
+      };
+    }
+
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_explore",
+        label: "Explore Subgraph from a Node",
+        description:
+          "从指定节点出发，召回其子图（语义邻居 + 关联节点）。与 gm_search 的区别是：gm_search 按关键词检索全局节点，gm_explore 从指定节点出发探索子图结构。适用于查看某个节点的关联知识网络。",
+        parameters: Type.Object({
+          nodeName: Type.String({ description: "节点名称，精确匹配（区分大小写）" }),
+          maxNodes: Type.Optional(
+            Type.Number({ description: "最大返回节点数（默认 45）" }),
+          ),
+        }),
+        async execute(_toolCallId: string, params: { nodeName: string; maxNodes?: number }) {
+          const { nodeName, maxNodes } = params;
+          try {
+            const result = await recaller.exploreSubgraph(nodeName, maxNodes);
+            if (!result.roots.length) {
+              return {
+                content: [{ type: "text", text: `未找到名为 "${nodeName}" 的节点。` }],
+                details: { success: false },
+              };
+            }
+            if (!result.nodes.length) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `节点 "${nodeName}" 是孤立节点，没有关联子图。`,
+                  },
+                ],
+                details: { success: true, isolated: true, seed: result.roots[0] },
+              };
+            }
+
+            const { seeds, subgraphs } = buildSubgraphResult(
+              result.roots,
+              result.nodes,
+              result.edges,
+            );
+
+            // 记录 L1 节点的访问（用于衰减引擎）
+            const l1NodeIds = result.nodes
+              .filter((n: any) => n.tier === "L1")
+              .map((n: any) => n.id);
+            if (l1NodeIds.length > 0) {
+              recordNodeAccessBatch(db, l1NodeIds);
+            }
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: formatSubgraphForLLM(seeds, subgraphs),
+                },
+              ],
+              details: {
+                success: true,
+                seed: seeds[0],
+                subgraphs,
+              },
+            };
+
+          } catch (err) {
+            api.logger.error(`[graph-memory] gm_explore failed: ${err}`);
+            return {
+              content: [{ type: "text", text: `gm_explore 失败: ${String(err)}` }],
+              details: { success: false, error: String(err) },
+            };
+          }
+        },
+      }),
+      { name: "gm_explore" },
+    );
+
+    // ── gm_dream ──────────────────────────────────────────────
+    function exponentialDecayPick<T extends Record<string, unknown>>(
+      candidates: T[],
+      timeField: keyof T,
+      lambda = 0.33,
+    ): T | null {
+      if (!candidates.length) return null;
+      const now = Date.now();
+      const MS_PER_DAY = 86_400_000;
+      const withWeights = candidates.map(c => {
+        const t = Number(c[timeField]) ?? 0;
+        const days = Math.max(0, (now - t) / MS_PER_DAY);
+        return { item: c, weight: Math.exp(-lambda * days) };
+      });
+      const totalWeight = withWeights.reduce((s, w) => s + w.weight, 0);
+      if (totalWeight <= 0) return candidates[0];
+      let r = Math.random() * totalWeight;
+      for (const { item, weight } of withWeights) {
+        r -= weight;
+        if (r <= 0) return item;
+      }
+      return withWeights[withWeights.length - 1].item;
+    }
+
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_dream",
+        label: "Dream — Random Memory Exploration",
+        description:
+          "随机漫游记忆图谱。从最近召回的记忆池和最近新建的记忆池中按指数衰减概率各选取一个锚点（种子），从每个种子出发探索其子图，返回给 agent 进一步处理（合并、发现遗漏关系、处理冲突等）。无输入参数。日有所思夜有所梦，即随机又偏向近期记忆。",
+        parameters: Type.Object({}),
+        async execute(_toolCallId: string, _params: any) {
+          try {
+            const POOL_HOURS = 168; // 7 天
+            const POOL_SIZE = 50;
+
+            // 池A：最近召回的记忆（按 recall 时间衰减）
+            const recalledPool = getRecentlyRecalledNodes(db, POOL_HOURS, POOL_SIZE);
+            const recalledDedup = new Map<string, (typeof recalledPool)[0]>();
+            for (const r of recalledPool) {
+              if (!recalledDedup.has(r.nodeId)) recalledDedup.set(r.nodeId, r);
+            }
+            const recalledCandidates = Array.from(recalledDedup.values());
+
+            // 池B：最近新建的记忆（按创建时间衰减）
+            const createdPool = getRecentlyCreatedNodes(db, POOL_HOURS, POOL_SIZE);
+
+            // 指数衰减选取锚点（lambda=0.33，半衰期约 2.1 天，倾向于最近 3 天的记忆）
+            const seedFromRecalled = exponentialDecayPick(
+              recalledCandidates,
+              "recalledAt" as keyof (typeof recalledCandidates)[0],
+              0.33,
+            );
+            const seedFromCreated = exponentialDecayPick(
+              createdPool,
+              "createdAt" as keyof (typeof createdPool)[0],
+              0.33,
+            );
+
+            if (!seedFromRecalled && !seedFromCreated) {
+              return {
+                content: [
+                  { type: "text", text: "记忆池为空（7 天内没有召回或创建的节点），无法做梦。" },
+                ],
+                details: { success: false, reason: "empty_pools" },
+              };
+            }
+
+            const subgraphs: Array<{ seed: string; nodes: any[]; edges: any[] }> = [];
+            const allSeeds: any[] = [];
+
+            if (seedFromRecalled) {
+              const result = await recaller.exploreSubgraph(seedFromRecalled.nodeId);
+              if (result.roots.length && result.nodes.length) {
+                const { seeds, subgraphs: sg } = buildSubgraphResult(
+                  result.roots,
+                  result.nodes,
+                  result.edges,
+                );
+                allSeeds.push(...seeds);
+                subgraphs.push(...sg);
+              }
+            }
+
+            if (seedFromCreated) {
+              const alreadySeedNames = new Set(allSeeds.map((r: any) => r.name));
+              if (!alreadySeedNames.has(seedFromCreated.name)) {
+                const result = await recaller.exploreSubgraph(seedFromCreated.id);
+                if (result.roots.length && result.nodes.length) {
+                  const { seeds, subgraphs: sg } = buildSubgraphResult(
+                    result.roots,
+                    result.nodes,
+                    result.edges,
+                  );
+                  allSeeds.push(...seeds);
+                  subgraphs.push(...sg);
+                }
+              }
+            }
+
+            if (!subgraphs.length) {
+              return {
+                content: [
+                  { type: "text", text: "做梦完成，但没有找到可用的子图（锚点可能是孤立节点）。" },
+                ],
+                details: { success: true, seeds: allSeeds, subgraphs: [] },
+              };
+            }
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: formatSubgraphForLLM(allSeeds, subgraphs),
+                },
+              ],
+              details: { success: true, seeds: allSeeds, subgraphs },
+            };
+          } catch (err) {
+            api.logger.error(`[graph-memory] gm_dream failed: ${err}`);
+            return {
+              content: [{ type: "text", text: `gm_dream 失败: ${String(err)}` }],
+              details: { success: false, error: String(err) },
+            };
+          }
+        },
+      }),
+      { name: "gm_dream" },
     );
   },
 };

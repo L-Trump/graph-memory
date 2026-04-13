@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pdftotext /home/ltrump/Downloads/graph-memory 代码审查报告.pdf -)"
+    ]
+  }
+}

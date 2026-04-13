@@ -1259,3 +1259,57 @@ export function getStaleNodeCandidates(
     createdAt: r.created_at,
   }));
 }
+
+// ─── Dream 锚点候选池 ─────────────────────────────────────────
+
+/**
+ * 获取最近召回的节点候选池（gm_recalled 表，按召回时间倒序）
+ * 用于 gm_dream 的池A：最近被召回的记忆
+ */
+export function getRecentlyRecalledNodes(
+  db: DatabaseSyncInstance,
+  hoursAgo: number,
+  limit: number,
+): Array<{ nodeId: string; nodeName: string; nodeType: string; recalledAt: number }> {
+  const cutoff = Date.now() - hoursAgo * 3600 * 1000;
+  const rows = db.prepare(`
+    SELECT node_id, node_name, node_type, created_at as recalled_at
+    FROM gm_recalled
+    WHERE created_at >= ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(cutoff, limit) as any[];
+
+  return rows.map(r => ({
+    nodeId: r.node_id as string,
+    nodeName: r.node_name as string,
+    nodeType: r.node_type as string,
+    recalledAt: r.recalled_at as number,
+  }));
+}
+
+/**
+ * 获取最近创建的节点候选池（gm_nodes 表，按创建时间倒序）
+ * 用于 gm_dream 的池B：最近新建的记忆
+ */
+export function getRecentlyCreatedNodes(
+  db: DatabaseSyncInstance,
+  hoursAgo: number,
+  limit: number,
+): Array<{ id: string; name: string; type: string; createdAt: number }> {
+  const cutoff = Date.now() - hoursAgo * 3600 * 1000;
+  const rows = db.prepare(`
+    SELECT id, name, type, created_at
+    FROM gm_nodes
+    WHERE status = 'active' AND created_at >= ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(cutoff, limit) as any[];
+
+  return rows.map(r => ({
+    id: r.id as string,
+    name: r.name as string,
+    type: r.type as string,
+    createdAt: r.created_at as number,
+  }));
+}

@@ -36,7 +36,7 @@ import {
   searchNodes, vectorSearchWithScore,
   graphWalk, communityRepresentatives,
   communityVectorSearch, nodesByCommunityIds,
-  saveVector, getVectorHash,
+  saveVector, getVectorHash, findById,
 } from "../store/store.ts";
 import { getCommunityPeers } from "../graph/community.ts";
 import { personalizedPageRank } from "../graph/pagerank.ts";
@@ -615,5 +615,134 @@ export class Recaller {
         else tier = "filtered";
         return { ...n, tier };
       });
+  }
+
+  /**
+   * gm_explore: 从指定节点出发，召回其子图。
+   *
+   * 与 recallV2 的区别：
+   * - 不做向量搜索（锚点已知）
+   * - 以指定节点为唯一语义锚点，通过向量相似度找到其语义邻居
+   * - 语义邻居 + 社区扩展 → graphWalk → PPR + 组合评分 → tiered 结果
+   * - 返回 { roots, nodes, edges }（子图结构）
+   */
+  async exploreSubgraph(
+    seedName: string,
+    maxNodes?: number,
+  ): Promise<{
+    roots: GmNode[];
+    nodes: TieredNode[];
+    edges: GmEdge[];
+    pprScores: Record<string, number>;
+  }> {
+    const limit = maxNodes ?? this.cfg.recallMaxNodes;
+
+    // ── 1. 找到种子节点 ──────────────────────────────────────
+    const seedNode = findById(this.db, seedName);
+    if (!seedNode) {
+      return { roots: [], nodes: [], edges: [], pprScores: {} };
+    }
+
+    const seedIds = [seedNode.id];
+    const semanticScores = new Map<string, number>();
+
+    // ── 2. 语义锚点：用种子节点的内容做向量搜索，找语义邻居 ─────────
+    if (this.embed) {
+      try {
+        const text = `${seedNode.name}: ${seedNode.description}\n${seedNode.content.slice(0, 500)}`;
+        const vec = await this.embed(text);
+        const k = Math.ceil(limit / 3);
+        const scored = vectorSearchWithScore(this.db, vec, k);
+        for (const s of scored) {
+          // 排除种子节点自身（分数可以保留，但不应该重复出现在结果中）
+          if (s.node.id !== seedNode.id) {
+            semanticScores.set(s.node.id, s.score);
+          }
+        }
+        if (process.env.GM_DEBUG && scored.length > 0) {
+          console.log(`  [DEBUG] exploreSubgraph: seedNeighbors=${scored.length}, bestScore=${scored[0].score.toFixed(3)}`);
+        }
+      } catch (err) {
+        if (process.env.GM_DEBUG) {
+          console.log(`  [DEBUG] exploreSubgraph: embed failed: ${err}`);
+        }
+      }
+    }
+
+    // ── 3. 社区扩展 ──────────────────────────────────────────
+    const expandedIds = new Set<string>(seedIds);
+    const peers = getCommunityPeers(this.db, seedNode.id, 2);
+    for (const pid of peers) expandedIds.add(pid);
+
+    // ── 4. 图遍历 ────────────────────────────────────────────
+    const { nodes, edges } = graphWalk(
+      this.db,
+      Array.from(expandedIds),
+      this.cfg.recallMaxDepth,
+    );
+
+    if (!nodes.length) {
+      return { roots: [seedNode], nodes: [], edges: [], pprScores: {} };
+    }
+
+    // ── 5. PPR ───────────────────────────────────────────────
+    const candidateIds = nodes.map(n => n.id);
+    const { scores: pprScores } = personalizedPageRank(
+      this.db, seedIds, candidateIds, this.cfg,
+    );
+
+    // ── 6. 组合评分（语义 + PPR + PageRank）────────────────────────
+    // 语义锚点（向量搜索邻居）权重为 1.0，无向量的节点语义分为 0
+    const hybridSemantic = (n: GmNode): number => {
+      return semanticScores.get(n.id) ?? 0;
+    };
+    const scoredNodes = combinedScore(
+      nodes,
+      hybridSemantic,
+      (n) => pprScores.get(n.id) ?? 0,
+      (n) => n.pagerank ?? 0,
+      SEMANTIC_WEIGHT,
+      PAGERANK_WEIGHT,
+    );
+
+    // ── 7. 三级分级 ───────────────────────────────────────────
+    let tiered = this.assignTiers(scoredNodes);
+
+    // ── 8. 应用衰减评分 ──────────────────────────────────────
+    if (this.cfg.decayEnabled !== false) {
+      tiered = this.applyDecayScoring(tiered);
+    }
+
+    // ── 9. 确保种子节点在结果中 ───────────────────────────────
+    const nodeMap = new Map(tiered.map(n => [n.id, n]));
+    if (!nodeMap.has(seedNode.id)) {
+      // 种子节点不在 graphWalk 结果里（孤立节点），手动加入并标记为 L1
+      const seedTiered: TieredNode = {
+        ...seedNode,
+        tier: "L1",
+        semanticScore: 1.0,
+        pprScore: 1.0,
+        pagerankScore: seedNode.pagerank ?? 0,
+        combinedScore: 1.0,
+      };
+      nodeMap.set(seedNode.id, seedTiered);
+      tiered = [seedTiered, ...tiered];
+    }
+
+    const finalNodes = Array.from(nodeMap.values());
+    const finalIds = new Set(finalNodes.map(n => n.id));
+    const finalEdges = edges.filter(
+      e => finalIds.has(e.fromId) && finalIds.has(e.toId),
+    );
+
+    const pprScoresFinal: Record<string, number> = {};
+    for (const n of finalNodes) pprScoresFinal[n.id] = n.pprScore;
+
+    return {
+      roots: [seedNode],
+      nodes: finalNodes,
+      edges: finalEdges,
+      pprScores: pprScoresFinal,
+    };
   }
 }
