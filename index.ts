@@ -1758,7 +1758,7 @@ ${suggestionsText}
           ? new Date(seed.lastAccessedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
           : "从未";
         lines.push(`【种子】${seed?.name || sg.seed}`);
-        lines.push(`  类型: ${seed?.type || "?"} | 置信度: ${((seed?.combinedScore ?? 0) * 100).toFixed(1)}% | 访问: ${lastAccessed}`);
+        lines.push(`  类型: ${seed?.type || "?"} | 置信度: ${(seed?.belief ?? 0.5).toFixed(3)} | 访问: ${lastAccessed}`);
         if (seed?.description) lines.push(`  简介: ${seed.description}`);
         lines.push(`  内容: ${seed?.content || "(无)"}`);
         lines.push("");
@@ -1771,7 +1771,7 @@ ${suggestionsText}
             ? new Date(n.lastAccessedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
             : "从未";
           lines.push(`【关联】${n.name}`);
-          lines.push(`  类型: ${n.type} | 置信度: ${((n.combinedScore ?? 0) * 100).toFixed(1)}% | 访问: ${lastAccessed}`);
+          lines.push(`  类型: ${n.type} | 置信度: ${(n.belief ?? 0.5).toFixed(3)} | 访问: ${lastAccessed}`);
           if (n.description) lines.push(`  简介: ${n.description}`);
           lines.push(`  内容: ${n.content || "(无)"}`);
           lines.push("");
