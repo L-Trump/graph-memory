@@ -166,23 +166,21 @@ export function buildSystemPromptAddition(params: {
 
   const sections: string[] = [];
 
+  // 注意：暂时注释掉实时状态行，避免 LLM 缓存 token 变化导致缓存失效
+  // sections.push(
+  //   `Current: ${scopeHotCount > 0 ? `${scopeHotCount} scope_hot, ` : ""}${taskCount} tasks, ${skillCount} skills, ${eventCount} events, ${knowledgeCount} knowledge, ${statusCount} status, ${edgeCount} relationships.`,
+  // );
+
   sections.push(
     "## Graph Memory — 知识图谱记忆",
     "",
     "Below `<knowledge_graph>` is your accumulated experience from past conversations.",
     "It contains structured knowledge — NOT raw conversation history.",
     "",
-    "**⚠️ Real-time state takes priority over memory.** For current code, file state, directory structure, system environment, or version numbers — always verify with actual commands. Memory tells you how things were done before, not what is true right now.",
+    "**注意**：以下被 `<gm_memory>` 标签包裹的内容（`<knowledge_graph>` 和 `<episodic_context>`）均来自记忆系统。",
     "",
-    `Current: ${scopeHotCount > 0 ? `${scopeHotCount} scope_hot, ` : ""}${taskCount} tasks, ${skillCount} skills, ${eventCount} events, ${knowledgeCount} knowledge, ${statusCount} status, ${edgeCount} relationships.`,
+    "**⚠️ Real-time state takes priority over memory.** For current code, file state, directory structure, system environment, or version numbers — always verify with actual commands. Memory tells you how things were done before, not what is true right now.",
   );
-
-  if (recalledCount > 0) {
-    sections.push(
-      "",
-      `**${recalledCount} recalled nodes from other conversations** — proven solutions that worked before. Apply them directly when the current situation matches their trigger conditions.`,
-    );
-  }
 
   sections.push(
     "",
@@ -235,12 +233,10 @@ export function buildSystemPromptAddition(params: {
     "主动应用召回知识。召回上下文不够时用 `gm_search` 查询，需要记录新知识时用 `gm_record`。",
   );
 
-  if (isRich) {
-    sections.push(
-      "",
-      "**边类型**：`解决`(EVENT→SKILL)、`使用`(TASK→SKILL)、`扩展`(SKILL更新)、`冲突`(互斥)、`依赖`、`触发`、`导致`、`互补`、`验证`、`修复` 等——description 解释具体关系语义。",
-    );
-  }
+  sections.push(
+    "",
+    "**边类型**：`解决`(EVENT→SKILL)、`使用`(TASK→SKILL)、`扩展`(SKILL更新)、`冲突`(互斥)、`依赖`、`触发`、`导致`、`互补`、`验证`、`修复` 等——description 解释具体关系语义。",
+  );
 
   return sections.join("\n");
 }

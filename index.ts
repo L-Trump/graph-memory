@@ -521,9 +521,17 @@ ${suggestionsText}
           recordNodeAccessBatch(db, l1NodeIds);
         }
 
-        const parts = [systemPrompt, xml, episodicXml].filter(Boolean);
-        if (parts.length) {
-          return { appendSystemContext: parts.join("\n\n") };
+        // systemPrompt → appendSystemContext（追加在 prompt 末尾）
+        // xml + episodicXml → <gm_memory> 包裹后作为 prependContext（前置）
+        const gmBody = [xml, episodicXml].filter(Boolean).join("\n\n");
+        const prepend = gmBody ? `<gm_memory>\n\n${gmBody}\n\n</gm_memory>` : "";
+        const append = systemPrompt;
+
+        if (prepend || append) {
+          return {
+            ...(prepend ? { prependContext: prepend } : {}),
+            ...(append ? { appendSystemContext: append } : {}),
+          };
         }
       } catch (err) {
         api.logger.warn(`[graph-memory] before_prompt_build failed: ${err}`);
