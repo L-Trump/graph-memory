@@ -146,9 +146,9 @@ function compactStripSessionFile(sessionFile: string): void {
       }
     });
     writeFileSync(sessionFile, cleaned.join("\n") + "\n", "utf-8");
-    api.logger.debug(`[graph-memory] stripped gm_memory from sessionFile: ${sessionFile}`);
+    console.debug(`[graph-memory] stripped gm_memory from sessionFile: ${sessionFile}`);
   } catch (err) {
-    api.logger.warn(`[graph-memory] failed to strip gm_memory from sessionFile: ${err}`);
+    console.warn(`[graph-memory] failed to strip gm_memory from sessionFile: ${err}`);
   }
 }
 
