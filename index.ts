@@ -107,6 +107,23 @@ function stripGmMemoryFromText(text: string): string {
 
 // ─── Compact 时清理 sessionFile 中每条消息开头的 gm_memory 标签 ───
 
+// ─── Compact 时清理 sessionFile 中每条消息开头的 gm_memory 标签 ───
+
+
+function stripContentBlocks(content: any): any {
+  if (typeof content === "string") {
+    return stripGmMemoryFromText(content);
+  } else if (Array.isArray(content)) {
+    return content.map((block: any) => {
+      if (block && block.type === "text" && typeof block.text === "string") {
+        return { ...block, text: stripGmMemoryFromText(block.text) };
+      }
+      return block;
+    });
+  }
+  return content;
+}
+
 function compactStripSessionFile(sessionFile: string): void {
   try {
     const content = readFileSync(sessionFile, "utf-8");
@@ -114,17 +131,13 @@ function compactStripSessionFile(sessionFile: string): void {
     const cleaned = lines.map((line) => {
       try {
         const msg = JSON.parse(line);
-        // 处理 content 为字符串的情况
-        if (typeof msg.content === "string") {
-          msg.content = stripGmMemoryFromText(msg.content);
-        } else if (Array.isArray(msg.content)) {
-          // 处理 content 为数组的情况
-          msg.content = msg.content.map((block: any) => {
-            if (block && block.type === "text" && typeof block.text === "string") {
-              return { ...block, text: stripGmMemoryFromText(block.text) };
-            }
-            return block;
-          });
+        // 处理顶层 content（assembler/ingest 直接存入的格式）
+        if (msg.content !== undefined) {
+          msg.content = stripContentBlocks(msg.content);
+        }
+        // 处理 message.content（JSONL session 标准格式）
+        if (msg.message?.content !== undefined) {
+          msg.message.content = stripContentBlocks(msg.message.content);
         }
         return JSON.stringify(msg);
       } catch {
