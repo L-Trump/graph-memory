@@ -97,6 +97,13 @@ function cleanPrompt(raw: string): string {
   return prompt;
 }
 
+// ─── 去掉消息开头的 <gm_memory>...</gm_memory> 标签（防止每轮累积）───
+
+function stripGmMemoryFromText(text: string): string {
+  // 只去掉字符串开头的 <gm_memory>...</gm_memory> 块
+  return text.trim().replace(/^<gm_memory>[\s\S]*?<\/gm_memory>/i, "").trim();
+}
+
 // ─── 规范化消息 content，确保 OpenClaw 对 content.filter() 不崩 ──
 
 function normalizeMessageContent(messages: any[]): any[] {
@@ -106,17 +113,19 @@ function normalizeMessageContent(messages: any[]): any[] {
     // 已经是数组 → 修复畸形 block（如 { type: "text" } 缺 text 属性）
     if (Array.isArray(c)) {
       const fixed = c.map((block: any) => {
-        if (block && typeof block === "object" && block.type === "text" && !("text" in block)) {
-          return { ...block, text: "" };
+        if (block && typeof block === "object" && block.type === "text") {
+          const stripped = stripGmMemoryFromText(block.text ?? "");
+          return { ...block, text: stripped };
         }
         return block;
       });
       if (fixed !== c) return { ...msg, content: fixed };
       return msg;
     }
-    // string → 包装成标准 content block 数组
+    // string → 包装成标准 content block 数组，先去掉 gm_memory
     if (typeof c === "string") {
-      return { ...msg, content: [{ type: "text", text: c }] };
+      const stripped = stripGmMemoryFromText(c);
+      return { ...msg, content: [{ type: "text", text: stripped }] };
     }
     // undefined/null → 空 text block
     if (c == null) {
@@ -608,13 +617,14 @@ ${suggestionsText}
         // ── Input-layer noise filter ───────────────────────
         const filteredMsgs = filterNoiseMessages(msgs, extractUserText);
         if (!filteredMsgs.length) {
-          return {
-            ok: true, compacted: true,
-            result: {
-              summary: `no messages after noise filter`,
-              tokensBefore: currentTokenCount ?? 0,
-            },
-          };
+          return await delegateCompactionToRuntime(params);
+          // return {
+          //   ok: true, compacted: false,
+          //   result: {
+          //     summary: `no messages after noise filter`,
+          //     tokensBefore: currentTokenCount ?? 0,
+          //   },
+          // };
         }
 
         // fire-and-forget：提取异步进行，不阻塞 compaction 返回
@@ -622,13 +632,14 @@ ${suggestionsText}
           api.logger.error(`[graph-memory] compact extract failed: ${err}`);
         });
 
-        return {
-          ok: true, compacted: true,
-          result: {
-            summary: `extraction queued (fire-and-forget)`,
-            tokensBefore: currentTokenCount ?? 0,
-          },
-        };
+        return await delegateCompactionToRuntime(params);
+        // return {
+        //   ok: true, compacted: false,
+        //   result: {
+        //     summary: `extraction queued (fire-and-forget)`,
+        //     tokensBefore: currentTokenCount ?? 0,
+        //   },
+        // };
       },
 
       async afterTurn({
