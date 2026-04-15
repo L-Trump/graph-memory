@@ -710,6 +710,9 @@ ${suggestionsText}
       }) {
         if (isHeartbeat) return;
 
+        // 清理 sessionFile 中的 gm_memory 标签
+        compactStripSessionFile(sessionFile);
+
         // 消息入库（同步，零 LLM）
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
         for (const message of newMessages) {
