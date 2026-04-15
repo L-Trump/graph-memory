@@ -696,12 +696,13 @@ ${suggestionsText}
 
       async afterTurn({
         sessionId,
+        sessionFile,
         messages,
         prePromptMessageCount,
         isHeartbeat,
       }: {
         sessionId: string;
-        sessionFile: string;
+        sessionFile?: string;
         messages: any[];
         prePromptMessageCount: number;
         autoCompactionSummary?: string;
@@ -711,7 +712,7 @@ ${suggestionsText}
         if (isHeartbeat) return;
 
         // 清理 sessionFile 中的 gm_memory 标签
-        compactStripSessionFile(sessionFile);
+        if (sessionFile) compactStripSessionFile(sessionFile);
 
         // 消息入库（同步，零 LLM）
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
