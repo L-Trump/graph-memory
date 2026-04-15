@@ -14,6 +14,7 @@
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { delegateCompactionToRuntime } from "openclaw/plugin-sdk";
+import { readFileSync, writeFileSync } from "node:fs";
 import { Type } from "@sinclair/typebox";
 import { getDb } from "./src/store/db.ts";
 import {
@@ -102,6 +103,40 @@ function cleanPrompt(raw: string): string {
 function stripGmMemoryFromText(text: string): string {
   // 只去掉字符串开头的 <gm_memory>...</gm_memory> 块
   return text.trim().replace(/^<gm_memory>[\s\S]*?<\/gm_memory>/i, "").trim();
+}
+
+// ─── Compact 时清理 sessionFile 中每条消息开头的 gm_memory 标签 ───
+
+function compactStripSessionFile(sessionFile: string): void {
+  try {
+    const content = readFileSync(sessionFile, "utf-8");
+    const lines = content.split("\n").filter((line) => line.trim());
+    const cleaned = lines.map((line) => {
+      try {
+        const msg = JSON.parse(line);
+        // 处理 content 为字符串的情况
+        if (typeof msg.content === "string") {
+          msg.content = stripGmMemoryFromText(msg.content);
+        } else if (Array.isArray(msg.content)) {
+          // 处理 content 为数组的情况
+          msg.content = msg.content.map((block: any) => {
+            if (block && block.type === "text" && typeof block.text === "string") {
+              return { ...block, text: stripGmMemoryFromText(block.text) };
+            }
+            return block;
+          });
+        }
+        return JSON.stringify(msg);
+      } catch {
+        // 非 JSON 行直接保留
+        return line;
+      }
+    });
+    writeFileSync(sessionFile, cleaned.join("\n") + "\n", "utf-8");
+    api.logger.debug(`[graph-memory] stripped gm_memory from sessionFile: ${sessionFile}`);
+  } catch (err) {
+    api.logger.warn(`[graph-memory] failed to strip gm_memory from sessionFile: ${err}`);
+  }
 }
 
 // ─── 规范化消息 content，确保 OpenClaw 对 content.filter() 不崩 ──
@@ -612,6 +647,10 @@ ${suggestionsText}
         // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
         // 知识提取使用 fire-and-forget，不阻塞 compaction 返回
         const { sessionId, sessionFile, force, currentTokenCount } = params;
+
+        // ── 先清理 sessionFile 中的 gm_memory 标签 ────────────
+        compactStripSessionFile(sessionFile);
+
         const msgs = getUnextracted(db, sessionId, 50);
 
         // ── Input-layer noise filter ───────────────────────
