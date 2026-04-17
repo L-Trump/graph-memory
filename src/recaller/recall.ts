@@ -17,7 +17,7 @@
  *           + ppr_weight × norm_ppr
  *           + pagerank_weight × norm_pagerank
  *
- * 关键词混合：semantic × (1 + keywordScore × KEYWORD_WEIGHT)
+ * 关键词混合：semantic = vecSim × (0.6 + keywordScore × KEYWORD_WEIGHT)（上限 1.0）
  *
  * 分层召回（Top K = 45）：
  *   L1 (Top 0~15): 完整 content
@@ -50,8 +50,8 @@ import {
 
 // ─── 组合评分权重 ────────────────────────────────────────────
 const SEMANTIC_WEIGHT = 0.5;   // α：语义相关性权重
-const PPR_WEIGHT = 0.3;        // β：局部关联性权重（PPR）
-const PAGERANK_WEIGHT = 0.2;   // γ：全局重要性权重（PageRank）
+const PPR_WEIGHT = 0.4;        // β：局部关联性权重（PPR）
+const PAGERANK_WEIGHT = 0.1;   // γ：全局重要性权重（PageRank）
 
 // ─── 关键词混合召回 ────────────────────────────────────────────
 const KEYWORD_WEIGHT = 0.4;    // 关键词分数在语义组合中的权重上限（与向量相似度混合）
@@ -113,7 +113,7 @@ function computeKeywordScore(query: string, node: GmNode): number {
 }
 
 /**
- * 混合语义评分：向量相似度 × (1 + keywordBoost × KEYWORD_WEIGHT)
+ * 混合语义评分：vecSim × (1 - KEYWORD_WEIGHT + keywordBoost × KEYWORD_WEIGHT)（上限 1.0）
  */
 function makeHybridSemanticFn(
   semanticScores: Map<string, number>,
@@ -128,8 +128,7 @@ function makeHybridSemanticFn(
       kwScore = computeKeywordScore(query, n);
       kwScores.set(n.id, kwScore);
     }
-    const boost = 1 + kwScore * KEYWORD_WEIGHT;
-    return Math.min(1, vecSim * boost);
+    return Math.min(1, vecSim * (1 - KEYWORD_WEIGHT + kwScore * KEYWORD_WEIGHT));
   };
 }
 
