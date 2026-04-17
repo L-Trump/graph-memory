@@ -34,7 +34,7 @@ function minMax(scores: number[]): number[] {
  * @param getPpr 每个候选的 PPR 分数
  * @param getPageRank 每个候选的全局 PageRank 分数
  * @param alpha semantic 权重，默认 0.40
- * @param gamma pagerank 权重，默认 0.20
+ * @param gamma pagerank 权重，默认 0.10
  * @param getBelief 每个候选的置信度分数（0-1），可选
  * @param delta belief 权重，默认 0.15
  */
@@ -44,7 +44,7 @@ export function combinedScore<T>(
   getPpr: (item: T) => number,
   getPageRank: (item: T) => number,
   alpha = 0.40,
-  gamma = 0.20,
+  gamma = 0.10,
   getBelief?: (item: T) => number,
   delta = 0.15,
 ): Scored<T>[] {
