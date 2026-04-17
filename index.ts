@@ -680,7 +680,7 @@ ${suggestionsText}
         }
 
         // fire-and-forget：提取异步进行，不阻塞 compaction 返回
-        runTurnExtract(sessionId, sessionId, filteredMsgs).catch((err) => {
+        await runTurnExtract(sessionId, sessionId, filteredMsgs).catch((err) => {
           api.logger.error(`[graph-memory] compact extract failed: ${err}`);
         });
 
