@@ -483,7 +483,7 @@ ${suggestionsText}
         const sid = ctx?.sessionId ?? ctx?.sessionKey;
 
         // ── 只取最近 3 轮 user+assistant 消息作为 recall query ────────
-        const recallSlice = sliceLastTurn(event.messages ?? [], RECALL_KEEP_TURNS);
+        const recallSlice = sliceLastTurn(event.messages ?? [], RECALL_KEEP_TURNS, false);
         const recallQuery = [...(recallSlice.messages
           .map((m: any) => {
             const text = typeof m.content === "string" ? m.content :
@@ -2173,6 +2173,7 @@ function extractUserText(msg: any): string {
 function sliceLastTurn(
   messages: any[],
   keepTurns: number = DEFAULT_KEEP_TURNS,
+  keepLastTurnToolCalls: boolean = true,
 ): { messages: any[]; tokens: number; dropped: number } {
   if (!messages.length) {
     return { messages: [], tokens: 0, dropped: 0 };
@@ -2194,29 +2195,45 @@ function sliceLastTurn(
   // 最后一轮的 user 位置
   const lastTurnUserIdx = userIndices[0];
 
-  // ── 最后 1 轮：完整保留（含 toolResult，Agent 需要最新执行结果）──
-  let lastTurnMsgs = messages.slice(lastTurnUserIdx);
-  const lastTurnTotal = lastTurnMsgs.length;
-
-  // 截断超长 tool_result
+  // ── 截断超长 tool_result 的辅助函数 ────────────────────
   const TOOL_MAX = 6000;
-  lastTurnMsgs = lastTurnMsgs.map((msg: any) => {
+  function truncateToolResult(msg: any): any {
     if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
     if (typeof msg.content !== "string") return msg;
     if (msg.content.length <= TOOL_MAX) return msg;
     const head = Math.floor(TOOL_MAX * 0.6);
     const tail = Math.floor(TOOL_MAX * 0.3);
     return { ...msg, content: msg.content.slice(0, head) + `\n...[truncated ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail) };
-  });
+  }
+
+  // ── 最后 1 轮 ───────────────────────────────────────────
+  let lastTurnMsgs: any[];
+  if (keepLastTurnToolCalls) {
+    // 完整保留（含 toolResult，Agent 需要最新执行结果）
+    lastTurnMsgs = messages.slice(lastTurnUserIdx).map(truncateToolResult);
+  } else {
+    // 只保留 user + assistant 文本（与前 N-1 轮一致，用于 recall query）
+    lastTurnMsgs = [];
+    for (let i = lastTurnUserIdx; i < messages.length; i++) {
+      const msg = messages[i];
+      if (!msg) continue;
+      if (msg.role === "user") {
+        const text = extractUserText(msg);
+        if (text) lastTurnMsgs.push({ role: "user", content: text });
+      } else if (msg.role === "assistant") {
+        const text = extractAssistantText(msg);
+        if (text) lastTurnMsgs.push({ role: "assistant", content: text });
+      }
+      // toolResult / tool_use / thinking 等全部跳过
+    }
+  }
 
   // ── 前 N-1 轮：只保留 user 输入 + assistant 文本（去掉 tool schema）──
   const prevTurnMsgs: any[] = [];
-  let prevOriginalCount = 0;
 
   if (userIndices.length > 1) {
     // 从最早的 user 到最后一轮 user 之前
     const earliestIdx = userIndices[userIndices.length - 1];
-    prevOriginalCount = lastTurnUserIdx - earliestIdx;
 
     for (let i = earliestIdx; i < lastTurnUserIdx; i++) {
       const msg = messages[i];
@@ -2237,7 +2254,7 @@ function sliceLastTurn(
     }
   }
 
-  // ── 合并：前 N-1 轮摘要 + 最后 1 轮完整 ────────────────
+  // ── 合并：前 N-1 轮摘要 + 最后 1 轮 ────────────────────
   const kept = [...prevTurnMsgs, ...lastTurnMsgs];
   const dropped = messages.length - kept.length;
 
