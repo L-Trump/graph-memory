@@ -26,7 +26,7 @@ export type CompleteFn = (system: string, user: string) => Promise<string>;
 
 const RETRYABLE = new Set([429, 500, 502, 503, 529]);
 
-async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs = 30_000): Promise<Response> {
+async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs = 90_000): Promise<Response> {
   for (let i = 0; i <= retries; i++) {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
