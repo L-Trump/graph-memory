@@ -1071,7 +1071,7 @@ ${suggestionsText}
         description: "手动记录经验到知识图谱。发现重要解法、踩坑经验或工作流程时调用。",
         parameters: Type.Object({
           content: Type.String({ description: "用自然语言描述需要记忆的内容（会被当作待提取对话）" }),
-          flags: Type.Optional(Type.Array(Type.String(), { description: "节点标记数组。默认不传或者传空数组[]，可用的标记有\"hot\"和\"scope_hot:<scope_name>\"" })),
+          flags: Type.Optional(Type.Array(Type.String(), { description: "节点标记数组。默认不传或者传空数组[]，可用的标记有\"hot\"和\"scope_hot:<scope_name>\"，标记仅在用户显式要求添加时添加" })),
         }),
         async execute(
           _toolCallId: string,
@@ -1178,7 +1178,10 @@ ${suggestionsText}
           const topPr = (db.prepare(
             "SELECT name, type, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT 5"
           ).all() as any[]);
-          const embedEnabled = recaller.isEmbedReady();
+          // embedFn 真实可用：embedReady 标志为 true 且 embed 函数已赋值
+          const embedReady = recaller.isEmbedReady();
+          const embedFnExists = (recaller as any).embed != null;
+          const embedEnabled = embedReady && embedFnExists;
           const pendingCount = (recaller as any).pendingEmbedNodes?.length ?? 0;
           const topicCount = (db.prepare(
             "SELECT COUNT(*) as c FROM gm_nodes WHERE type='TOPIC' AND status='active'"
@@ -1206,14 +1209,14 @@ ${suggestionsText}
             `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `社区：${stats.communities} 个`,
             `Hot 节点：${stats.hotNodes} 个`,
-            `Embedding：${embedEnabled ? "✅ 已开启" : "❌ 未开启"}${pendingCount > 0 ? ` (待处理: ${pendingCount})` : ""}`,
+            `Embedding：${embedEnabled ? "✅ 已开启" : "❌ 未开启"}${pendingCount > 0 ? ` (待处理: ${pendingCount})` : ""}${embedReady && !embedFnExists ? " (embedFn 未赋值)" : ""}`,
             `PageRank Top 5：`,
             ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),
             beliefText,
           ].join("\n");
           return {
             content: [{ type: "text", text }],
-            details: { ...stats, embedEnabled, pendingEmbedCount: pendingCount },
+            details: { ...stats, embedEnabled, embedReady, embedFnExists, pendingEmbedCount: pendingCount },
           };
         },
       }),

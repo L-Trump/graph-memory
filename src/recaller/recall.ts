@@ -165,12 +165,10 @@ export class Recaller {
     // 处理竞态队列中积压的节点
     if (this.pendingEmbedNodes.length > 0) {
       const pending = this.pendingEmbedNodes.splice(0);
-      const logger = (process.env.GM_DEBUG ? console : undefined);
-      logger?.log(`[graph-memory] processing ${pending.length} pending embed nodes after embedFn ready`);
+      console.log(`[graph-memory] processing ${pending.length} pending embed nodes after embedFn ready`);
       for (const node of pending) {
         this._doSyncEmbed(node).catch((err) => {
-          const logErr = (process.env.GM_DEBUG ? console.error : undefined);
-          logErr?.(`[graph-memory] pending embed failed for node ${node.id}: ${err}`);
+          console.error(`[graph-memory] pending embed failed for node ${node.id}: ${err}`);
         });
       }
     }
@@ -491,8 +489,7 @@ export class Recaller {
     if (!this.embed) {
       // embedFn 尚未初始化，加入积压队列等待
       this.pendingEmbedNodes.push(node);
-      const logger = (process.env.GM_DEBUG ? console.log : undefined);
-      logger?.call(console, `[graph-memory] syncEmbed: embed not ready, queued node ${node.id} (pending=${this.pendingEmbedNodes.length})`);
+      console.log(`[graph-memory] syncEmbed: embed not ready, queued node ${node.id} (pending=${this.pendingEmbedNodes.length})`);
       return;
     }
     return this._doSyncEmbed(node, force);
@@ -509,12 +506,10 @@ export class Recaller {
       const vec = await this.embed!(text);
       if (vec.length) {
         saveVector(this.db, node.id, node.content, vec);
-        const logger = (process.env.GM_DEBUG ? console.log : undefined);
-        logger?.call(console, `[graph-memory] synced embedding for node ${node.id} (${vec.length} dims)`);
+        console.log(`[graph-memory] synced embedding for node ${node.id} (${vec.length} dims)`);
       }
     } catch (err) {
-      const logErr = (process.env.GM_DEBUG ? console.error : undefined);
-      logErr?.call(console, `[graph-memory] syncEmbed failed for node ${node.id}: ${err}`);
+      console.error(`[graph-memory] syncEmbed failed for node ${node.id}: ${err}`);
     }
   }
 
