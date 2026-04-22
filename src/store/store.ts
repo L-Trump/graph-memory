@@ -1005,7 +1005,7 @@ export function getNodeFullInfo(
 export function updateNodeFields(
   db: DatabaseSyncInstance,
   name: string,
-  fields: { description?: string; content?: string },
+  fields: { description?: string; content?: string; type?: string },
 ): GmNode | null {
   const node = findByName(db, name);
   if (!node) return null;
@@ -1018,6 +1018,10 @@ export function updateNodeFields(
   if (fields.content !== undefined) {
     sets.push("content = ?");
     vals.push(fields.content);
+  }
+  if (fields.type !== undefined) {
+    sets.push("type = ?");
+    vals.push(fields.type);
   }
   if (!sets.length) return node;
   sets.push("updated_at = ?");
