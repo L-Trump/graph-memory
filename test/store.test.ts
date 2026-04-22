@@ -376,3 +376,42 @@ describe("getBySession", () => {
     expect(edges[0].to_id).toBe(cId);
   });
 });
+// ═══════════════════════════════════════════════════════════════
+// updateNodeFields 支持 type
+// ═══════════════════════════════════════════════════════════════
+
+import { updateNodeFields } from "../src/store/store.ts";
+
+describe("updateNodeFields", () => {
+  it("修改节点类型", () => {
+    upsertNode(db, { type: "SKILL", name: "docker-up", description: "启动容器", content: "docker compose up" }, "s1");
+    const updated = updateNodeFields(db, "docker-up", { type: "EVENT" });
+    expect(updated).not.toBeNull();
+    expect(updated!.type).toBe("EVENT");
+  });
+
+  it("同时修改内容和类型", () => {
+    upsertNode(db, { type: "TASK", name: "task-abc", description: "旧描述", content: "旧内容" }, "s1");
+    const updated = updateNodeFields(db, "task-abc", { content: "新内容", type: "KNOWLEDGE" });
+    expect(updated!.content).toBe("新内容");
+    expect(updated!.type).toBe("KNOWLEDGE");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// cross-type merge（手动 gm_merge 允许跨类型）
+// ═══════════════════════════════════════════════════════════════
+
+describe("mergeNodes cross-type", () => {
+  it("允许不同类型节点合并（mergeNodes 底层不校验类型）", () => {
+    const a = insertNode(db, { name: "node-x", type: "SKILL" });
+    const b = insertNode(db, { name: "node-y", type: "EVENT" });
+    expect(a && b).toBeTruthy();
+    // 直接调用 mergeNodes，不走 gm_merge tool 的类型校验
+    mergeNodes(db, a, b);
+    const aAfter = findById(db, a)!;
+    expect(aAfter.status).toBe("active");
+    const bAfter = findById(db, b)!;
+    expect(bAfter.status).toBe("deprecated");
+  });
+});
