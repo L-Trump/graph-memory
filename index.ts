@@ -29,6 +29,7 @@ import {
   getNodeFullInfo, updateNodeFields,
   saveRecalledNodes, recordNodeAccessBatch,
   getRecentlyRecalledNodes, getRecentlyCreatedNodes,
+  mergeNodes,
 } from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
@@ -276,7 +277,12 @@ const graphMemoryPlugin = {
       }
       seq += 1;
       msgSeq.set(sessionId, seq);
-      saveMessage(db, sessionId, seq, message.role ?? "unknown", message);
+      // 入库前先去掉 gm_memory 标签
+      const strippedMessage = {
+        ...message,
+        content: stripContentBlocks(message.content),
+      };
+      saveMessage(db, sessionId, seq, strippedMessage.role ?? "unknown", strippedMessage);
     }
 
     /** 每轮结束后直接提取当前轮的消息（同 session 串行，不丢消息） */
@@ -716,7 +722,12 @@ ${suggestionsText}
 
         // 消息入库（同步，零 LLM）
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
-        for (const message of newMessages) {
+        // 在最开头统一去掉所有消息中的 gm_memory 标签
+        const strippedNewMessages = newMessages.map((msg: any) => ({
+          ...msg,
+          content: stripContentBlocks(msg.content),
+        }));
+        for (const message of strippedNewMessages) {
           ingestMessage(sessionId, message);
         }
 
@@ -725,8 +736,8 @@ ${suggestionsText}
           `[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
         );
 
-        // ★ 每轮直接提取
-        runTurnExtract(sessionId, sessionId, newMessages).catch((err) => {
+        // ★ 每轮直接提取（使用已剥离 gm_memory 的消息）
+        runTurnExtract(sessionId, sessionId, strippedNewMessages).catch((err) => {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
         });
 
@@ -1385,13 +1396,17 @@ ${suggestionsText}
           name: Type.String({ description: "节点名称，精确匹配" }),
           description: Type.Optional(Type.String({ description: "新的描述文本（可选）" })),
           content: Type.Optional(Type.String({ description: "新的内容文本（可选）" })),
+          type: Type.Optional(Type.String({ description: "新的节点类型（可选），有效值：TASK、SKILL、EVENT、KNOWLEDGE、STATUS" })),
         }),
-        async execute(_toolCallId: string, params: { name: string; description?: string; content?: string }) {
-          const { name, description, content } = params;
+        async execute(_toolCallId: string, params: { name: string; description?: string; content?: string; type?: string }) {
+          const { name, description, content, type } = params;
+          if (type !== undefined && !["TASK","SKILL","EVENT","KNOWLEDGE","STATUS"].includes(type)) {
+            return { content: [{ type: "text", text: `无效的节点类型 "${type}"，有效值：TASK、SKILL、EVENT、KNOWLEDGE、STATUS` }], details: { success: false } };
+          }
           if (!description && !content) {
             return { content: [{ type: "text", text: "至少需要提供 description 或 content 之一。" }], details: { success: false } };
           }
-          const updated = updateNodeFields(db, name, { description, content });
+          const updated = updateNodeFields(db, name, { description, content, type });
           if (!updated) {
             return { content: [{ type: "text", text: `未找到名为 "${name}" 的节点。` }], details: { success: false } };
           }
@@ -1626,6 +1641,54 @@ ${suggestionsText}
         },
       }),
       { name: "gm_remove" },
+    );
+
+    // ── gm_merge ─────────────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_merge",
+        label: "Merge Two Nodes in Graph Memory",
+        description: "手动合并两个节点：保留 keepName 指定的节点，将 mergeName 指定的节点内容合并到保留节点，然后标记被合并节点为 deprecated。边也会迁移到保留节点。与 gm maintain 去重的区别是：gm_merge 由用户手动指定哪两个节点合并，适用于明确知道两个节点重复的场景。",
+        parameters: Type.Object({
+          keepName: Type.String({ description: "保留的节点名称（精确匹配），合并后此节点保留" }),
+          mergeName: Type.String({ description: "被合并的节点名称（精确匹配），合并后此节点标记为 deprecated" }),
+        }),
+        async execute(_toolCallId: string, params: { keepName: string; mergeName: string }) {
+          const { keepName, mergeName } = params;
+          if (keepName === mergeName) {
+            return {
+              content: [{ type: "text", text: `两个节点名相同，请提供不同的节点名。` }],
+              details: { success: false, reason: "same_name" },
+            };
+          }
+          const keepNode = findByName(db, keepName);
+          const mergeNode = findByName(db, mergeName);
+          if (!keepNode) {
+            return {
+              content: [{ type: "text", text: `未找到名为 "${keepName}" 的节点（保留节点）。` }],
+              details: { success: false, reason: "keep_not_found" },
+            };
+          }
+          if (!mergeNode) {
+            return {
+              content: [{ type: "text", text: `未找到名为 "${mergeName}" 的节点（被合并节点）。` }],
+              details: { success: false, reason: "merge_not_found" },
+            };
+          }
+          // 允许跨类型合并（用户手动指定，不受类型约束）
+          mergeNodes(db, keepNode.id, mergeNode.id);
+          invalidateGraphCache();
+          api.logger.info(`[graph-memory] gm_merge: "${keepName}" kept, "${mergeName}" merged`);
+          return {
+            content: [{
+              type: "text",
+              text: `合并完成：保留节点 "${keepName}"（${keepNode.type}），"${mergeName}"（${mergeNode.type}）已标记为 deprecated 并合并到保留节点。`,
+            }],
+            details: { success: true, keepName, keepNodeId: keepNode.id, mergeName, mergeNodeId: mergeNode.id },
+          };
+        },
+      }),
+      { name: "gm_merge" },
     );
 
     // ── gm_embedding ──────────────────────────────────────────
