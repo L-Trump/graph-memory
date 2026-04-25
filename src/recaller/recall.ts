@@ -19,10 +19,10 @@
  *
  * 关键词混合：semantic = vecSim × (0.6 + keywordScore × KEYWORD_WEIGHT)（上限 1.0）
  *
- * 分层召回（Top K = 45）：
- *   L1 (Top 0~15): 完整 content
- *   L2 (Top 15~30): 仅 description
- *   L3 (Top 30~45): 仅 name
+ * 分层召回（Top K = 15）：
+ *   L1 (Top 0~5): 完整 content
+ *   L2 (Top 5~10): 仅 description
+ *   L3 (Top 10~15): 仅 name
  *   其余：filtered（不传递）
  *
  * 默认权重：α=0.5（语义） β=0.3（PPR） γ=0.2（PageRank） KEYWORD_WEIGHT=0.4
@@ -402,7 +402,7 @@ export class Recaller {
 
   /**
    * 三级分级：按组合评分排序后划档
-   * k 默认 45：L1=top k/3 (0~15)，L2=k/3~2k/3 (15~30)，L3=2k/3~k (30~45)，filtered=k+ (45+)
+   * k 默认 15：L1=top k/3 (0~5)，L2=k/3~2k/3 (5~10)，L3=2k/3~k (10~15)，filtered=k+ (15+)
    */
   private assignTiers(scored: Scored<GmNode>[]): TieredNode[] {
     const k = this.cfg.recallMaxNodes;

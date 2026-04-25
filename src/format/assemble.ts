@@ -4,13 +4,13 @@
  * By: adoresever
  * Email: Wywelljob@gmail.com
  *
- * 七层召回分层（Top K=45）：
+ * 七层召回分层（Top K=15）：
  * - scope_hot: 完整 content（scope 下永久加载）
  * - hot: 完整 content（全局热记忆）
  * - active: 完整 content（session 新节点）
- * - L1 (Top 0~15): 完整 content
- * - L2 (Top 15~30): 仅 description
- * - L3 (Top 30~45): 仅 name
+ * - L1 (Top 0~5): 完整 content
+ * - L2 (Top 5~10): 仅 description
+ * - L3 (Top 10~15): 仅 name
  * - filtered: 不传递，不渲染
  *
  * 节点 XML 格式：
@@ -129,9 +129,9 @@ function formatEdge(e: GmEdge, fromName: string, toName: string, hasDescription:
  *  - **scope_hot**（scope 热记忆）：当前 session 所属 scope 下永久加载的记忆，永远可见
  *  - **hot**（全局热记忆）：全局永久加载的记忆，每个 session 必定注入
  *  - **active**（本 session 节点）：本轮对话中新产生的节点，compact 后需参考其上下文
- *  - **L1**（recalled top 15）：完整 content，召回评分最高的节点
- *  - **L2**（recalled 16~30）：仅 description，上下文参考
- *  - **L3**（recalled 31~45）：仅 name，提示存在相关知识域
+ *  - **L1**（recalled top 5）：完整 content，召回评分最高的节点
+ *  - **L2**（recalled 6~10）：仅 description，上下文参考
+ *  - **L3**（recalled 11~15）：仅 name，提示存在相关知识域
  *  - **filtered**：不传递，不渲染
  *
  * 节点 confidence（置信度）：0.00~1.00

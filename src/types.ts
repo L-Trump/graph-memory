@@ -199,7 +199,7 @@ export interface GmConfig {
 export const DEFAULT_CONFIG: GmConfig = {
   dbPath: "~/.openclaw/graph-memory.db",
   compactTurnCount: 6,
-  recallMaxNodes: 45,
+  recallMaxNodes: 15,
   recallMaxDepth: 2,
   freshTailCount: 10,
   dedupThreshold: 0.90,
