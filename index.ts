@@ -433,7 +433,7 @@ ${suggestionsText}
 2. 对于仍有价值的"建议写成文档"类建议：
    - 将节点内容写成文档，写入 ~/.openclaw/workspace/memory/ 目录下
    - 文件名使用建议的文档标题（如有），或自动生成合适的标题
-   - 完成后用 gm_edit_node 工具更新对应节点，在 content 或 description 中补充文档路径信息
+   - 完成后必须用 gm_edit_node 工具更新对应节点，在 content 中补充文档路径信息和更新日期
 3. 如果建议已过时或无价值，输出 NO_REPLY 静默即可
 
 重要：你有完整的文件写入和 gm_edit_node 工具权限。
@@ -587,12 +587,12 @@ ${suggestionsText}
         // systemPrompt → appendSystemContext（追加在 prompt 末尾）
         // xml + episodicXml → <gm_memory> 包裹后作为 prependContext（前置）
         const gmBody = [xml, episodicXml].filter(Boolean).join("\n\n");
-        const prepend = gmBody ? `<gm_memory>\n\n${gmBody}\n\n</gm_memory>` : "";
-        const append = systemPrompt;
+        const append = gmBody ? `${systemPrompt}\n\n<gm_memory>\n\n${gmBody}\n\n</gm_memory>` : "";
+        // const append = systemPrompt;
 
-        if (prepend || append) {
+        if (append) {
           return {
-            ...(prepend ? { prependContext: prepend } : {}),
+            // ...(prepend ? { prependContext: prepend } : {}),
             ...(append ? { appendSystemContext: append } : {}),
           };
         }
