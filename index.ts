@@ -488,28 +488,34 @@ ${suggestionsText}
 
         const sid = ctx?.sessionId ?? ctx?.sessionKey;
 
-        // ── 只取最近 3 轮 user+assistant 消息作为 recall query ────────
+        // ── 构造两次独立 recall query ──────────────────────────────
         const recallSlice = sliceLastTurn(event.messages ?? [], RECALL_KEEP_TURNS, false);
-        const recallQuery = [...(recallSlice.messages
+        // historyQuery：只取最近 2 轮消息（不含当前 prompt）
+        const historyQuery = recallSlice.messages
           .map((m: any) => {
             const text = typeof m.content === "string" ? m.content :
               (Array.isArray(m.content)
                 ? m.content.filter((b: any) => b?.type === "text" && typeof b.text === "string").map((b: any) => b.text).join("\n")
                 : String(m.content ?? ""));
-            // 去掉 OpenClaw metadata wrapper
             const fenceEnd = text.lastIndexOf("```");
             const cleaned = fenceEnd >= 0 && text.includes("Sender") ? text.slice(fenceEnd + 3).trim() : text;
             return `[${m.role}] ${cleaned}`;
-          })), `[user] ${prompt}`]
+          })
           .join("\n")
-          .replace(/^\[[\w\s\-:]*\]\s*/, "")
+          .replace(/^\[[\w\s\-:]\s*/, "")
           .trim();
+        // promptQuery：清理后的当前用户 prompt
+        const promptQuery = prompt;
 
-        const query = recallQuery || prompt;
-        api.logger.info(`[graph-memory] recall query (${RECALL_KEEP_TURNS} turns): "${query.slice(0, 80)}"`);
+        if (!historyQuery && !promptQuery) {
+          api.logger.info(`[graph-memory] recall: both queries empty, skip`);
+          return;
+        }
 
-        // ── 召回 ────────────────────────────────────────────────
-        const res = await recaller.recallV2(query);
+        api.logger.info(`[graph-memory] parallel recall: history(${historyQuery.slice(0, 60)}...) + prompt("${promptQuery.slice(0, 60)}")`);
+
+        const res = await parallelRecall(recaller, historyQuery, promptQuery);
+
         if (res.nodes.length) {
           const stored = { nodes: res.nodes, edges: res.edges, pprScores: res.pprScores };
           if (ctx?.sessionId) recalled.set(ctx.sessionId, stored);
@@ -521,9 +527,9 @@ ${suggestionsText}
           for (const n of res.nodes) {
             tierCounts[n.tier ?? "?"] = (tierCounts[n.tier ?? "?"] ?? 0) + 1;
           }
-          const tierStr = ["L1", "L2", "L3"].map(t => `${t}=${tierCounts[t] ?? 0}`).join(" ");
+          const tierStr = ["scope_hot", "hot", "active", "L1", "L2", "L3"].map(t => `${t}=${tierCounts[t] ?? 0}`).join(" ");
           api.logger.info(
-            `[graph-memory] recalled ${res.nodes.length} nodes [${tierStr}], ${res.edges.length} edges`,
+            `[graph-memory] parallel recall merged: ${res.nodes.length} nodes [${tierStr}], ${res.edges.length} edges`,
           );
 
           // ── 记录召回节点到 gm_recalled 表 ────────────────────────
@@ -2182,6 +2188,55 @@ function estimateMsgTokens(msg: any): number {
 
 const DEFAULT_KEEP_TURNS = 5;  // assemble 阶段保留最近 5 轮
 const RECALL_KEEP_TURNS = 2;   // recall 阶段只取最近 2 轮
+
+/**
+ * 并行召回两次（历史消息 + 当前 prompt），去重合并结果
+ * 节点按 name 去重，保留更高 tier 的节点
+ * 边按 (from, to, name) 去重
+ */
+async function parallelRecall(
+  recaller: Recaller,
+  historyQuery: string,
+  promptQuery: string,
+): Promise<{ nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }> {
+  const tierPriority = (tier: string): number => {
+    const p: Record<string, number> = { scope_hot: 6, hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
+    return p[tier] ?? 0;
+  };
+
+  const [historyRes, promptRes] = await Promise.all([
+    recaller.recallV2(historyQuery),
+    recaller.recallV2(promptQuery),
+  ]);
+
+  // ── 节点去重（按 name，保留更高 tier）──────────────────────
+  const nodesMap = new Map<string, TieredNode>();
+  for (const n of [...historyRes.nodes, ...promptRes.nodes]) {
+    const existing = nodesMap.get(n.name);
+    if (!existing || tierPriority(n.tier) > tierPriority(existing.tier)) {
+      nodesMap.set(n.name, n);
+    }
+  }
+
+  // ── 边去重（按 from+to+name）──────────────────────────────
+  const edgesSet = new Set<string>();
+  const mergedEdges: any[] = [];
+  for (const e of [...historyRes.edges, ...promptRes.edges]) {
+    const key = `${e.from}-${e.to}-${e.name}`;
+    if (!edgesSet.has(key)) {
+      edgesSet.add(key);
+      mergedEdges.push(e);
+    }
+  }
+
+  // ── 合并 pprScores（取更高值）────────────────────────────
+  const pprScores: Record<string, number> = { ...historyRes.pprScores };
+  for (const [k, v] of Object.entries(promptRes.pprScores ?? {})) {
+    if (!pprScores[k] || v > pprScores[k]) pprScores[k] = v;
+  }
+
+  return { nodes: Array.from(nodesMap.values()), edges: mergedEdges, pprScores };
+}
 
 /**
  * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema
