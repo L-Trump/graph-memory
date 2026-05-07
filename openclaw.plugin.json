@@ -1,8 +1,33 @@
 {
   "id": "graph-memory",
   "name": "Graph Memory",
-  "version": "1.5.6",
+  "version": "3.0.0",
   "description": "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类+向量去重自动维护",
+  "contracts": {
+    "tools": [
+      "gm_search",
+      "gm_record",
+      "gm_stats",
+      "gm_maintain",
+      "gm_get_hots",
+      "gm_set_flags",
+      "gm_get_node",
+      "gm_edit_node",
+      "gm_set_hot",
+      "gm_set_scope_hot",
+      "gm_get_scope",
+      "gm_set_scope",
+      "gm_list_scopes",
+      "gm_remove",
+      "gm_merge",
+      "gm_reembedding_all",
+      "gm_induce_topics",
+      "gm_dream",
+      "gm_explore",
+      "gm_embedding",
+      "gm_get_flags"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "properties": {
