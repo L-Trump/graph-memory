@@ -20,7 +20,7 @@ import { getDb } from "./src/store/db.ts";
 import {
   saveMessage, getUnextracted, getRecentExtractedMessages,
   markExtracted,
-  upsertNode, upsertEdge, findByName,
+  upsertNode, upsertEdge, findByName, findById,
   getBySession, edgesFrom, edgesTo,
   deprecate, getStats, getHotNodes, getEdgesForNodes, setNodeFlags,
   getTopicNodes, getTopicToTopicEdges, getSemanticToTopicEdges,
@@ -1902,8 +1902,8 @@ ${suggestionsText}
         lines.push(`  内容: ${seed?.content || "(无)"}`);
         lines.push("");
 
-        // 关联节点（排除种子自身）
-        const relatedNodes = sg.nodes.filter((n: any) => n.id !== seed?.id && n.tier === "L1");
+        // 关联节点（排除种子自身）：L1层节点 + active节点（来自同session）
+        const relatedNodes = sg.nodes.filter((n: any) => n.id !== seed?.id && (n.tier === "L1" || n.tier === "active"));
 
         for (const n of relatedNodes) {
           const lastAccessed = n.lastAccessedAt
@@ -2125,6 +2125,27 @@ ${suggestionsText}
                   result.edges,
                 );
                 allSeeds.push(...seeds);
+
+                // ── 补充：带出种子节点最新 session 的所有节点 ─────────────
+                for (const subgraph of sg) {
+                  const seedNode = findById(db, seedFromRecalled.nodeId);
+                  if (seedNode && seedNode.sourceSessions && seedNode.sourceSessions.length > 0) {
+                    const latestSessionId = seedNode.sourceSessions[seedNode.sourceSessions.length - 1];
+                    const sessionNodes = getBySession(db, latestSessionId);
+                    // 去重合并，并显式标记 tier=active（避免 undefined/null）
+                    const existingIds = new Set(subgraph.nodes.map((n: any) => n.id));
+                    const newNodes = sessionNodes
+                      .filter((n: any) => !existingIds.has(n.id))
+                      .map((n: any) => ({ ...n, tier: "active" }));
+                    subgraph.nodes.push(...newNodes);
+
+                    // 合并后统一获取节点之间的边
+                    const allNodeIds = subgraph.nodes.map((n: any) => n.id);
+                    const allEdges = getEdgesForNodes(db, allNodeIds);
+                    subgraph.edges = allEdges;
+                  }
+                }
+
                 subgraphs.push(...sg);
               }
             }
@@ -2140,6 +2161,27 @@ ${suggestionsText}
                     result.edges,
                   );
                   allSeeds.push(...seeds);
+
+                  // ── 补充：带出种子节点最新 session 的所有节点 ─────────────
+                  for (const subgraph of sg) {
+                    const seedNode = findById(db, seedFromCreated.id);
+                    if (seedNode && seedNode.sourceSessions && seedNode.sourceSessions.length > 0) {
+                      const latestSessionId = seedNode.sourceSessions[seedNode.sourceSessions.length - 1];
+                      const sessionNodes = getBySession(db, latestSessionId);
+                      // 去重合并，并显式标记 tier=active（避免 undefined/null）
+                      const existingIds = new Set(subgraph.nodes.map((n: any) => n.id));
+                      const newNodes = sessionNodes
+                        .filter((n: any) => !existingIds.has(n.id))
+                        .map((n: any) => ({ ...n, tier: "active" }));
+                      subgraph.nodes.push(...newNodes);
+
+                      // 合并后统一获取节点之间的边
+                      const allNodeIds = subgraph.nodes.map((n: any) => n.id);
+                      const allEdges = getEdgesForNodes(db, allNodeIds);
+                      subgraph.edges = allEdges;
+                    }
+                  }
+
                   subgraphs.push(...sg);
                 }
               }
@@ -2222,7 +2264,7 @@ async function parallelRecall(
   const edgesSet = new Set<string>();
   const mergedEdges: any[] = [];
   for (const e of [...historyRes.edges, ...promptRes.edges]) {
-    const key = `${e.from}-${e.to}-${e.name}`;
+    const key = `${e.fromId}-${e.toId}-${e.name}`;
     if (!edgesSet.has(key)) {
       edgesSet.add(key);
       mergedEdges.push(e);

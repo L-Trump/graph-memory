@@ -41,7 +41,7 @@ async function parallelRecall(
   // 合并 pprScores（取更高值）
   const pprScores: Record<string, number> = { ...historyRes.pprScores };
   for (const [k, v] of Object.entries(promptRes.pprScores ?? {})) {
-    if (!pprScores[k] || v > pprScores[k]) pprScores[k] = v;
+    if (!pprScores[k] || (v as number) > pprScores[k]) pprScores[k] = v as number;
   }
 
   return { nodes: Array.from(nodesMap.values()), edges: mergedEdges, pprScores };
@@ -62,7 +62,7 @@ describe("parallelRecall 去重合并", () => {
   }
 
   function node(name: string, tier: string = "L1"): TieredNode {
-    return { id: name, name, type: "KNOWLEDGE" as any, tier: tier as any, content: "", description: "", confidence: 0.5, updated: "" };
+    return { id: name, name, type: "KNOWLEDGE" as any, tier: tier as any, content: "", description: "", belief: 0.5, updatedAt: 0, semanticScore: 0, pprScore: 0, pagerankScore: 0, combinedScore: 0, status: "active" as any, validatedCount: 0, sourceSessions: [], communityId: null, pagerank: 0, flags: [], createdAt: 0 } as TieredNode;
   }
 
   function edge(from: string, to: string, name: string = "使用"): any {

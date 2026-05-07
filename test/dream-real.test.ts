@@ -12,7 +12,7 @@ import {
 
 // ─── 加载真实数据库副本 ─────────────────────────────────────────
 const TEST_DB_PATH = "/tmp/gm-test.db";
-const db = new DatabaseSync(`file:${TEST_DB_PATH}?mode=ro`, { readonly: true });
+const db = new DatabaseSync(`file:${TEST_DB_PATH}?mode=ro`, { readOnly: true });
 // 重新打开为读写以便某些操作（如 access_count 更新）
 const dbRw = new DatabaseSync(TEST_DB_PATH);
 
