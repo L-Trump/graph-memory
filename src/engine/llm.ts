@@ -70,6 +70,8 @@ export function createCompleteFn(
             { role: "user", content: user },
           ],
           temperature: 0.1,
+          // 禁止工具调用：GM 内部 LLM 调用只输出文本，不执行任何工具
+          tool_choice: "none",
         }),
       });
       if (!res.ok) {
