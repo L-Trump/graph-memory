@@ -225,6 +225,7 @@ const graphMemoryPlugin = {
       _gmRecaller = new Recaller(db, cfg);
       extractor = new Extractor(cfg, llm);
       _gmExtractor = extractor;
+      recaller = _gmRecaller!;
 
       // 异步初始化 embedding（仅首次执行）
       createEmbedFn(cfg.embedding)
