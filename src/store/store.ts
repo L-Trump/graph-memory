@@ -348,6 +348,7 @@ export function getBySession(db: DatabaseSyncInstance, sessionId: string): GmNod
   return (db.prepare(`
     SELECT DISTINCT n.* FROM gm_nodes n, json_each(n.source_sessions) j
     WHERE j.value = ? AND n.status = 'active'
+    ORDER BY n.updated_at ASC
   `).all(sessionId) as any[]).map(toNode);
 }
 
