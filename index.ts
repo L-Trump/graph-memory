@@ -854,9 +854,14 @@ ${suggestionsText}
         event?.sessionKey;
       if (!sid) return;
 
-      try {
-        const nodes = getBySession(db, sid);
-        if (nodes.length) {
+      // ── 全部 fire-and-forget，不阻塞 handler ───────────────────
+
+      // 1. Finalize + upsert promoted skills/edges (fire-and-forget)
+      (async () => {
+        try {
+          const nodes = getBySession(db, sid);
+          if (!nodes.length) return;
+
           const summary = (
             db.prepare(
               "SELECT name, type, validated_count, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT 20",
@@ -865,10 +870,7 @@ ${suggestionsText}
             .map((n) => `${n.type}:${n.name}(v${n.validated_count},pr${n.pagerank.toFixed(3)})`)
             .join(", ");
 
-          const fin = await extractor.finalize({
-            sessionNodes: nodes,
-            graphSummary: summary,
-          });
+          const fin = await extractor.finalize({ sessionNodes: nodes, graphSummary: summary });
 
           for (const nc of fin.promotedSkills) {
             if (nc.name && nc.content) {
@@ -883,70 +885,69 @@ ${suggestionsText}
             const fromId = findByName(db, ec.from)?.id;
             const toId = findByName(db, ec.to)?.id;
             if (fromId && toId) {
-              upsertEdge(db, {
-                fromId, toId,
-                name: ec.name,
-                description: ec.description,
-                sessionId: sid,
-              });
+              upsertEdge(db, { fromId, toId, name: ec.name, description: ec.description, sessionId: sid });
             }
           }
           for (const id of fin.invalidations) deprecate(db, id);
+        } catch (err) {
+          api.logger.error(`[graph-memory] session_end finalize error: ${err}`);
         }
+      })();
 
-        // ★ Topic Induction：基于 session 语义节点归纳主题（fire-and-forget）
-        {
-          const sessionNodes = getBySession(db, sid);
-          const sessionSemanticNodes = sessionNodes.filter(n =>
-            ["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"].includes(n.type)
-          );
+      // 2. Topic Induction（已是 fire-and-forget，保持结构）
+      {
+        const sessionNodes = getBySession(db, sid);
+        const sessionSemanticNodes = sessionNodes.filter(n =>
+          ["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"].includes(n.type)
+        );
 
-          if (sessionSemanticNodes.length > 0) {
-            induceTopics({
-              db,
-              sessionNodes: sessionSemanticNodes,
-              llm,
-              recaller,
-            }).then((induction) => {
+        if (sessionSemanticNodes.length > 0) {
+          induceTopics({ db, sessionNodes: sessionSemanticNodes, llm, recaller })
+            .then((induction) => {
               const total =
                 induction.createdTopics.length +
                 induction.updatedTopics.length +
                 induction.semanticToTopicEdges.length +
                 induction.topicToTopicEdges.length;
-              if (total > 0) {
-                invalidateGraphCache();
-              }
+              if (total > 0) invalidateGraphCache();
               api.logger.info(
                 `[graph-memory] session_end topic induction: ` +
                 `created=${induction.createdTopics.length}, updated=${induction.updatedTopics.length}, ` +
                 `sem→topic=${induction.semanticToTopicEdges.length}, topic↔topic=${induction.topicToTopicEdges.length}`,
               );
-            }).catch((err) => {
+            })
+            .catch((err) => {
               const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
               api.logger.error(`[graph-memory] session_end topic induction failed: ${msg}`);
             });
-          }
         }
+      }
 
-        const embedFn = (recaller as any).embed ?? undefined;
-        const result = await runMaintenance(db, cfg, llm, embedFn);
-        api.logger.info(
-          `[graph-memory] maintenance: ${result.durationMs}ms, ` +
-          `dedup=${result.dedup.merged}, ` +
-          `communities=${result.community.count}, ` +
-          `summaries=${result.communitySummaries}, ` +
-          `top_pr=${result.pagerank.topK.slice(0, 3).map((n: any) => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
-        );
+      // 3. runMaintenance (fire-and-forget)
+      (async () => {
+        try {
+          const embedFn = (recaller as any).embed ?? undefined;
+          const result = await runMaintenance(db, cfg, llm, embedFn);
+          api.logger.info(
+            `[graph-memory] maintenance: ${result.durationMs}ms, ` +
+            `dedup=${result.dedup.merged}, ` +
+            `communities=${result.community.count}, ` +
+            `summaries=${result.communitySummaries}, ` +
+            `top_pr=${result.pagerank.topK.slice(0, 3).map((n: any) => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
+          );
+        } catch (err) {
+          api.logger.error(`[graph-memory] session_end maintenance error: ${err}`);
+        }
+      })();
 
-        // ── Belief: Session 完成信号 ──────────────────────────
-        // 对本 session 的所有节点记录 task_completed 信号（如果 session_nodes 存在）
+      // 4. Belief update (fire-and-forget)
+      (async () => {
         try {
           const sessionBeliefNodes = getBySession(db, sid);
           for (const node of sessionBeliefNodes) {
             try {
               recordBeliefSignal(db, node.id, node.name, "supported", sid, 0.3, {
-                source: "session_end",
-                nodeCount: sessionBeliefNodes.length,
+                source: "session_end", nodeCount: sessionBeliefNodes.length,
               });
               updateNodeBelief(db, node.id, "supported");
             } catch { /* belief may not be migrated */ }
@@ -959,14 +960,13 @@ ${suggestionsText}
         } catch (err) {
           api.logger.warn(`[graph-memory] session_end belief update failed: ${err}`);
         }
-      } catch (err) {
-        api.logger.error(`[graph-memory] session_end error: ${err}`);
-      } finally {
-        extractChain.delete(sid);
-        msgSeq.delete(sid);
-        recalled.delete(sid);
-        turnCounter.delete(sid);
-      }
+      })();
+
+      // finally: 清理 session 上下文（仍同步执行）
+      extractChain.delete(sid);
+      msgSeq.delete(sid);
+      recalled.delete(sid);
+      turnCounter.delete(sid);
     });
 
     // ── Agent Tools（改名 gm_*）──────────────────────────────
@@ -2105,6 +2105,9 @@ ${suggestionsText}
               0.33,
             );
 
+            console.log('[GM_DREAM] seedFromRecalled:', seedFromRecalled?.nodeName, seedFromRecalled?.nodeId);
+            console.log('[GM_DREAM] seedFromCreated:', seedFromCreated?.name, seedFromCreated?.id);
+
             if (!seedFromRecalled && !seedFromCreated) {
               return {
                 content: [
@@ -2119,12 +2122,14 @@ ${suggestionsText}
 
             if (seedFromRecalled) {
               const result = await recaller.exploreSubgraph(seedFromRecalled.nodeId);
+              console.log('[GM_DREAM] recalled result: roots=', result.roots.length, 'nodes=', result.nodes.length);
               if (result.roots.length && result.nodes.length) {
                 const { seeds, subgraphs: sg } = buildSubgraphResult(
                   result.roots,
                   result.nodes,
                   result.edges,
                 );
+                console.log('[GM_DREAM] after build: allSeeds.length=', allSeeds.length, 'sg.length=', sg.length);
                 allSeeds.push(...seeds);
 
                 // ── 补充：带出种子节点最新 session 的所有节点 ─────────────
@@ -2153,8 +2158,10 @@ ${suggestionsText}
 
             if (seedFromCreated) {
               const alreadySeedNames = new Set(allSeeds.map((r: any) => r.name));
+              console.log('[GM_DREAM] created alreadySeedNames:', Array.from(alreadySeedNames), 'checking:', seedFromCreated.name);
               if (!alreadySeedNames.has(seedFromCreated.name)) {
                 const result = await recaller.exploreSubgraph(seedFromCreated.id);
+                console.log('[GM_DREAM] created result: roots=', result.roots.length, 'nodes=', result.nodes.length);
                 if (result.roots.length && result.nodes.length) {
                   const { seeds, subgraphs: sg } = buildSubgraphResult(
                     result.roots,
