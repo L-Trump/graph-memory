@@ -315,8 +315,6 @@ export function graphWalk(
   const visited = new Set<string>(seedIds);
   let frontier = new Set<string>(seedIds);
   const nodeIdList: string[] = [...seedIds];
-  const edgeFromList: string[] = [];
-  const edgeToList: string[] = [];
 
   for (let depth = 1; depth < maxDepth && frontier.size > 0; depth++) {
     if (visited.size >= maxNodes) break;
@@ -334,8 +332,6 @@ export function graphWalk(
     for (const { from_id, to_id } of rows) {
       if (!visited.has(to_id)) { visited.add(to_id); nextFrontier.add(to_id); nodeIdList.push(to_id); }
       if (!visited.has(from_id)) { visited.add(from_id); nextFrontier.add(from_id); nodeIdList.push(from_id); }
-      edgeFromList.push(from_id);
-      edgeToList.push(to_id);
     }
 
     frontier = nextFrontier;
@@ -349,13 +345,11 @@ export function graphWalk(
     `SELECT * FROM gm_nodes WHERE id IN (${np}) AND status='active'`
   ).all(...uniqueNodeIds) as any[]).map(toNode);
 
-  // 边去重
-  const seenEdge = new Set<string>();
-  const edges: GmEdge[] = [];
-  for (let i = 0; i < edgeFromList.length; i++) {
-    const key = `${edgeFromList[i]}->${edgeToList[i]}`;
-    if (!seenEdge.has(key)) { seenEdge.add(key); edges.push({ fromId: edgeFromList[i], toId: edgeToList[i], name: "" }); }
-  }
+  // 查所有两端都在 visited 节点集合里的边（用 toEdge 保留 name 等字段）
+  const edgeRows = db.prepare(
+    `SELECT * FROM gm_edges WHERE from_id IN (${np}) AND to_id IN (${np})`
+  ).all(...uniqueNodeIds, ...uniqueNodeIds) as any[];
+  const edges = edgeRows.map(toEdge);
 
   return { nodes, edges };
 }
