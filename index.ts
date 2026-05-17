@@ -548,7 +548,26 @@ ${suggestionsText}
 
         // ── 组装 KG 并注入 appendSystemContext（优先级低于 Claw 核心设定）──
         const rec = recalled.get(sid) ?? { nodes: [], edges: [], pprScores: {} };
-        const activeNodes = getBySession(db, sid);
+        let activeNodes = getBySession(db, sid);
+
+        // ── Active nodes 数量裁剪：从旧到新删除，配额保底 ────────
+        if (activeNodes.length > 100) {
+          activeNodes.sort((a, b) => a.updatedAt - b.updatedAt);
+          let taskCount = activeNodes.filter(n => n.type === "TASK").length;
+          let eventCount = activeNodes.filter(n => n.type === "EVENT").length;
+          let knowledgeCount = activeNodes.filter(n => n.type === "KNOWLEDGE").length;
+          const toRemove = new Set<string>();
+          for (const node of activeNodes) {
+            const curTotal = activeNodes.length - toRemove.size;
+            if (curTotal <= 100) break;
+            if (node.type === "SKILL") continue;
+            if (node.type === "TASK" && taskCount > 5) { toRemove.add(node.id); taskCount--; }
+            else if (node.type === "EVENT" && eventCount > 10) { toRemove.add(node.id); eventCount--; }
+            else if (node.type === "KNOWLEDGE" && knowledgeCount > 10) { toRemove.add(node.id); knowledgeCount--; }
+            else if (!["SKILL", "TASK", "EVENT", "KNOWLEDGE"].includes(node.type)) { toRemove.add(node.id); }
+          }
+          activeNodes = activeNodes.filter(n => !toRemove.has(n.id));
+        }
         const activeEdges = activeNodes.flatMap((n) => [
           ...edgesFrom(db, n.id),
           ...edgesTo(db, n.id),

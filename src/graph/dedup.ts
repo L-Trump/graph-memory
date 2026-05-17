@@ -62,12 +62,14 @@ function cosineSim(a: Float32Array, b: Float32Array): number {
  * 需要 embedding 才能工作，没有向量的节点会被跳过。
  * FTS5 名称完全匹配由 store.upsertNode 已处理，这里处理语义重复。
  */
-export function detectDuplicates(db: DatabaseSyncInstance, cfg: GmConfig): DuplicatePair[] {
+export async function detectDuplicates(db: DatabaseSyncInstance, cfg: GmConfig): Promise<DuplicatePair[]> {
   const vectors = getAllVectors(db);
   if (vectors.length < 2) return [];
 
   const threshold = cfg.dedupThreshold;
   const pairs: DuplicatePair[] = [];
+  let processed = 0;
+  const YIELD_EVERY = 1000;
 
   for (let i = 0; i < vectors.length; i++) {
     for (let j = i + 1; j < vectors.length; j++) {
@@ -85,6 +87,10 @@ export function detectDuplicates(db: DatabaseSyncInstance, cfg: GmConfig): Dupli
           });
         }
       }
+      processed++;
+      if (processed % YIELD_EVERY === 0) {
+        await new Promise(r => setImmediate(r));
+      }
     }
   }
 
@@ -99,8 +105,8 @@ export function detectDuplicates(db: DatabaseSyncInstance, cfg: GmConfig): Dupli
  *   - 保留 validatedCount 更高的
  *   - validatedCount 相同时保留更新时间更近的
  */
-export function dedup(db: DatabaseSyncInstance, cfg: GmConfig): DedupResult {
-  const pairs = detectDuplicates(db, cfg);
+export async function dedup(db: DatabaseSyncInstance, cfg: GmConfig): Promise<DedupResult> {
+  const pairs = await detectDuplicates(db, cfg);
   let merged = 0;
 
   // 已经被合并过的节点不再参与合并
