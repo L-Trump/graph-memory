@@ -302,42 +302,60 @@ export function topNodes(db: DatabaseSyncInstance, limit = 6): GmNode[] {
   `).all(limit) as any[]).map(toNode);
 }
 
-// ─── 递归 CTE 图遍历 ────────────────────────────────────────
+// ─── 迭代 BFS 图遍历 ──────────────────────────────────────
 
 export function graphWalk(
   db: DatabaseSyncInstance,
   seedIds: string[],
   maxDepth: number,
+  maxNodes = 1500,
 ): { nodes: GmNode[]; edges: GmEdge[] } {
   if (!seedIds.length) return { nodes: [], edges: [] };
 
-  const placeholders = seedIds.map(() => "?").join(",");
+  const visited = new Set<string>(seedIds);
+  let frontier = new Set<string>(seedIds);
+  const nodeIdList: string[] = [...seedIds];
+  const edgeFromList: string[] = [];
+  const edgeToList: string[] = [];
 
-  const walkRows = db.prepare(`
-    WITH RECURSIVE walk(node_id, depth) AS (
-      SELECT id, 0 FROM gm_nodes WHERE id IN (${placeholders}) AND status='active'
-      UNION
-      SELECT
-        CASE WHEN e.from_id = w.node_id THEN e.to_id ELSE e.from_id END,
-        w.depth + 1
-      FROM walk w
-      JOIN gm_edges e ON (e.from_id = w.node_id OR e.to_id = w.node_id)
-      WHERE w.depth < ?
-    )
-    SELECT DISTINCT node_id FROM walk
-  `).all(...seedIds, maxDepth) as any[];
+  for (let depth = 1; depth < maxDepth && frontier.size > 0; depth++) {
+    if (visited.size >= maxNodes) break;
 
-  const nodeIds = walkRows.map((r: any) => r.node_id);
-  if (!nodeIds.length) return { nodes: [], edges: [] };
+    const frontierArr = Array.from(frontier);
+    const placeholders = frontierArr.map(() => "?").join(",");
 
-  const np = nodeIds.map(() => "?").join(",");
-  const nodes = (db.prepare(`
-    SELECT * FROM gm_nodes WHERE id IN (${np}) AND status='active'
-  `).all(...nodeIds) as any[]).map(toNode);
+    // 一轮一次 OR 查询：from IN frontier OR to IN frontier
+    const rows = db.prepare(`
+      SELECT from_id, to_id FROM gm_edges
+      WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})
+    `).all(...frontierArr) as any[];
 
-  const edges = (db.prepare(`
-    SELECT * FROM gm_edges WHERE from_id IN (${np}) AND to_id IN (${np})
-  `).all(...nodeIds, ...nodeIds) as any[]).map(toEdge);
+    const nextFrontier = new Set<string>();
+    for (const { from_id, to_id } of rows) {
+      if (!visited.has(to_id)) { visited.add(to_id); nextFrontier.add(to_id); nodeIdList.push(to_id); }
+      if (!visited.has(from_id)) { visited.add(from_id); nextFrontier.add(from_id); nodeIdList.push(from_id); }
+      edgeFromList.push(from_id);
+      edgeToList.push(to_id);
+    }
+
+    frontier = nextFrontier;
+  }
+
+  if (nodeIdList.length === 0) return { nodes: [], edges: [] };
+
+  const uniqueNodeIds = [...new Set(nodeIdList)];
+  const np = uniqueNodeIds.map(() => "?").join(",");
+  const nodes = (db.prepare(
+    `SELECT * FROM gm_nodes WHERE id IN (${np}) AND status='active'`
+  ).all(...uniqueNodeIds) as any[]).map(toNode);
+
+  // 边去重
+  const seenEdge = new Set<string>();
+  const edges: GmEdge[] = [];
+  for (let i = 0; i < edgeFromList.length; i++) {
+    const key = `${edgeFromList[i]}->${edgeToList[i]}`;
+    if (!seenEdge.has(key)) { seenEdge.add(key); edges.push({ fromId: edgeFromList[i], toId: edgeToList[i], name: "" }); }
+  }
 
   return { nodes, edges };
 }
