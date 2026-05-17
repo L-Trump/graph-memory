@@ -1327,6 +1327,45 @@ ${suggestionsText}
       { name: "gm_get_hots" },
     );
 
+    // ── gm_get_scope_hots ──────────────────────────────────────
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_get_scope_hots",
+        label: "Get Scope Hot Nodes from Graph Memory",
+        description: "获取指定 scope 的所有 scope_hot 节点。scope_hot 节点在对应 scope 的 session 中 assemble 时必定渲染。",
+        parameters: Type.Object({
+          scope: Type.String({ description: "scope 名称，如 'cron' 或 'gm开发'" }),
+        }),
+        async execute(_toolCallId: string, params: any) {
+          const { scope } = params;
+          if (!scope?.trim()) {
+            return { content: [{ type: "text", text: "scope 参数不能为空。" }], details: { count: 0 } };
+          }
+          const nodes = getScopeHotNodes(db, [scope.trim()]);
+          if (!nodes.length) {
+            return {
+              content: [{ type: "text", text: `scope \"${scope}\" 当前没有 scope_hot 节点。` }],
+              details: { count: 0, scope },
+            };
+          }
+          const lines = nodes.map((n: any) => {
+            const flagsStr = n.flags?.length ? ` [${n.flags.map((f: string) => `"${f}"`).join(", ")}]` : "";
+            return `[${n.type}] ${n.name}${flagsStr}\n  ${n.description || "(无描述)"}\n  ${(n.content || "").slice(0, 500)}${(n.content || "").length > 500 ? "..." : ""}`;
+          });
+          const text = [
+            `scope \"${scope}\" 共有 ${nodes.length} 个 scope_hot 节点：`,
+            "",
+            ...lines,
+          ].join("\n");
+          return {
+            content: [{ type: "text", text }],
+            details: { count: nodes.length, scope, nodes },
+          };
+        },
+      }),
+      { name: "gm_get_scope_hots" },
+    );
+
     // ── gm_set_flags ───────────────────────────────────────────
     api.registerTool(
       (_ctx: any) => ({
