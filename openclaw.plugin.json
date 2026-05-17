@@ -10,6 +10,7 @@
       "gm_stats",
       "gm_maintain",
       "gm_get_hots",
+      "gm_get_scope_hots",
       "gm_set_flags",
       "gm_get_node",
       "gm_edit_node",
