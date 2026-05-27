@@ -13,7 +13,7 @@ import type { CompleteFn } from "../engine/llm.ts";
 
 // ─── 节点合法类型 ──────────────────────────────────────────────
 
-// TOPIC 节点由 topic induction 阶段单独管理,extract 阶段不创建
+// TOPIC / SESSION 节点由独立阶段管理,extract 阶段不创建
 const VALID_NODE_TYPES = new Set(["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"]);
 
 // ─── 提取 System Prompt ─────────────────────────────────────────

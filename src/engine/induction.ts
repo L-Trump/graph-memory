@@ -491,3 +491,180 @@ export async function induceTopics(params: {
     topicToTopicEdges,
   };
 }
+
+// ─── Session 归纳引擎 ───────────────────────────────────────────────
+
+const SESSION_INDUCTION_SYS = `你是 session 归纳引擎。为当前 session 生成或更新一个 session 摘要节点。
+
+规则：
+- description：一句话说明这个 session 讨论了什么主题（20字以内）
+- 摘要：用 3-5 句话归纳本 session 的核心内容和结论
+- 不要泄露私人信息或敏感数据
+- 保持简洁，摘要不超过 500 字
+
+输出严格 JSON，禁止额外文字：
+{"description": "一句话描述", "summary": "摘要内容"}`;
+
+const MSG_TRUNCATE_SESS = 500;
+
+function renderSessionMessages(msgs: any[]): string {
+  return msgs
+    .filter(m => m.role === "user" || m.role === "assistant")
+    .map(m => {
+      const role = (m.role ?? "?").toUpperCase();
+      let raw = "";
+      if (typeof m.content === "string") {
+        raw = m.content;
+      } else if (Array.isArray(m.content)) {
+        raw = m.content
+          .filter((b: any) => b && typeof b === "object" && b.type === "text")
+          .map((b: any) => {
+            let text = b.text ?? "";
+            if (text.length > MSG_TRUNCATE_SESS) {
+              text = text.slice(0, MSG_TRUNCATE_SESS) + `...(truncated ${text.length - MSG_TRUNCATE_SESS} chars)`;
+            }
+            return text;
+          })
+          .join("\n");
+      }
+      if (raw.length > MSG_TRUNCATE_SESS) {
+        raw = raw.slice(0, MSG_TRUNCATE_SESS) + `...(truncated ${raw.length - MSG_TRUNCATE_SESS} chars)`;
+      }
+      return `[${role}]\n${raw}`;
+    })
+    .join("\n\n---\n\n");
+}
+
+function parseSessionInduction(raw: string): { description: string; summary: string } {
+  try {
+    const s = raw.trim()
+      .replace(/<think>[\s\S]*?<\/think>/gi, "")
+      .replace(/^```(?:json)?\s*\n?/i, "")
+      .replace(/\n?\s*```\s*$/i, "")
+      .trim();
+    const first = s.indexOf("{");
+    const last = s.lastIndexOf("}");
+    const json = first !== -1 && last > first ? s.slice(first, last + 1) : s;
+    const p = JSON.parse(json);
+    return {
+      description: String(p.description || "").trim().slice(0, 200),
+      summary: String(p.summary || "").trim().slice(0, 500),
+    };
+  } catch (err) {
+    console.error("[session induction] parse failed:", err);
+    return { description: "", summary: "" };
+  }
+}
+
+export interface SessionInductionResult {
+  created: boolean;     // 是否新建节点（false=更新已有）
+  description: string;
+  summary: string;
+}
+
+/**
+ * 获取 session 的消息（仅 user + assistant），用于 LLM 归纳。
+ * 从 gm_messages 表读取。
+ */
+function getSessionMessagesForInduction(
+  db: DatabaseSyncInstance,
+  sessionId: string,
+): any[] {
+  const rows = db.prepare(`
+    SELECT * FROM gm_messages
+    WHERE session_id = ? AND role IN ('user', 'assistant')
+    ORDER BY turn_index ASC
+  `).all(sessionId) as any[];
+
+  return rows.map(r => {
+    let content: any;
+    try {
+      content = JSON.parse(r.content ?? "{}");
+    } catch {
+      content = { text: r.content ?? "" };
+    }
+    return {
+      role: r.role,
+      turn_index: r.turn_index,
+      content,
+    };
+  });
+}
+
+/**
+ * 归纳当前 session 内容，创建或更新 session 节点。
+ *
+ * 触发时机：
+ * 1. session 第一次产生节点时（runTurnExtract 中）
+ * 2. 每 N 轮自动维护（afterTurn periodic maintenance）
+ * 3. session_end
+ * 4. compaction
+ *
+ * @param sessionKey  用于填充 content.sessionKey 字段
+ */
+export async function induceSession(params: {
+  db: DatabaseSyncInstance;
+  sessionId: string;
+  sessionKey: string;
+  sessionNodes: GmNode[];
+  llm: CompleteFn;
+  recaller?: Recaller;
+}): Promise<SessionInductionResult> {
+  const { db, sessionId, sessionKey, sessionNodes, llm } = params;
+
+  // 1. 获取 session 消息
+  const messages = getSessionMessagesForInduction(db, sessionId);
+  const messagesText = renderSessionMessages(messages);
+
+  // 2. 构建节点摘要
+  const nodesText = sessionNodes
+    .slice(0, 20) // 最多20个节点
+    .map(n => `[${n.type}] ${n.name}\n  desc: ${(n.description || "").slice(0, 100)}\n  content: ${(n.content || "").slice(0, 200)}`)
+    .join("\n\n");
+
+  // 3. 调用 LLM
+  let description = "";
+  let summary = "";
+  try {
+    const raw = await llm(
+      SESSION_INDUCTION_SYS,
+      `<Session Nodes>\n${nodesText || "(无节点)"}\n\n<Messages>\n${messagesText || "(无消息)"}`
+    );
+    const parsed = parseSessionInduction(raw);
+    description = parsed.description;
+    summary = parsed.summary;
+  } catch (err) {
+    console.warn(`[session induction] LLM call failed for ${sessionId}:`, err);
+    // LLM 失败时，给一个默认 description
+    description = sessionNodes.length > 0
+      ? `关于 ${sessionNodes[0].name} 等${sessionNodes.length}个节点的讨论`
+      : "会话记录";
+    summary = "（LLM 归纳失败，内容不可用）";
+  }
+
+  // 4. 生成/更新 session 节点
+  const sessionName = `session-${sessionId}`;
+  const now = new Date().toISOString();
+  const content = [
+    `session最后更新时间：${now}`,
+    `sessionKey: ${sessionKey}`,
+    `session摘要：`,
+    summary,
+  ].join("\n");
+
+  const existing = findByName(db, sessionName);
+  const { node, isNew } = upsertNode(db, {
+    type: "SESSION",
+    name: sessionName,
+    description: description || "会话记录",
+    content,
+  }, sessionId);
+
+  if (params.recaller) params.recaller.syncEmbed(node).catch(() => {});
+
+  return {
+    created: isNew,
+    description: node.description,
+    summary,
+  };
+}

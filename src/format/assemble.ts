@@ -421,7 +421,7 @@ export function assembleContext(
 // ─── Extract 用知识图谱 ──────────────────────────────────────
 
 // extract 阶段不处理的节点类型（由 topic induction 阶段管理）
-const EXTRACT_EXCLUDED_TYPES = new Set(["TOPIC"]);
+const EXTRACT_EXCLUDED_TYPES = new Set(["TOPIC", "SESSION"]);
 
 /**
  * 为 extraction 构建知识图谱 XML

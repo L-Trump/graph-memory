@@ -49,10 +49,45 @@ export function resetDb(): void {
   if (_db) { try { _db.close(); } catch {} _db = null; }
 }
 
+
+function recreateNodeFtsTriggers(db: DatabaseSyncInstance): void {
+  try {
+    db.exec(`
+      DROP TRIGGER IF EXISTS gm_nodes_ai;
+      DROP TRIGGER IF EXISTS gm_nodes_ad;
+      DROP TRIGGER IF EXISTS gm_nodes_au;
+      CREATE TRIGGER IF NOT EXISTS gm_nodes_ai AFTER INSERT ON gm_nodes BEGIN
+        INSERT INTO gm_nodes_fts(rowid, name, description, content)
+        VALUES (NEW.rowid, NEW.name, NEW.description, NEW.content);
+      END;
+      CREATE TRIGGER IF NOT EXISTS gm_nodes_ad AFTER DELETE ON gm_nodes BEGIN
+        INSERT INTO gm_nodes_fts(gm_nodes_fts, rowid, name, description, content)
+        VALUES ('delete', OLD.rowid, OLD.name, OLD.description, OLD.content);
+      END;
+      CREATE TRIGGER IF NOT EXISTS gm_nodes_au AFTER UPDATE ON gm_nodes BEGIN
+        INSERT INTO gm_nodes_fts(gm_nodes_fts, rowid, name, description, content)
+        VALUES ('delete', OLD.rowid, OLD.name, OLD.description, OLD.content);
+        INSERT INTO gm_nodes_fts(rowid, name, description, content)
+        VALUES (NEW.rowid, NEW.name, NEW.description, NEW.content);
+      END;
+    `);
+  } catch {
+    // FTS5 may be unavailable; keep LIKE fallback behavior.
+  }
+}
+
+function recreateNodeIndexes(db: DatabaseSyncInstance): void {
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_nodes_name ON gm_nodes(name);
+    CREATE INDEX IF NOT EXISTS ix_gm_nodes_type_status ON gm_nodes(type, status);
+    CREATE INDEX IF NOT EXISTS ix_gm_nodes_community ON gm_nodes(community_id);
+  `);
+}
+
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes, m12_recalled, m13_access_tracking];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes, m12_recalled, m13_access_tracking, m14_session_type];
 
 function m11_scopes(db: DatabaseSyncInstance): void {
   try {
@@ -134,6 +169,65 @@ function m13_access_tracking(db: DatabaseSyncInstance): void {
     ALTER TABLE gm_nodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE gm_nodes ADD COLUMN last_accessed_at INTEGER NOT NULL DEFAULT 0;
   `);
+}
+
+function m14_session_type(db: DatabaseSyncInstance): void {
+  // Add SESSION to gm_nodes.type CHECK constraint
+  // SQLite doesn't support ALTER TABLE for CHECK constraints, must rebuild table
+  const schema = (db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='gm_nodes'"
+  ).get() as any)?.sql ?? "";
+  if (schema.includes("'SESSION'")) {
+    return; // already migrated
+  }
+
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec("PRAGMA legacy_alter_table = ON");
+
+  try {
+    // 0. Clean up possible residue from an interrupted previous migration
+    db.exec("DROP TABLE IF EXISTS gm_nodes_new");
+
+    // 1. Create new table with updated CHECK constraint
+    db.exec(`
+      CREATE TABLE gm_nodes_new (
+        id              TEXT PRIMARY KEY,
+        type            TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT','KNOWLEDGE','STATUS','TOPIC','SESSION')),
+        name            TEXT NOT NULL,
+        description     TEXT NOT NULL DEFAULT '',
+        content         TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','deprecated')),
+        validated_count INTEGER NOT NULL DEFAULT 1,
+        source_sessions TEXT NOT NULL DEFAULT '[]',
+        community_id    TEXT,
+        pagerank       REAL NOT NULL DEFAULT 0,
+        created_at     INTEGER NOT NULL,
+        updated_at     INTEGER NOT NULL,
+        flags           TEXT NOT NULL DEFAULT '[]',
+        belief          REAL NOT NULL DEFAULT 0.5,
+        success_count   INTEGER NOT NULL DEFAULT 0,
+        failure_count   INTEGER NOT NULL DEFAULT 0,
+        last_signal_at  INTEGER NOT NULL DEFAULT 0,
+        access_count    INTEGER NOT NULL DEFAULT 0,
+        last_accessed_at INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+
+    // 2. Copy data
+    db.exec("INSERT INTO gm_nodes_new SELECT * FROM gm_nodes");
+
+    // 3. Drop old table
+    db.exec("DROP TABLE gm_nodes");
+
+    // 4. Rename new table
+    db.exec("ALTER TABLE gm_nodes_new RENAME TO gm_nodes");
+
+    // 5. Recreate indexes and FTS triggers
+    recreateNodeIndexes(db);
+    recreateNodeFtsTriggers(db);
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
 }
 
   for (let i = cur; i < steps.length; i++) {
@@ -226,22 +320,7 @@ function m4_fts5(db: DatabaseSyncInstance): void {
         content_rowid=rowid
       );
     `);
-    db.exec(`
-      CREATE TRIGGER IF NOT EXISTS gm_nodes_ai AFTER INSERT ON gm_nodes BEGIN
-        INSERT INTO gm_nodes_fts(rowid, name, description, content)
-        VALUES (NEW.rowid, NEW.name, NEW.description, NEW.content);
-      END;
-      CREATE TRIGGER IF NOT EXISTS gm_nodes_ad AFTER DELETE ON gm_nodes BEGIN
-        INSERT INTO gm_nodes_fts(gm_nodes_fts, rowid, name, description, content)
-        VALUES ('delete', OLD.rowid, OLD.name, OLD.description, OLD.content);
-      END;
-      CREATE TRIGGER IF NOT EXISTS gm_nodes_au AFTER UPDATE ON gm_nodes BEGIN
-        INSERT INTO gm_nodes_fts(gm_nodes_fts, rowid, name, description, content)
-        VALUES ('delete', OLD.rowid, OLD.name, OLD.description, OLD.content);
-        INSERT INTO gm_nodes_fts(rowid, name, description, content)
-        VALUES (NEW.rowid, NEW.name, NEW.description, NEW.content);
-      END;
-    `);
+    recreateNodeFtsTriggers(db);
   } catch {
     // FTS5 不可用时静默降级到 LIKE 搜索
   }
@@ -293,8 +372,8 @@ function m7_edge_flexible(db: DatabaseSyncInstance): void {
     -- 创建新表（无 type 列，新增 name + description）
     CREATE TABLE gm_edges (
       id          TEXT PRIMARY KEY,
-      from_id     TEXT NOT NULL REFERENCES gm_nodes(id),
-      to_id       TEXT NOT NULL REFERENCES gm_nodes(id),
+      from_id     TEXT NOT NULL,
+      to_id       TEXT NOT NULL,
       name        TEXT NOT NULL,
       description TEXT NOT NULL DEFAULT '',
       session_id  TEXT NOT NULL,
@@ -343,12 +422,18 @@ function m8_flags(db: DatabaseSyncInstance): void {
 // ─── TOPIC 节点类型迁移 ──────────────────────────────────────
 
 function m9_topic_nodes(db: DatabaseSyncInstance): void {
-  // 更新 CHECK 约束，允许 TOPIC 类型
-  // SQLite 不支持 ALTER TABLE CHECK，需要重建表
+  const schema = (db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='gm_nodes'"
+  ).get() as any)?.sql ?? "";
+  if (schema.includes("'TOPIC'")) {
+    return; // already migrated
+  }
+
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec("PRAGMA legacy_alter_table = ON");
+
   try {
-    // 检查当前 CHECK 是否已包含 TOPIC
-    const colInfo = db.prepare("PRAGMA table_info(gm_nodes)").all() as any[];
-    // 如果 type 列没有 CHECK 约束包含 TOPIC，则重建表
+    db.exec("DROP TABLE IF EXISTS gm_nodes_old");
     db.exec(`
       ALTER TABLE gm_nodes RENAME TO gm_nodes_old;
 
@@ -367,12 +452,13 @@ function m9_topic_nodes(db: DatabaseSyncInstance): void {
         updated_at      INTEGER NOT NULL,
         flags           TEXT NOT NULL DEFAULT '[]'
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_nodes_name ON gm_nodes(name);
-      CREATE INDEX IF NOT EXISTS ix_gm_nodes_type_status ON gm_nodes(type, status);
-      CREATE INDEX IF NOT EXISTS ix_gm_nodes_community ON gm_nodes(community_id);
 
       INSERT INTO gm_nodes SELECT * FROM gm_nodes_old;
       DROP TABLE gm_nodes_old;
     `);
-  } catch { /* 已经是最新 schema */ }
+    recreateNodeIndexes(db);
+    recreateNodeFtsTriggers(db);
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
 }

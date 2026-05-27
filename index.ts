@@ -41,7 +41,7 @@ import { runMaintenance } from "./src/graph/maintenance.ts";
 import { filterNoiseMessages } from "./src/extractor/noise-filter.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
 import { detectCommunities } from "./src/graph/community.ts";
-import { induceTopics } from "./src/engine/induction.ts";
+import { induceTopics, induceSession } from "./src/engine/induction.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
 
 // ─── 从 OpenClaw config 读 provider/model ────────────────────
@@ -351,6 +351,47 @@ const graphMemoryPlugin = {
 
           const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
           markExtracted(db, sessionId, maxTurn);
+
+          // ── Session 节点：确保存在，为新节点建边 ──────────────────────
+          const sessionNodeName = `session-${sessionId}`;
+          let sessionNode = findByName(db, sessionNodeName);
+
+          if (!sessionNode) {
+            // 第一次产生节点 → 创建 session 节点
+            const currentSessionNodes = getBySession(db, sessionId);
+            try {
+              const induction = await induceSession({
+                db,
+                sessionId,
+                sessionKey,
+                sessionNodes: currentSessionNodes,
+                llm,
+                recaller,
+              });
+              sessionNode = findByName(db, sessionNodeName);
+              api.logger.info(
+                `[graph-memory] session node created: ${sessionNodeName} (${induction.description})`,
+              );
+            } catch (err) {
+              api.logger.warn(`[graph-memory] induceSession failed for ${sessionNodeName}: ${err}`);
+            }
+          }
+
+          // 为每个新节点建立指向 session 节点的边（"来自会话"）
+          if (sessionNode && newNodeNames.size > 0) {
+            for (const nodeName of newNodeNames) {
+              const node = findByName(db, nodeName);
+              if (node) {
+                upsertEdge(db, {
+                  fromId: node.id,
+                  toId: sessionNode.id,
+                  name: "来自会话",
+                  description: "该节点在本会话中产生",
+                  sessionId,
+                });
+              }
+            }
+          }
 
           // ── 处理置信度更新（beliefUpdates）────────────────────────
           if (result.beliefUpdates && result.beliefUpdates.length > 0) {
@@ -681,6 +722,7 @@ ${suggestionsText}
 
       async compact(params: {
         sessionId: string;
+        sessionKey?: string;
         sessionFile: string;
         tokenBudget?: number;
         force?: boolean;
@@ -691,7 +733,7 @@ ${suggestionsText}
       }) {
         // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
         // 知识提取使用 fire-and-forget，不阻塞 compaction 返回
-        const { sessionId, sessionFile, force, currentTokenCount } = params;
+        const { sessionId, sessionKey, sessionFile, force, currentTokenCount } = params;
 
         // ── 先清理 sessionFile 中的 gm_memory 标签 ────────────
         compactStripSessionFile(sessionFile);
@@ -712,9 +754,33 @@ ${suggestionsText}
         }
 
         // fire-and-forget：提取异步进行，不阻塞 compaction 返回
-        await runTurnExtract(sessionId, sessionId, filteredMsgs).catch((err) => {
+        await runTurnExtract(sessionId, sessionKey ?? sessionId, filteredMsgs).catch((err) => {
           api.logger.error(`[graph-memory] compact extract failed: ${err}`);
         });
+
+        // ★ Session 归纳：compaction 后更新 session 节点摘要（fire-and-forget）
+        {
+          const sk = sessionKey ?? sessionId;
+          const sid = sessionId;
+          const dbRef = db;
+          const llmRef = llm;
+          const recallerRef = recaller;
+          const sessionNodesRef = getBySession(db, sessionId);
+          if (sessionNodesRef.length > 0) {
+            induceSession({
+              db: dbRef,
+              sessionId: sid,
+              sessionKey: sk,
+              sessionNodes: sessionNodesRef,
+              llm: llmRef,
+              recaller: recallerRef,
+            }).then((induction) => {
+              api.logger.info(`[graph-memory] compact session induction: ${induction.description}`);
+            }).catch((err) => {
+              api.logger.warn(`[graph-memory] compact session induction failed: ${err}`);
+            });
+          }
+        }
 
         return await delegateCompactionToRuntime(params);
         // return {
@@ -728,12 +794,14 @@ ${suggestionsText}
 
       async afterTurn({
         sessionId,
+        sessionKey,
         sessionFile,
         messages,
         prePromptMessageCount,
         isHeartbeat,
       }: {
         sessionId: string;
+        sessionKey?: string;
         sessionFile?: string;
         messages: any[];
         prePromptMessageCount: number;
@@ -763,7 +831,7 @@ ${suggestionsText}
         );
 
         // ★ 每轮直接提取（使用已剥离 gm_memory 的消息）
-        runTurnExtract(sessionId, sessionId, strippedNewMessages).catch((err) => {
+        runTurnExtract(sessionId, sessionKey ?? sessionId, strippedNewMessages).catch((err) => {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
         });
 
@@ -804,6 +872,27 @@ ${suggestionsText}
                 const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
                 api.logger.error(`[graph-memory] periodic topic induction failed: ${msg}`);
               });
+            }
+
+            // ★ Session 归纳：更新 session 节点摘要
+            try {
+              const currentSessionNodes = getBySession(db, sessionId);
+              if (currentSessionNodes.length > 0) {
+                const induction = await induceSession({
+                  db,
+                  sessionId,
+                  sessionKey: sessionKey ?? sessionId,
+                  sessionNodes: currentSessionNodes,
+                  llm,
+                  recaller,
+                });
+                api.logger.info(
+                  `[graph-memory] periodic session induction (turn ${turns}): ` +
+                  `${induction.description}`,
+                );
+              }
+            } catch (err) {
+              api.logger.warn(`[graph-memory] periodic session induction failed: ${err}`);
             }
 
             // ★ 社区维护
@@ -939,6 +1028,28 @@ ${suggestionsText}
               const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
               api.logger.error(`[graph-memory] session_end topic induction failed: ${msg}`);
             });
+        }
+      }
+
+      // 2b. Session 归纳：session 结束前最终更新
+      {
+        const sessionNodes = getBySession(db, sid);
+        if (sessionNodes.length > 0) {
+          try {
+            const induction = await induceSession({
+              db,
+              sessionId: sid,
+              sessionKey: ctx?.sessionKey ?? sid,
+              sessionNodes,
+              llm,
+              recaller,
+            });
+            api.logger.info(
+              `[graph-memory] session_end session induction: ${induction.description}`,
+            );
+          } catch (err) {
+            api.logger.warn(`[graph-memory] session_end session induction failed: ${err}`);
+          }
         }
       }
 
@@ -1242,7 +1353,7 @@ ${suggestionsText}
 
           const text = [
             `知识图谱统计`,
-            `节点：${stats.totalNodes} 个 (${["TASK","SKILL","EVENT","KNOWLEDGE","STATUS","TOPIC"].map(t => `${t}: ${t === "TOPIC" ? topicCount : (stats.byType[t] ?? 0)}`).join(", ")})`,
+            `节点：${stats.totalNodes} 个 (${["TASK","SKILL","EVENT","KNOWLEDGE","STATUS","TOPIC","SESSION"].map(t => `${t}: ${t === "TOPIC" ? topicCount : (stats.byType[t] ?? 0)}`).join(", ")})`,
             `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `社区：${stats.communities} 个`,
             `Hot 节点：${stats.hotNodes} 个`,
