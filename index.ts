@@ -15,6 +15,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { delegateCompactionToRuntime } from "openclaw/plugin-sdk";
 import { readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { getDb } from "./src/store/db.ts";
 import {
@@ -494,16 +495,23 @@ ${suggestionsText}
                   return;
                 }
 
+                const advisorParentKey = sessionKey;
+                const advisorKeyHash = createHash("sha256").update(advisorParentKey).digest("hex").slice(0, 16);
+                const suggestionKey = validSuggestions.map(s => s.nodeName).sort().join("|");
+                const suggestionHash = createHash("sha256").update(suggestionKey).digest("hex").slice(0, 12);
+                const advisorSessionKey = `agent:main:subagent:gm-advisor-${advisorKeyHash}`;
+                const advisorIdempotencyKey = `gm-advisor:${advisorKeyHash}:${suggestionHash}:${Date.now()}`;
+
                 const { runId } = await (api.runtime as any).subagent.run({
-                  idempotencyKey: sessionKey,
-                  sessionKey,
+                  idempotencyKey: advisorIdempotencyKey,
+                  sessionKey: advisorSessionKey,
                   message: advisorTask,
                   extraSystemPrompt: advisorSystemPrompt,
                   deliver: false,
                 });
 
                 api.logger.info(
-                  `[graph-memory] advisor launched: runId=${runId}, suggestions=${validSuggestions.length} [${validSuggestions.map(s => s.nodeName).join(", ")}]`,
+                  `[graph-memory] advisor launched: runId=${runId}, parentSession=${advisorParentKey}, advisorSession=${advisorSessionKey}, suggestions=${validSuggestions.length} [${validSuggestions.map(s => s.nodeName).join(", ")}]`,
                 );
               } catch (err) {
                 api.logger.warn(`[graph-memory] advisor launch failed: ${err}`);
