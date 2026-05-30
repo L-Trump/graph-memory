@@ -1,6 +1,6 @@
 # graph-memory
 
-> **Forked from** [adoresever/graph-memory](https://github.com/adoresever/graph-memory) · Original project with upstream changes merged in
+> **Forked from** [adoresever/graph-memory](https://github.com/adoresever/graph-memory) · custom OpenClaw knowledge-graph context engine
 
 <p align="center">
   <strong>Knowledge Graph Context Engine for OpenClaw</strong>
@@ -10,293 +10,230 @@
 
 ## What it does
 
-When conversations grow long, agents lose track of what happened. graph-memory solves three problems at once:
+graph-memory turns conversations into a persistent knowledge graph and injects relevant graph context back into future OpenClaw sessions.
 
-1. **Context explosion** — graph-memory compresses long conversations by replacing raw history with structured knowledge graph nodes
-2. **Cross-session amnesia** — Yesterday's bugs, solved problems, all recalled automatically via semantic + graph search
-3. **Skill islands** — Isolated learnings get connected: "installed libgl1" and "ImportError: libGL.so.1" linked by a `解决` edge
+It solves three practical problems:
 
-**It feels like talking to an agent that learns from experience. Because it does.**
+1. **Context explosion** — old raw messages are distilled into structured nodes and edges.
+2. **Cross-session amnesia** — previous fixes, decisions, pitfalls, and workflows can be recalled later.
+3. **Disconnected experience** — isolated memories are connected by free-form relationship edges such as `解决`, `使用`, `依赖`, `扩展`, `冲突`.
 
-## Architecture
+## Current architecture
 
-```
+```text
 Message in
-  └─ ingest(): save to gm_messages (synchronous, zero LLM)
+  └─ ContextEngine.ingest(): save raw message to gm_messages synchronously
 
 before_prompt_build hook
-  ├─ recallV2(): dual-path recall → tiered nodes
-  ├─ saveRecalledNodes(): cache recalled nodes to gm_recalled
-  ├─ assembleStableContext(): hot/scope_hot/compactActive → appendSystemContext
-  └─ assembleDynamicContext(): recalled L1/L2/L3 → prependContext
+  ├─ filterNoiseMessages(): skip obvious boilerplate / denial / memory-meta messages
+  ├─ Recaller.recallV2(): precise recall only
+  ├─ saveRecalledNodes(): persist per-turn recalled nodes to gm_recalled
+  ├─ assembleStableContext(): scope_hot + hot + compacted active nodes → appendSystemContext
+  └─ assembleDynamicContext(): recalled L1/L2/L3 nodes → prependContext
 
 afterTurn hook (async, non-blocking)
-  ├─ Input-layer noise filter
-  ├─ extract(): LLM extract triples → gm_nodes + gm_edges
-  ├─ recordBeliefSignal() + updateNodeBelief(): process beliefUpdates
-  ├─ syncEmbed(): async embedding write (non-blocking)
-  └─ Periodic (every N turns): topic induction + maintenance
+  ├─ save new messages
+  ├─ runTurnExtract(): LLM extraction → gm_nodes + gm_edges
+  ├─ beliefUpdates → gm_belief_signals + node belief score updates
+  ├─ syncEmbed(): async embedding writes; queues nodes until embedding is ready
+  ├─ advisorySuggestions → optional background memory-advisor subagent
+  └─ every compactTurnCount turns: topic induction + session induction + lightweight global PageRank
 
 session_end hook
-  ├─ finalize(): EVENT → SKILL promotion, 补充遗漏关系, 标记失效节点
+  ├─ finalize(): promote EVENT→SKILL, add missed edges, invalidate obsolete nodes
   ├─ topic induction
-  ├─ runMaintenance(): dedup → PageRank → community detection
-  └─ recordBeliefSignal(): session task_completed for all session nodes
+  ├─ session induction: create/update SESSION node for the session
+  ├─ runMaintenance(): retention cleanup → vector dedup → global PageRank
+  └─ task_completed belief signals for session nodes
 ```
 
-### ContextEngine interface
+### ContextEngine surface
 
-Implements OpenClaw's `ContextEngine` interface:
+| Method | Current behavior |
+|--------|------------------|
+| `bootstrap` | Lightweight no-op init |
+| `ingest` | Store messages in `gm_messages`; no LLM call |
+| `assemble` | Pass-through; KG injection is handled by `before_prompt_build` |
+| `compact` | Fallback extraction path; normal extraction is in `afterTurn` |
+| `afterTurn` | Main async extraction + periodic topic/session/lightweight maintenance |
+| `prepareSubagentSpawn` | Share current recalled graph context with subagents |
+| `onSubagentEnded` | Cleanup subagent session state |
+| `dispose` | Clear in-memory session state |
 
-| Method | Description |
-|--------|-------------|
-| `bootstrap` | Lightweight session init |
-| `ingest` | Save messages to gm_messages (sync, zero LLM) |
-| `assemble` | Pass-through (KG rendering moved to before_prompt_build) |
-| `compact` | Backup extraction path with noise filter + beliefUpdates processing |
-| `afterTurn` | Main extraction path (async) |
-| `prepareSubagentSpawn` | Share recalled context with subagent |
-| `onSubagentEnded` | Cleanup subagent session data |
-| `dispose` | Clear session state |
-
-### Hooks
-
-| Hook | When | Purpose |
-|------|-------|---------|
-| `before_prompt_build` | Before each LLM call | Recall + split KG XML into stable appendSystemContext and dynamic prependContext |
-| `session_end` | Session terminates | Finalize + topic induction + maintenance + belief updates (weight=0.3) |
-
-## Features
-
-### Noise filter
-
-**Input-layer** (`src/extractor/noise-filter.ts`): Filters messages before LLM extraction
-- Agent denial patterns ("I don't have any information")
-- Meta-question patterns ("do you remember")
-- Strict boilerplate (greetings, HEARTBEAT)
-- Short boilerplate (≤10 chars)
+## Current features
 
 ### Node types
 
 | Type | Meaning |
 |------|---------|
-| `TASK` | User-requested task with goal, steps, result |
-| `SKILL` | Reusable skill with trigger, steps, pitfalls |
-| `EVENT` | One-time error with symptom, cause, fix |
-| `KNOWLEDGE` | Domain knowledge with scope + caveats |
-| `STATUS` | Time-sensitive snapshot (never merged, always new with timestamp) |
+| `TASK` | User-requested task with goal, steps, and result |
+| `SKILL` | Reusable procedure with trigger, steps, pitfalls |
+| `EVENT` | One-off incident/error with symptom, cause, fix |
+| `KNOWLEDGE` | Domain knowledge with scope and caveats |
+| `STATUS` | Time-sensitive snapshot; never merged semantically |
+| `TOPIC` | LLM-induced topic node that groups related semantic nodes |
+| `SESSION` | LLM-induced session summary node |
 
-### Confidence (置信度) system
+### Edges
 
-Each node has a `belief` score ∈ [0, 1]:
-- `1.00` = fully trusted (multiple verifications)
-- `0.7~0.99` = trusted, apply directly
-- `0.4~0.69` = reference, verify with caution
-- `0.00~0.39` = low credibility, must verify before applying
+Edges use a flexible schema:
 
-**Signal sources:**
-- **Extract LLM**: `beliefUpdates` in extract results (supported/contradicted)
-- **Session end**: `task_completed` signal for all session nodes (weight=0.3)
-- **gm_record tool**: does not process beliefUpdates (skipped intentionally)
+- `name`: free-form relation name, generated by the LLM or tools (for example `使用`, `解决`, `依赖`, `扩展`, `冲突`, `来自会话`).
+- `description`: one-sentence explanation of the relationship.
 
-### Tiered recall (assemble injection priority)
+Older typed edges are migrated to this flexible schema by migration `m7_edge_flexible`.
 
-| Tier | Priority | Output |
-|------|----------|--------|
-| `scope_hot` | 1 (highest) | Full content — scope 下永久加载，永远可见 |
-| `hot` | 2 | Full content — 每个 session 必定注入 |
-| `active` | 3 | Full content — 本轮对话新产生，compact 后需参考上下文 |
-| `L1` | 4 | Full content (Top 0~15 by combined score) |
-| `L2` | 5 | description only (Top 15~30) |
-| `L3` | 6 | name only (Top 30~45) |
-| `filtered` | 7 | excluded |
+### Recall path
 
-### Dual-path recall
+The generalized/community recall path has been removed. The current recall path is precise-only:
 
-```
+```text
 Query
-  │
-  └─ Precise path (generalized path disabled)
-       vector/FTS5 search → seed nodes
-       → community peer expansion
-       → graph walk (N hops)
-       → Personalized PageRank ranking
-       → Keyword-boosted semantic scoring
+  └─ vector search if embedding is ready, otherwise FTS5/LIKE search
+      ├─ semantic seeds: top ceil(recallMaxNodes / 3)
+      ├─ PageRank candidates: top ceil(recallMaxNodes / 5), used only as graph-expansion anchors
+      ├─ graphWalk(maxDepth = recallMaxDepth): iterative BFS, N means N hops
+      ├─ Personalized PageRank from semantic seeds
+      ├─ combinedScore = semantic × 0.5 + PPR × 0.4 + PageRank × 0.1
+      ├─ access-based decay adjusts combinedScore when decayEnabled !== false
+      └─ tiers: L1 / L2 / L3 / filtered
 ```
 
-### Combined scoring
+Keyword hybrid scoring mixes vector similarity with keyword overlap:
 
-Three-dimension scoring with min-max normalization:
-
-```
-combinedScore = semantic_weight × norm_semantic
-              + ppr_weight × norm_ppr
-              + pagerank_weight × norm_pagerank
+```text
+hybridSemantic = vectorSim × (1 - KEYWORD_WEIGHT + keywordScore × KEYWORD_WEIGHT)
+KEYWORD_WEIGHT = 0.4
 ```
 
-**Keyword hybrid recall**: Semantic score is boosted by keyword overlap:
-```
-hybridSemantic = vectorSim × (1 + keywordScore × KEYWORD_WEIGHT)
-```
-Where `keywordScore` = log-TF weighted overlap between query keywords and node text (name + description + content[0:200]).
+`graphWalk(maxDepth=N)` now means "walk N hops":
 
-Default weights: α=0.5 (semantic), β=0.3 (PPR), γ=0.2 (PageRank), KEYWORD_WEIGHT=0.4.
+- `maxDepth=0`: only seed nodes
+- `maxDepth=1`: seed + one-hop neighbors
+- `maxDepth=2`: seed + one-hop + two-hop neighbors
 
-### Topic induction
+### Tiered context injection
 
-Periodic topic induction runs via `compactTurnCount` and at `session_end`. It:
-1. Takes session nodes as `sessionNodes`
-2. Cross-session recall to find related nodes
-3. Forms a local subgraph
-4. LLM induces `TOPIC` nodes with:
-   - `semantic → TOPIC` edges (node belongs to topic)
-   - `TOPIC ↔ TOPIC` edges (topic relationships)
+| Tier | Injection/rendering behavior |
+|------|------------------------------|
+| `scope_hot` | Stable layer; full description + content; rendered for sessions bound to matching scope |
+| `hot` | Stable layer; full description + content; rendered in every session |
+| `active` | Stable layer after compaction; current-session nodes that must remain visible |
+| `L1` | Dynamic layer; full description + content |
+| `L2` | Dynamic layer; description only |
+| `L3` | Dynamic layer; name only |
+| `filtered` | Not injected |
 
-`gm_induce_topics(name)` can also be called manually.
+Stable context is appended to system context; dynamic context is prepended as turn context. `debugContextPreview` or `GM_DEBUG_CONTEXT_PREVIEW=1` logs context previews.
 
-### Edge types
+### Belief/confidence system
 
-Edges are free-form — the LLM generates the `name` freely (e.g., "使用", "解决", "依赖", "扩展", "冲突"). Each edge has a `description` (one-sentence relationship description).
+Each node can have a `belief` score in `[0, 1]`.
 
-## Agent tools (17 total)
+Signal sources:
+
+- Extractor `beliefUpdates` for recalled nodes: `supported` or `contradicted` with weight `0.5~2.0`.
+- `session_end`: `task_completed` signal for session nodes with low weight.
+- Manual tools such as `gm_record` store knowledge but intentionally do not process belief updates.
+
+The stats tool reports average/high/low belief and signal counts.
+
+### Access-based decay
+
+Recall results are adjusted by a Weibull-style access-based decay engine:
+
+- `access_count` and `last_accessed_at` are recorded for L1 recalled nodes.
+- Node type controls intrinsic stability: SKILL/TOPIC decay slowest, STATUS/TASK decay fastest.
+- `decayEnabled=false` disables the adjustment.
+
+### Topic and session induction
+
+- Topic induction creates/updates `TOPIC` nodes and `semantic → TOPIC` / `TOPIC ↔ TOPIC` edges.
+- Session induction creates/updates `SESSION` nodes summarizing a session and links session-created nodes with `来自会话` edges.
+- Periodic induction runs every `compactTurnCount` turns; both also run at `session_end`.
+- `gm_induce_topics(name)` manually induces topics around a specific semantic node.
+
+### Maintenance and retention
+
+`runMaintenance()` currently does:
+
+1. **Retention cleanup** of inactive session history (`gm_messages`, then remaining budget for `gm_recalled`).
+2. **Vector dedup** using cosine similarity and `dedupThreshold`.
+3. **Global PageRank** recomputation.
+
+Retention details:
+
+- Enabled by default.
+- Protected sessions are `running` sessions plus sessions updated within the retention cutoff.
+- Default retention is 30 days, max 20,000 deleted rows per maintenance run.
+- `VACUUM` is never automatic unless `retention.vacuum=true`; default is false.
+
+Community detection/runtime code has been removed. The legacy `gm_nodes.community_id` column and `gm_communities` table remain only for schema compatibility.
+
+### gm_dream and gm_explore
+
+- `gm_explore(nodeName, maxNodes?)`: explores a node-centered subgraph using semantic neighbors + graph walk; returns L1-oriented subgraph text for LLM use.
+- `gm_dream()`: samples one seed from recently recalled nodes and one seed from recently created nodes using exponential time decay, explores both subgraphs, and returns material for maintenance/reflection.
+
+## Agent tools (22 total)
 
 | Tool | Description |
 |------|-------------|
-| `gm_search(query)` | Semantic search for relevant nodes |
-| `gm_record(content, flags?)` | Manually record knowledge (no beliefUpdates); `flags=["hot"]` marks as hot |
-| `gm_stats()` | Graph stats: nodes, edges, communities, PageRank top, belief stats |
-| `gm_get_hots()` | Get all hot nodes |
-| `gm_maintain()` | Manual trigger: dedup → PageRank → community detection |
-| `gm_embedding(name, force?)` | Recompute embedding for one node |
-| `gm_reembedding_all(confirm, force?)` | Recompute all embeddings; requires `confirm=true` |
-| `gm_remove(name, reason?)` | Soft-delete node (marks deprecated) |
-| `gm_induce_topics(name)` | Topic induction centered on a node |
-| `gm_get_node(name)` | Full node info: description, content, belief, flags, edges |
-| `gm_edit_node(name, description?, content?)` | Edit node; auto re-embeds |
-| `gm_set_hot(name)` | Add "hot" flag (append mode) |
-| `gm_set_scope_hot(name, scope)` | Add "scope_hot:scope" flag (append mode) |
-| `gm_get_flags(name)` | Get all flags for a node |
-| `gm_set_flags(name, flags)` | Set (replace) flags |
-| `gm_set_scope(scopes)` | Bind scopes to current session |
-| `gm_get_scope()` | Get scopes bound to current session |
-| `gm_list_scopes()` | List all scopes with session counts |
-
-### Scope hot
-
-Scopes bind context to sessions. Set scopes via `gm_set_scope`. Nodes with matching `scope_hot:scope` flags render before regular `hot` nodes in assemble.
-
-## Installation
-
-### Prerequisites
-
-- OpenClaw (v2026.3.x+)
-- Node.js 22+
-
-### Step 1: Install plugin
-
-```bash
-pnpm openclaw plugins install graph-memory
-```
-
-### Step 2: Activate context engine (critical)
-
-Edit `~/.openclaw/openclaw.json`:
-
-```json
-{
-  "plugins": {
-    "slots": { "contextEngine": "graph-memory" },
-    "entries": {
-      "graph-memory": {
-        "enabled": true,
-        "config": {
-          "llm": {
-            "apiKey": "your-key",
-            "baseURL": "https://api.openai.com/v1",
-            "model": "gpt-4o-mini"
-          },
-          "embedding": {
-            "apiKey": "your-key",
-            "baseURL": "https://api.openai.com/v1",
-            "model": "text-embedding-3-small",
-            "dimensions": 512
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-### Step 3: Restart and verify
-
-```bash
-pnpm openclaw gateway --verbose
-# Should see:
-# [graph-memory] ready | db=~/.openclaw/graph-memory.db | provider=... | model=...
-# [graph-memory] vector search ready
-```
+| `gm_search(query)` | Recall relevant nodes and edges from the graph |
+| `gm_record(content, flags?)` | Extract and record manual knowledge; optional `hot` / `scope_hot:<scope>` flags |
+| `gm_stats()` | Node/edge/hot/PageRank/embedding/belief stats |
+| `gm_maintain()` | Manual retention cleanup + dedup + global PageRank |
+| `gm_get_hots()` | List all global hot nodes |
+| `gm_get_scope_hots(scope)` | List scope-hot nodes for one scope |
+| `gm_set_flags(name, flags)` | Replace a node's flags |
+| `gm_get_node(name)` | Get full node data plus incoming/outgoing edges |
+| `gm_edit_node(name, description?, content?, type?)` | Overwrite node fields and re-embed |
+| `gm_set_hot(name)` | Add global `hot` flag |
+| `gm_set_scope_hot(name, scope)` | Add `scope_hot:<scope>` flag |
+| `gm_get_flags(name)` | Show a node's flags |
+| `gm_set_scope(scopes)` | Bind current session to scopes; `[]` clears |
+| `gm_get_scope()` | Show current session scopes |
+| `gm_list_scopes()` | List scopes and bound session counts |
+| `gm_remove(name, reason?)` | Soft-delete a node and remove its incident edges |
+| `gm_merge(keepName, mergeName)` | Manually merge two nodes and migrate edges |
+| `gm_embedding(name, force?)` | Recompute one node embedding |
+| `gm_reembedding_all(confirm, force?)` | Recompute embeddings for all active nodes; requires `confirm=true` |
+| `gm_induce_topics(name)` | Induce topics centered on a node |
+| `gm_explore(nodeName, maxNodes?)` | Explore a node-centered subgraph |
+| `gm_dream()` | Random decayed exploration from recent recalled/created memory pools |
 
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `dbPath` | `~/.openclaw/graph-memory.db` | SQLite database path |
-| `compactTurnCount` | `6` | Turns between maintenance + topic induction cycles |
-| `recallMaxNodes` | `45` | Max nodes injected per recall |
-| `recallMaxDepth` | `2` | Graph traversal hops |
-| `freshTailCount` | `10` | Fresh tail nodes always included in assemble |
-| `dedupThreshold` | `0.90` | Cosine similarity for dedup |
-| `pagerankDamping` | `0.85` | PPR damping factor |
-| `pagerankIterations` | `20` | PPR iteration count |
-| `extractionRecentTurns` | `3` | Recent session turns injected into extract prompt |
+| `compactTurnCount` | `6` | Periodic afterTurn induction/lightweight maintenance interval |
+| `recallMaxNodes` | `15` | Tiering cutoff: roughly 1/3 L1, 1/3 L2, 1/3 L3 |
+| `recallMaxDepth` | `2` | Graph walk hops from seed/expansion nodes |
+| `freshTailCount` | `10` | Deprecated/unused compatibility field |
+| `dedupThreshold` | `0.90` | Cosine similarity threshold for vector dedup |
+| `pagerankDamping` | `0.85` | PageRank/PPR damping factor |
+| `pagerankIterations` | `20` | PageRank/PPR iteration count |
+| `extractionRecentTurns` | `3` | Recent user-bounded turns included in extraction prompt |
+| `decayEnabled` | `true` | Enable access-based decay scoring |
+| `debugContextPreview` | `false` | Log stable/dynamic injected context previews |
+| `retention.enabled` | `true` | Enable inactive session history cleanup during maintenance |
+| `retention.retentionDays` | `30` | Keep inactive session history for this many days |
+| `retention.maxDeletePerRun` | `20000` | Shared deletion budget for `gm_messages` then `gm_recalled` |
+| `retention.vacuum` | `false` | Run SQLite `VACUUM` after cleanup; disabled by default |
 
-### Supported embedding providers
+### Embedding providers
 
-| Provider | baseURL | Model |
-|----------|---------|-------|
+Embeddings are OpenAI-compatible HTTP calls. Known working targets include:
+
+| Provider | baseURL | Example model |
+|----------|---------|---------------|
 | OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` |
 | DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4` |
 | MiniMax | `https://api.minimax.chat/v1` | `embo-01` |
 | Ollama | `http://localhost:11434/v1` | `nomic-embed-text` |
 
-## Development
-
-```bash
-git clone https://github.com/adoresever/graph-memory.git
-cd graph-memory
-npm install
-npx vitest run   # all tests pass
-```
-
-### Project structure
-
-```
-graph-memory/
-├── index.ts                     # Plugin entry point + all hooks + 17 tools
-├── src/
-│   ├── types.ts                 # Type definitions + GmConfig
-│   ├── db.ts                    # DB singleton + migrations
-│   ├── store.ts                 # SQLite CRUD (nodes/edges/messages/vectors)
-│   ├── engine/
-│   │   ├── llm.ts              # LLM (fetch-based, SDK-free)
-│   │   ├── embed.ts             # Embedding (fetch-based)
-│   │   └── induction.ts         # Topic induction engine
-│   ├── extractor/
-│   │   ├── extract.ts          # Knowledge extraction + beliefUpdates
-│   │   └── noise-filter.ts     # Input-layer noise filter (denial/meta/boilerplate)
-│   ├── format/
-│   │   └── assemble.ts         # Context assembly + KG XML rendering + system prompt
-│   ├── recaller/
-│   │   ├── recall.ts           # Recall (precise only) + combined scoring + keyword hybrid
-│   │   └── score.ts            # Combined scoring functions
-│   └── graph/
-│       ├── pagerank.ts          # Personalized PageRank + global PageRank
-│       ├── community.ts         # Community detection + summaries
-│       ├── dedup.ts            # Vector-based dedup
-│       └── maintenance.ts       # Orchestrates dedup → PR → community
-└── test/                       # vitest tests
-```
+Without embedding config, graph-memory falls back to FTS5/LIKE search.
 
 ## Database
 
@@ -304,24 +241,78 @@ SQLite WAL mode at `~/.openclaw/graph-memory.db`.
 
 | Table | Purpose |
 |-------|---------|
-| `gm_nodes` | Knowledge nodes with confidence, pagerank, community_id, flags |
-| `gm_edges` | Typed relationships |
+| `gm_nodes` | Knowledge nodes; includes type, status, belief, access tracking, flags, pagerank, legacy `community_id` |
+| `gm_edges` | Flexible relationship edges: `from_id`, `to_id`, `name`, `description` |
 | `gm_messages` | Raw conversation messages |
-| `gm_signals` | Signal records (tool_error, skill_invoked, etc.) |
-| `gm_vectors` | Embedding vectors |
-| `gm_communities` | Community summaries + embeddings |
+| `gm_signals` | Legacy/general signal records |
+| `gm_nodes_fts` | FTS5 table for node name/description/content |
+| `gm_vectors` | Embedding vectors keyed by node id |
+| `gm_communities` | Legacy compatibility table; runtime no longer uses it |
 | `gm_scopes` | Session ↔ scope bindings |
-| `gm_recalled` | Per-session recalled node cache |
-| `gm_belief_signals` | Belief evidence records (verdict, weight, reason) |
-| `gm_recall_feedback` | Recall feedback signals |
+| `gm_recalled` | Per-session recalled node records used by retention and dream |
+| `gm_belief_signals` | Belief evidence records |
 | `_migrations` | Migration tracker |
 
-### gm_nodes flags
+### Flags
 
-Flags stored as JSON array strings:
-- `"hot"` — always rendered at assemble
-- `"scope_hot:xxx"` — rendered when session has scope `xxx` bound
-- Any custom string
+Flags are stored as JSON array strings on `gm_nodes.flags`:
+
+- `hot` — always rendered in stable context.
+- `scope_hot:<scope>` — rendered when the current session is bound to `<scope>`.
+- Any other string can be stored, but only the above two have built-in rendering semantics.
+
+## Development
+
+```bash
+npm install
+npm run build
+npm test
+```
+
+Default `npm test` skips real-DB dream/debug tests that require `/tmp/gm-test.db`. To run them explicitly:
+
+```bash
+RUN_GM_REAL_DB_TESTS=1 npm test
+```
+
+## Project structure
+
+```text
+graph-memory/
+├── index.ts                    # Plugin entry, hooks, tools
+├── openclaw.plugin.json        # Plugin metadata/config schema
+├── src/
+│   ├── types.ts                # Core types and DEFAULT_CONFIG
+│   ├── engine/
+│   │   ├── llm.ts              # LLM wrapper
+│   │   ├── embed.ts            # Embedding wrapper
+│   │   ├── induction.ts        # Topic/session induction
+│   │   └── decay.ts            # Access-based decay engine
+│   ├── extractor/
+│   │   ├── extract.ts          # LLM extraction/finalization parsing
+│   │   └── noise-filter.ts     # Input noise filter
+│   ├── format/
+│   │   ├── assemble.ts         # Stable/dynamic KG XML rendering
+│   │   └── transcript-repair.ts
+│   ├── recaller/
+│   │   ├── recall.ts           # Precise recall, graphWalk, PPR, decay
+│   │   └── score.ts            # Combined score helpers
+│   ├── graph/
+│   │   ├── pagerank.ts         # Global PageRank and personalized PPR
+│   │   ├── dedup.ts            # Vector dedup and merge orchestration
+│   │   └── maintenance.ts      # Retention + dedup + PageRank
+│   └── store/
+│       ├── db.ts               # SQLite migrations/singleton
+│       └── store.ts            # CRUD/search/vector/scope/retention helpers
+└── test/                       # Vitest tests
+```
+
+## Notes for operators
+
+- Do not expose internal table names as user config.
+- Do not hardcode the OpenClaw `sessions.json` path; use the plugin session store API.
+- Do not auto-VACUUM unless explicitly configured.
+- Runtime community detection is intentionally removed; do not reintroduce it unless the feature is redesigned.
 
 ## License
 

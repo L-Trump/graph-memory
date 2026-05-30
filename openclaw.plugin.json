@@ -2,7 +2,7 @@
   "id": "graph-memory",
   "name": "Graph Memory",
   "version": "3.0.0",
-  "description": "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类+向量去重自动维护",
+  "description": "知识图谱记忆引擎：从对话提取结构化节点与关系，支持 embedding/FTS5 精确召回、图遍历、PPR、访问衰减、Hot/Scope Hot、主题归纳、向量去重与 retention 维护",
   "contracts": {
     "tools": [
       "gm_search",
@@ -39,13 +39,13 @@
       },
       "compactTurnCount": {
         "type": "integer",
-        "default": 7,
-        "description": "每隔多少轮检查信号触发知识提取"
+        "default": 6,
+        "description": "每隔多少轮执行周期性 topic/session 归纳和轻量维护"
       },
       "recallMaxNodes": {
         "type": "integer",
-        "default": 6,
-        "description": "跨对话召回最多注入几个节点"
+        "default": 15,
+        "description": "召回分层的最大节点数，约按 L1/L2/L3 三层切分"
       },
       "recallMaxDepth": {
         "type": "integer",
@@ -59,7 +59,7 @@
       },
       "dedupThreshold": {
         "type": "number",
-        "default": 0.90,
+        "default": 0.9,
         "description": "向量去重阈值：余弦相似度超过此值视为重复节点 (0-1)"
       },
       "pagerankDamping": {
@@ -76,19 +76,81 @@
         "type": "object",
         "description": "可选：向量搜索配置。配了用语义搜索+去重，没配用 FTS5 全文搜索",
         "properties": {
-          "apiKey": { "type": "string", "description": "Embedding API Key" },
-          "baseURL": { "type": "string", "default": "https://api.openai.com/v1", "description": "API 地址" },
-          "model": { "type": "string", "default": "text-embedding-3-small", "description": "模型名" },
-          "dimensions": { "type": "integer", "default": 512, "description": "向量维度" }
+          "apiKey": {
+            "type": "string",
+            "description": "Embedding API Key"
+          },
+          "baseURL": {
+            "type": "string",
+            "default": "https://api.openai.com/v1",
+            "description": "API 地址"
+          },
+          "model": {
+            "type": "string",
+            "default": "text-embedding-3-small",
+            "description": "模型名"
+          },
+          "dimensions": {
+            "type": "integer",
+            "default": 512,
+            "description": "向量维度"
+          }
         }
       },
       "llm": {
         "type": "object",
         "description": "可选：LLM 配置。不配则用 OpenClaw 全局 provider",
         "properties": {
-          "apiKey": { "type": "string" },
-          "baseURL": { "type": "string" },
-          "model": { "type": "string" }
+          "apiKey": {
+            "type": "string"
+          },
+          "baseURL": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          }
+        }
+      },
+      "extractionRecentTurns": {
+        "type": "integer",
+        "default": 3,
+        "description": "提取时传给 LLM 的最近用户轮次数（以 user 消息为边界）"
+      },
+      "decayEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否启用基于访问频率和节点类型的召回衰减评分"
+      },
+      "debugContextPreview": {
+        "type": "boolean",
+        "default": false,
+        "description": "是否在日志中输出 stable/dynamic 注入上下文预览"
+      },
+      "retention": {
+        "type": "object",
+        "description": "inactive session 历史记录清理配置；维护时清理 gm_messages 和 gm_recalled",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否启用 retention cleanup"
+          },
+          "retentionDays": {
+            "type": "integer",
+            "default": 30,
+            "description": "非 active session 历史保留天数"
+          },
+          "maxDeletePerRun": {
+            "type": "integer",
+            "default": 20000,
+            "description": "单次维护最多删除行数，先 messages 后 recalled"
+          },
+          "vacuum": {
+            "type": "boolean",
+            "default": false,
+            "description": "清理后是否执行 SQLite VACUUM；默认关闭"
+          }
         }
       }
     }

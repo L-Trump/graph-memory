@@ -1,124 +1,162 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code / coding agents when working in this repository.
 
-## 项目概述
+## Project overview
 
-graph-memory 是 OpenClaw 的知识图谱上下文引擎插件，从对话中自动提取节点/边，支持跨对话召回（向量+FTS5+PageRank）、社区检测和向量去重。
+graph-memory is an OpenClaw ContextEngine plugin. It extracts knowledge graph nodes/edges from conversations, stores them in SQLite, recalls relevant graph context across sessions, and injects stable/dynamic KG XML before model calls.
 
-## 开发命令
+Current runtime features:
+
+- Precise recall via embedding or FTS5/LIKE search, iterative graph walk, Personalized PageRank, combined scoring, and access-based decay.
+- Stable context: `scope_hot`, `hot`, compacted active nodes.
+- Dynamic context: recalled `L1` / `L2` / `L3` nodes.
+- Topic induction and session induction.
+- Belief/confidence scoring from `beliefUpdates` and session signals.
+- Retention cleanup for inactive `gm_messages` / `gm_recalled` rows.
+- Vector dedup and global PageRank maintenance.
+
+Community runtime code has been removed. Only legacy schema compatibility remains (`gm_nodes.community_id`, `gm_communities`). Do not reintroduce community detection unless explicitly redesigning the feature.
+
+## Development commands
 
 ```bash
-npm test              # 运行所有测试
-npm run test:watch   # 监听模式
-npm run build         # 编译 TypeScript
-npx vitest run src/xxx.test.ts   # 运行单个测试文件
-npx vitest run --grep "recall"   # 按测试名运行
+npm run build                    # bundle TypeScript with tsup
+npm test                         # run default Vitest suite
+npm run test:watch               # watch mode
+npx vitest run test/foo.test.ts   # run one test file
 ```
 
-## 架构
+Default `npm test` skips real-DB dream/debug tests that depend on `/tmp/gm-test.db`. To run those explicitly:
 
-### 核心模块
-
-- **index.ts** — 插件主入口，注册 ContextEngine、工具（gm_*）和生命周期钩子
-- **src/types.ts** — 核心类型：GmNode、GmEdge、GmConfig、Signal、RecallResult
-- **src/score.ts** — 组合评分：semantic(α) + PPR(β) + PageRank(γ) 三维归一化加权
-
-### 存储层 (src/store/)
-
-- **db.ts** — SQLite 初始化，创建 `gm_nodes` / `gm_edges` / `gm_messages` 表
-- **store.ts** — 节点/边的 CRUD、FTS5 搜索、向量存储
-
-### 召回 (src/recaller/recall.ts)
-
-**recallV2 双路径并行召回**：
-1. 精确路径：向量/FTS5 搜索 → 社区扩展 → 图遍历 → PPR 排序
-2. 泛化路径：社区摘要 embedding → 匹配社区成员 → PPR 排序
-
-**四级 Tier**：L1（top 15, 完整 content）、L2（15-30, description）、L3（30-45, name）、filtered
-
-### 图算法 (src/graph/)
-
-- **pagerank.ts** — 全局 PageRank（0-1 归一化, damping 0.85）+ 个性化 PPR（recall 时实时计算）
-- **community.ts** — Label Propagation 社区检测（无向边，O edges），写回 `gm_nodes.community_id`
-- **dedup.ts** — 向量余弦相似度去重
-- **maintenance.ts** — session_end 时运行去重+社区+PageRank+摘要
-
-### 提取 (src/extractor/extract.ts)
-
-调用 LLM 从对话中提取三元组。知识图谱以三级格式（name/type/description + content）传给 LLM 作为上下文。
-
-### 格式 (src/format/assemble.ts)
-
-assembleStableContext / assembleDynamicContext 将节点/边渲染为分层上下文：稳定层进入 appendSystemContext，动态 recall 层进入 prependContext。
-
-### 引擎 (src/engine/)
-
-- **llm.ts** — LLM 调用封装（OpenAI 兼容）
-- **embed.ts** — Embedding 向量计算（fetch 原生实现，兼容所有 OpenAI 兼容端点）
-
-### 关键数据流
-
-```
-对话消息
-  → ingestMessage（入库 gm_messages）
-  → afterTurn → runTurnExtract → extractor.extract（LLM 提取三元组）
-  → upsertNode / upsertEdge（存库 + 同步 embedding）
-  → 每 N 轮 → detectCommunities + computeGlobalPageRank
-
-recall（before_prompt_build）
-  → recaller.recallV2（双路径 + 组合评分 + 四级分级）
-  → TieredNode[] + GmEdge[] + pprScores
-
-assemble
-  → assembleStableContext（hot / scope_hot / compactActiveNodes → appendSystemContext）
-  → assembleDynamicContext（每轮 recall L1/L2/L3 → prependContext）
-  → 返回 { appendSystemContext, prependContext }
+```bash
+RUN_GM_REAL_DB_TESTS=1 npm test
 ```
 
-### 插件生命周期
+## Core files
 
-- `register()` — 初始化 db/llm/recaller/extractor，注册 ContextEngine 和工具
-- `before_prompt_build` — 调用 recallV2 填充召回结果到 session 内存
-- `afterTurn` — 消息入库 + 每轮提取 + 周期性（图维护）
-- `session_end` — finalize 提升技能 + 全量维护
-- `dispose` — 清理内存状态
+- `index.ts` — plugin entry; ContextEngine implementation; hooks; all `gm_*` tools.
+- `src/types.ts` — `GmNode`, `GmEdge`, config, extraction/finalize/recall result types.
+- `src/store/db.ts` — SQLite singleton and idempotent migrations.
+- `src/store/store.ts` — node/edge/message/vector/search/scope/retention helpers.
+- `src/recaller/recall.ts` — precise recall pipeline, graph expansion, PPR, tiering, decay.
+- `src/graph/pagerank.ts` — global PageRank and Personalized PageRank.
+- `src/graph/dedup.ts` — vector duplicate detection and merge orchestration.
+- `src/graph/maintenance.ts` — retention cleanup → dedup → PageRank.
+- `src/engine/induction.ts` — topic and session induction.
+- `src/engine/decay.ts` — access-based decay scoring.
+- `src/extractor/extract.ts` — LLM extraction/finalization parsing.
+- `src/extractor/noise-filter.ts` — input-layer noise filtering.
+- `src/format/assemble.ts` — stable/dynamic KG XML rendering and KG system guidance.
 
-### 数据库 Schema
+## Runtime data flow
 
-- `gm_nodes` — id, type, name, description, content, status, validated_count, source_sessions, community_id, pagerank, belief, success_count, failure_count, last_signal_at, created_at, updated_at
-- `gm_edges` — id, from_id, to_id, type, instruction, condition, session_id, created_at
-- `gm_messages` — id, session_id, turn_index, role, content, extracted, created_at
-- `gm_signals` — id, session_id, turn_index, type, data, processed, created_at
-- `gm_nodes_fts` — FTS5 虚拟表（name, description, content）
-- `gm_vectors` — node_id, content_hash, embedding（BLOB）
-- `gm_communities` — id, summary, node_count, embedding, created_at, updated_at
-- `gm_scopes` — scope_name, session_id
-- `gm_recalled` — session_id, turn_index, recalled_ids, ...
-- `gm_belief_signals` — id, session_id, node_id, signal, weight, at
+```text
+incoming message
+  → ingest(): save gm_messages
 
-### 工具函数
+before_prompt_build
+  → filterNoiseMessages
+  → recaller.recallV2
+  → saveRecalledNodes
+  → assembleStableContext + assembleDynamicContext
+  → appendSystemContext + prependContext
 
-- `gm_search` — 搜索图谱（recallV2）
-- `gm_record` — 手动记录记忆
-- `gm_stats` — 图谱统计
-- `gm_maintain` — 手动触发维护
-- `gm_get_hots` — 获取 hot 节点
-- `gm_set_flags` — 设置节点 flags
-- `gm_get_node` — 获取节点详情
-- `gm_edit_node` — 编辑节点
-- `gm_set_hot` — 标记节点为 hot
-- `gm_set_scope_hot` — 设置 scope 级别的 hot
-- `gm_get_flags` — 获取节点 flags
-- `gm_set_scope` — 设置 scope
-- `gm_get_scope` — 获取 scope
-- `gm_list_scopes` — 列出所有 scope
-- `gm_remove` — 软删除节点
-- `gm_embedding` — 计算单条 embedding
-- `gm_reembedding_all` — 重新嵌入所有节点
-- `gm_induce_topics` — 归纳主题
+afterTurn
+  → save new messages
+  → runTurnExtract
+  → upsertNode/upsertEdge
+  → beliefUpdates handling
+  → async embedding
+  → optional advisory subagent
+  → every compactTurnCount turns: topic induction + session induction + global PageRank
 
-### 环境变量
+session_end
+  → finalize
+  → topic induction
+  → session induction
+  → runMaintenance(retention + dedup + PageRank)
+  → task_completed belief signals
+```
 
-- `GM_DEBUG=1` — 开启 recall/embed 调试日志
-- `OPENCLAW_PROVIDER` — LLM provider（默认 anthropic）
+## Recall implementation notes
+
+Current recall is precise-only. The generalized/community path is disabled/removed.
+
+Pipeline:
+
+1. If embedding is ready, vector search provides semantic seeds; otherwise FTS5/LIKE search is used.
+2. If vector seeds are too few, FTS5 supplements them.
+3. Global PageRank top nodes are added only as graph-expansion anchors, not as PPR seeds.
+4. `graphWalk(db, seeds, maxDepth)` uses iterative BFS with one `from_id IN (...) OR to_id IN (...)` SQL query per layer.
+5. `maxDepth=N` means walk exactly N hops (`1` includes one-hop neighbors).
+6. Personalized PageRank starts from semantic seeds.
+7. Combined score = semantic `0.5` + PPR `0.4` + global PageRank `0.1`.
+8. Access-based decay adjusts combined score unless `decayEnabled === false`.
+9. Tier assignment uses `recallMaxNodes`: top third L1, second third L2, third third L3, rest filtered.
+
+## Maintenance and retention
+
+`runMaintenance(db, cfg, opts)` currently performs:
+
+1. Retention cleanup, only when `protectedSessionIds` are provided.
+   - Protected session rule: running sessions OR sessions updated within cutoff.
+   - Deletes from `gm_messages` first, then uses remaining `maxDeletePerRun` budget for `gm_recalled`.
+   - `VACUUM` only runs when `retention.vacuum === true`.
+2. Async vector dedup.
+3. Global PageRank recomputation.
+
+Do not expose internal table names as user-facing config. Do not hardcode `sessions.json`; use OpenClaw session store APIs.
+
+## Database schema summary
+
+- `gm_nodes`: knowledge nodes; supports `TASK`, `SKILL`, `EVENT`, `KNOWLEDGE`, `STATUS`, `TOPIC`, `SESSION`; includes flags, belief, access tracking, pagerank, and legacy `community_id`.
+- `gm_edges`: flexible `name` + `description` relationship edges.
+- `gm_messages`: raw conversation messages.
+- `gm_signals`: generic/legacy signal table.
+- `gm_nodes_fts`: FTS5 virtual table for name/description/content.
+- `gm_vectors`: embeddings by node id.
+- `gm_communities`: legacy compatibility table; runtime no longer uses it.
+- `gm_scopes`: scope/session bindings.
+- `gm_recalled`: recalled node records for retention and dream pools.
+- `gm_belief_signals`: belief evidence records.
+- `_migrations`: migration tracker.
+
+## Tools registered in index.ts
+
+22 tools are currently registered:
+
+- Search/record/stats/maintenance: `gm_search`, `gm_record`, `gm_stats`, `gm_maintain`
+- Hot/scope/flags: `gm_get_hots`, `gm_get_scope_hots`, `gm_set_flags`, `gm_get_flags`, `gm_set_hot`, `gm_set_scope_hot`, `gm_set_scope`, `gm_get_scope`, `gm_list_scopes`
+- Node editing: `gm_get_node`, `gm_edit_node`, `gm_remove`, `gm_merge`
+- Embeddings: `gm_embedding`, `gm_reembedding_all`
+- Induction/exploration: `gm_induce_topics`, `gm_explore`, `gm_dream`
+
+## Configuration defaults
+
+See `src/types.ts` for the source of truth.
+
+Important defaults:
+
+- `compactTurnCount = 6`
+- `recallMaxNodes = 15`
+- `recallMaxDepth = 2`
+- `dedupThreshold = 0.90`
+- `pagerankDamping = 0.85`
+- `pagerankIterations = 20`
+- `extractionRecentTurns = 3`
+- `decayEnabled = true`
+- `debugContextPreview = false`
+- `retention = { enabled: true, retentionDays: 30, maxDeletePerRun: 20000, vacuum: false }`
+- `freshTailCount` remains as a deprecated/unused compatibility field.
+
+## Testing notes
+
+- Keep tests deterministic and isolated with `createTestDb()` where possible.
+- Real production-DB tests should be guarded behind `RUN_GM_REAL_DB_TESTS=1`.
+- `graphWalk(maxDepth)` tests should assert hop semantics, not layer-count semantics.
+- Async APIs such as `dedup()` and `detectDuplicates()` must be awaited.
+
+## Safety / development boundary for this user environment
+
+For this local development setup, code changes should be made in `/home/ltrump/Codes/graph-memory/` only unless explicitly instructed otherwise. Do not modify the running extension copy under `~/.openclaw/extensions/graph-memory/`, do not restart Gateway, and do not sync Codes → Extensions without explicit authorization.
