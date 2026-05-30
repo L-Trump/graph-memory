@@ -668,8 +668,7 @@ ${suggestionsText}
           api.logger.info(
             `[graph-memory] bpb inject split: stable ~${stable.tokens} tok, dynamic ~${dynamic.tokens} tok` +
             (scopeHotNodes.length > 0 ? `, scope_hot=${scopeHotNodes.length}` : "") +
-            (activeNodes.length > 0 ? `, compact_active=${activeNodes.length}` : "") +
-            (dynamic.episodicTokens > 0 ? `, episodic ~${dynamic.episodicTokens} tok` : ""),
+            (activeNodes.length > 0 ? `, compact_active=${activeNodes.length}` : ""),
           );
         }
 

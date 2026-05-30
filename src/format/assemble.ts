@@ -25,7 +25,6 @@
 
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import type { GmNode, GmEdge } from "../types.ts";
-import { getEpisodicMessages } from "../store/store.ts";
 import type { GmConfig } from "../types.ts";
 import type { TieredNode, RecallTier } from "../recaller/recall.ts";
 
@@ -178,7 +177,7 @@ export function buildSystemPromptAddition(params: {
     "Below `<knowledge_graph>` is your accumulated experience from past conversations.",
     "It contains structured knowledge — NOT raw conversation history.",
     "",
-    "**注意**：以下被 `<gm_memory>` 标签包裹的内容（`<knowledge_graph>` 和 `<episodic_context>`）均来自记忆系统。",
+    "**注意**：以下被 `<gm_memory>` 标签包裹的 `<knowledge_graph>` 内容来自记忆系统。",
     "",
     "**⚠️ Real-time state takes priority over memory.** For current code, file state, directory structure, system environment, or version numbers — always verify with actual commands. Memory tells you how things were done before, not what is true right now.",
   );
@@ -228,7 +227,6 @@ export function buildSystemPromptAddition(params: {
     "",
     "## 上下文说明",
     "",
-    "- **`<episodic_context>`**：召回节点的来源 session 片段，按时间排列",
     "- **`<knowledge_graph>`**：结构化 KG，tier + confidence（格式见上方说明）",
     "",
     "主动应用召回知识。召回上下文不够时用 `gm_search` 查询，需要记录新知识时用 `gm_record`。",
@@ -246,14 +244,12 @@ export function buildSystemPromptAddition(params: {
 function renderKnowledgeGraph(params: {
   nodes: MergedNode[];
   edges: GmEdge[];
-  includeEpisodic?: boolean;
-  db?: DatabaseSyncInstance;
   logLabel?: string;
-}): { xml: string | null; tokens: number; episodicXml: string; episodicTokens: number; renderedEdges: number; rawEdges: number } {
+}): { xml: string | null; tokens: number; renderedEdges: number; rawEdges: number } {
   const passNodes = params.nodes.filter(n => n.tier !== "filtered");
 
   if (!passNodes.length) {
-    return { xml: null, tokens: 0, episodicXml: "", episodicTokens: 0, renderedEdges: 0, rawEdges: params.edges.length };
+    return { xml: null, tokens: 0, renderedEdges: 0, rawEdges: params.edges.length };
   }
 
   const idToName = new Map<string, string>();
@@ -315,34 +311,9 @@ function renderKnowledgeGraph(params: {
     : "";
   const xml = `<knowledge_graph>\n${nodesXml}${edgesXml}\n</knowledge_graph>`;
 
-  let episodicXml = "";
-  if (params.includeEpisodic && params.db) {
-    const topNodes = passNodes.filter(n => n.tier !== "active").slice(0, 3);
-    const episodicParts: string[] = [];
-
-    for (const node of topNodes) {
-      if (!(node as any).sourceSessions?.length) continue;
-      const recentSessions = (node as any).sourceSessions.slice(-2);
-      const msgs = getEpisodicMessages(params.db, recentSessions, node.updatedAt, 500);
-      if (!msgs.length) continue;
-
-      const lines = msgs.map(m =>
-        `    [${m.role.toUpperCase()}] ${escapeXml(m.text.slice(0, 200))}`
-      ).join("\n");
-      episodicParts.push(`  <trace node="${node.name}">\n${lines}\n  </trace>`);
-    }
-
-    episodicXml = episodicParts.length
-      ? `<episodic_context>\n${episodicParts.join("\n")}\n</episodic_context>`
-      : "";
-  }
-
-  const content = xml + (episodicXml ? "\n\n" + episodicXml : "");
   return {
     xml,
-    tokens: Math.ceil(content.length / CHARS_PER_TOKEN),
-    episodicXml,
-    episodicTokens: Math.ceil(episodicXml.length / CHARS_PER_TOKEN),
+    tokens: Math.ceil(xml.length / CHARS_PER_TOKEN),
     renderedEdges: seenEdgeIds.size,
     rawEdges: params.edges.length,
   };
@@ -409,7 +380,7 @@ export function assembleDynamicContext(
   db: DatabaseSyncInstance,
   cfg: GmConfig | null,
   params: AssembleDynamicParams,
-): { xml: string | null; context: string; tokens: number; episodicXml: string; episodicTokens: number } {
+): { xml: string | null; context: string; tokens: number } {
   const stableNodeIds = params.stableNodeIds ?? new Set<string>();
   const recalledNodes = params.recalledNodes.filter(n => !stableNodeIds.has(n.id));
   const recalledNodeIds = new Set(recalledNodes.map(n => n.id));
@@ -421,17 +392,13 @@ export function assembleDynamicContext(
   const rendered = renderKnowledgeGraph({
     nodes: mergedNodes,
     edges: allEdges,
-    includeEpisodic: true,
-    db,
     logLabel: "dynamic",
   });
 
-  const gmBody = [rendered.xml, rendered.episodicXml].filter(Boolean).join("\n\n");
-  const context = gmBody ? `<gm_memory>\n\n${gmBody}\n\n</gm_memory>` : "";
+  const context = rendered.xml ? `<gm_memory>\n\n${rendered.xml}\n\n</gm_memory>` : "";
 
   console.log(
     `[graph-memory] assemble tokens: dynamicXml=${Math.ceil((rendered.xml ?? "").length / 3)} ` +
-    `episodic=${Math.ceil(rendered.episodicXml.length / 3)} ` +
     `total=${Math.ceil(context.length / 3)}`
   );
 
@@ -439,8 +406,6 @@ export function assembleDynamicContext(
     xml: rendered.xml,
     context,
     tokens: Math.ceil(context.length / CHARS_PER_TOKEN),
-    episodicXml: rendered.episodicXml,
-    episodicTokens: rendered.episodicTokens,
   };
 }
 
@@ -582,40 +547,19 @@ export function assembleContext(
     scopeHotCount,
   });
 
-  // ── 溯源片段：组合评分 top 3 节点 ─────────────────────────
-  const topNodes = passNodes.filter(n => n.tier !== "active").slice(0, 3);
-  const episodicParts: string[] = [];
-
-  for (const node of topNodes) {
-    if (!(node as any).sourceSessions?.length) continue;
-    const recentSessions = (node as any).sourceSessions.slice(-2);
-    const msgs = getEpisodicMessages(db, recentSessions, node.updatedAt, 500);
-    if (!msgs.length) continue;
-
-    const lines = msgs.map(m =>
-      `    [${m.role.toUpperCase()}] ${escapeXml(m.text.slice(0, 200))}`
-    ).join("\n");
-    episodicParts.push(`  <trace node="${node.name}">\n${lines}\n  </trace>`);
-  }
-
-  const episodicXml = episodicParts.length
-    ? `<episodic_context>\n${episodicParts.join("\n")}\n</episodic_context>`
-    : "";
-
-  const fullContent = systemPrompt + "\n\n" + xml + (episodicXml ? "\n\n" + episodicXml : "");
+  const fullContent = systemPrompt + "\n\n" + xml;
   console.log(
     `[graph-memory] assemble tokens: ` +
     `sysPrompt=${Math.ceil(systemPrompt.length / 3)} ` +
     `xml=${Math.ceil(xml.length / 3)} ` +
-    `episodic=${Math.ceil(episodicXml.length / 3)} ` +
     `total=${Math.ceil(fullContent.length / 3)}`
   );
   return {
     xml,
     systemPrompt,
     tokens: Math.ceil(fullContent.length / CHARS_PER_TOKEN),
-    episodicXml,
-    episodicTokens: Math.ceil(episodicXml.length / CHARS_PER_TOKEN),
+    episodicXml: "",
+    episodicTokens: 0,
   };
 }
 
