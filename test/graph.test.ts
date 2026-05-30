@@ -11,7 +11,6 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
 import { personalizedPageRank, computeGlobalPageRank, invalidateGraphCache } from "../src/graph/pagerank.ts";
-import { detectCommunities, getCommunityPeers } from "../src/graph/community.ts";
 import { detectDuplicates, dedup } from "../src/graph/dedup.ts";
 import { runMaintenance } from "../src/graph/maintenance.ts";
 import { saveVector } from "../src/store/store.ts";
@@ -135,68 +134,6 @@ describe("Global PageRank", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// 社区检测
-// ═══════════════════════════════════════════════════════════════
-
-describe("Community Detection", () => {
-  it("连通的节点归入同一社区", () => {
-    // 社区 1：Docker 相关
-    const d1 = insertNode(db, { name: "docker-build" });
-    const d2 = insertNode(db, { name: "docker-push" });
-    const d3 = insertNode(db, { name: "dockerfile-write" });
-    insertEdge(db, { fromId: d1, toId: d2 });
-    insertEdge(db, { fromId: d1, toId: d3 });
-
-    // 社区 2：Python 相关（和 Docker 不连通）
-    const p1 = insertNode(db, { name: "pip-install" });
-    const p2 = insertNode(db, { name: "venv-create" });
-    insertEdge(db, { fromId: p1, toId: p2 });
-
-    const { labels, count } = detectCommunities(db);
-
-    // 至少 2 个社区
-    expect(count).toBeGreaterThanOrEqual(2);
-
-    // Docker 三个节点应该在同一社区
-    const dockerCommunity = labels.get(d1);
-    expect(labels.get(d2)).toBe(dockerCommunity);
-    expect(labels.get(d3)).toBe(dockerCommunity);
-
-    // Python 两个节点在另一个社区
-    const pythonCommunity = labels.get(p1);
-    expect(labels.get(p2)).toBe(pythonCommunity);
-    expect(pythonCommunity).not.toBe(dockerCommunity);
-  });
-
-  it("孤立节点各自一个社区", () => {
-    insertNode(db, { name: "isolated-a" });
-    insertNode(db, { name: "isolated-b" });
-
-    const { count } = detectCommunities(db);
-    expect(count).toBe(2);
-  });
-
-  it("getCommunityPeers 返回同社区节点", () => {
-    const a = insertNode(db, { name: "a" });
-    const b = insertNode(db, { name: "b" });
-    const c = insertNode(db, { name: "c" });
-    insertEdge(db, { fromId: a, toId: b });
-    insertEdge(db, { fromId: b, toId: c });
-
-    detectCommunities(db);
-
-    const peers = getCommunityPeers(db, a, 5);
-    // b 和 c 应该是 a 的社区成员
-    expect(peers.length).toBeGreaterThan(0);
-  });
-
-  it("空图不报错", () => {
-    const { count } = detectCommunities(db);
-    expect(count).toBe(0);
-  });
-});
-
-// ═══════════════════════════════════════════════════════════════
 // 向量去重
 // ═══════════════════════════════════════════════════════════════
 
@@ -289,13 +226,11 @@ describe("runMaintenance", () => {
 
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
     expect(result.pagerank.topK.length).toBeGreaterThan(0);
-    expect(result.community.count).toBeGreaterThan(0);
   });
 
   it("空图不报错", async () => {
     const result = await runMaintenance(db, cfg);
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
     expect(result.pagerank.topK).toHaveLength(0);
-    expect(result.community.count).toBe(0);
   });
 });

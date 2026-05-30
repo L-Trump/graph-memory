@@ -120,7 +120,7 @@ export function createTestDb(): DatabaseSyncInstance {
     );
   `);
 
-  // m6: 社区描述
+  // m6: 社区描述（legacy schema retained for compatibility）
   db.exec(`
     CREATE TABLE IF NOT EXISTS gm_communities (
       id          TEXT PRIMARY KEY,
@@ -129,14 +129,6 @@ export function createTestDb(): DatabaseSyncInstance {
       embedding   BLOB,
       created_at  INTEGER NOT NULL,
       updated_at  INTEGER NOT NULL
-    );
-  `);
-
-  // m7: 社区检测（由 runMaintenance 生成）
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS community_detection (
-      node_id     TEXT PRIMARY KEY,
-      member_ids  TEXT NOT NULL DEFAULT '[]'
     );
   `);
 

@@ -214,21 +214,6 @@ export function updatePageranks(db: DatabaseSyncInstance, scores: Map<string, nu
   }
 }
 
-/** 批量更新社区 ID */
-export function updateCommunities(db: DatabaseSyncInstance, labels: Map<string, string>): void {
-  const stmt = db.prepare("UPDATE gm_nodes SET community_id=? WHERE id=?");
-  db.exec("BEGIN");
-  try {
-    for (const [id, cid] of labels) {
-      stmt.run(cid, id);
-    }
-    db.exec("COMMIT");
-  } catch (e) {
-    db.exec("ROLLBACK");
-    throw e;
-  }
-}
-
 // ─── 边 CRUD ─────────────────────────────────────────────────
 
 export function upsertEdge(
@@ -644,7 +629,6 @@ export function getStats(db: DatabaseSyncInstance): {
   byType: Record<string, number>;
   totalEdges: number;
   byEdgeType: Record<string, number>;
-  communities: number;
   hotNodes: number;
 } {
   const totalNodes = (db.prepare("SELECT COUNT(*) as c FROM gm_nodes WHERE status='active'").get() as any).c;
@@ -664,13 +648,10 @@ export function getStats(db: DatabaseSyncInstance): {
       byEdgeType[r.type] = r.c;
     }
   }
-  const communities = (db.prepare(
-    "SELECT COUNT(DISTINCT community_id) as c FROM gm_nodes WHERE status='active' AND community_id IS NOT NULL"
-  ).get() as any).c;
   const hotNodes = (db.prepare(
     "SELECT COUNT(*) as c FROM gm_nodes WHERE status='active' AND flags LIKE '%\"hot\"%'"
   ).get() as any).c;
-  return { totalNodes, byType, totalEdges, byEdgeType, communities, hotNodes };
+  return { totalNodes, byType, totalEdges, byEdgeType, hotNodes };
 }
 
 // ─── 向量存储 + 搜索 ────────────────────────────────────────
@@ -738,158 +719,6 @@ export function vectorSearchWithScore(db: DatabaseSyncInstance, queryVec: number
 /** 兼容旧接口 */
 export function vectorSearch(db: DatabaseSyncInstance, queryVec: number[], limit: number, minScore = 0.35): GmNode[] {
   return vectorSearchWithScore(db, queryVec, limit, minScore).map(s => s.node);
-}
-
-/**
- * 社区代表节点：每个社区取最近更新的 topN 个节点
- * 用于泛化召回 —— 用户问"做了哪些工作"时按领域返回概览
- */
-export function communityRepresentatives(db: DatabaseSyncInstance, perCommunity = 2): GmNode[] {
-  const rows = db.prepare(`
-    SELECT * FROM gm_nodes
-    WHERE status = 'active' AND community_id IS NOT NULL
-    ORDER BY community_id, updated_at DESC
-  `).all() as any[];
-
-  const byCommunity = new Map<string, GmNode[]>();
-  for (const r of rows) {
-    const node = toNode(r);
-    const cid = r.community_id as string;
-    if (!byCommunity.has(cid)) byCommunity.set(cid, []);
-    const list = byCommunity.get(cid)!;
-    if (list.length < perCommunity) list.push(node);
-  }
-
-  // 社区按最新更新时间排序
-  const communities = Array.from(byCommunity.entries())
-    .sort((a, b) => {
-      const aTime = Math.max(...a[1].map(n => n.updatedAt));
-      const bTime = Math.max(...b[1].map(n => n.updatedAt));
-      return bTime - aTime;
-    });
-
-  const result: GmNode[] = [];
-  for (const [, nodes] of communities) {
-    result.push(...nodes);
-  }
-  return result;
-}
-
-// ─── 社区描述 CRUD ──────────────────────────────────────────
-
-export interface CommunitySummary {
-  id: string;
-  summary: string;
-  nodeCount: number;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export function upsertCommunitySummary(
-  db: DatabaseSyncInstance, id: string, summary: string, nodeCount: number, embedding?: number[],
-): void {
-  const now = Date.now();
-  const blob = embedding ? new Uint8Array(new Float32Array(embedding).buffer) : null;
-  const ex = db.prepare("SELECT id FROM gm_communities WHERE id=?").get(id) as any;
-  if (ex) {
-    if (blob) {
-      db.prepare("UPDATE gm_communities SET summary=?, node_count=?, embedding=?, updated_at=? WHERE id=?")
-        .run(summary, nodeCount, blob, now, id);
-    } else {
-      db.prepare("UPDATE gm_communities SET summary=?, node_count=?, updated_at=? WHERE id=?")
-        .run(summary, nodeCount, now, id);
-    }
-  } else {
-    db.prepare("INSERT INTO gm_communities (id, summary, node_count, embedding, created_at, updated_at) VALUES (?,?,?,?,?,?)")
-      .run(id, summary, nodeCount, blob, now, now);
-  }
-}
-
-export function getCommunitySummary(db: DatabaseSyncInstance, id: string): CommunitySummary | null {
-  const r = db.prepare("SELECT * FROM gm_communities WHERE id=?").get(id) as any;
-  if (!r) return null;
-  return { id: r.id, summary: r.summary, nodeCount: r.node_count, createdAt: r.created_at, updatedAt: r.updated_at };
-}
-
-export function getAllCommunitySummaries(db: DatabaseSyncInstance): CommunitySummary[] {
-  return (db.prepare("SELECT * FROM gm_communities ORDER BY node_count DESC").all() as any[])
-    .map(r => ({ id: r.id, summary: r.summary, nodeCount: r.node_count, createdAt: r.created_at, updatedAt: r.updated_at }));
-}
-
-export type ScoredCommunity = { id: string; summary: string; score: number; nodeCount: number };
-
-/**
- * 社区向量搜索：用 query 向量匹配社区 embedding，返回按相似度排序的社区
- */
-export function communityVectorSearch(db: DatabaseSyncInstance, queryVec: number[], minScore = 0.15): ScoredCommunity[] {
-  const rows = db.prepare(
-    "SELECT id, summary, node_count, embedding FROM gm_communities WHERE embedding IS NOT NULL"
-  ).all() as any[];
-
-  if (!rows.length) return [];
-
-  const q = new Float32Array(queryVec);
-  const qNorm = Math.sqrt(q.reduce((s, x) => s + x * x, 0));
-  if (qNorm === 0) return [];
-
-  return rows
-    .map(r => {
-      const raw = r.embedding as Uint8Array;
-      const v = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
-      let dot = 0, vNorm = 0;
-      const len = Math.min(v.length, q.length);
-      for (let i = 0; i < len; i++) {
-        dot += v[i] * q[i];
-        vNorm += v[i] * v[i];
-      }
-      return {
-        id: r.id as string,
-        summary: r.summary as string,
-        score: dot / (Math.sqrt(vNorm) * qNorm + 1e-9),
-        nodeCount: r.node_count as number,
-      };
-    })
-    .filter(s => s.score > minScore)
-    .sort((a, b) => b.score - a.score);
-}
-
-/**
- * 按社区 ID 列表获取成员节点（按时间倒序）
- */
-export function nodesByCommunityIds(db: DatabaseSyncInstance, communityIds: string[], perCommunity = 3): GmNode[] {
-  if (!communityIds.length) return [];
-  const placeholders = communityIds.map(() => "?").join(",");
-  const rows = db.prepare(`
-    SELECT * FROM gm_nodes
-    WHERE community_id IN (${placeholders}) AND status='active'
-    ORDER BY community_id, updated_at DESC
-  `).all(...communityIds) as any[];
-
-  const byCommunity = new Map<string, GmNode[]>();
-  for (const r of rows) {
-    const node = toNode(r);
-    const cid = r.community_id as string;
-    if (!byCommunity.has(cid)) byCommunity.set(cid, []);
-    const list = byCommunity.get(cid)!;
-    if (list.length < perCommunity) list.push(node);
-  }
-
-  const result: GmNode[] = [];
-  for (const cid of communityIds) {
-    const members = byCommunity.get(cid);
-    if (members) result.push(...members);
-  }
-  return result;
-}
-
-/** 清除已不存在的社区描述 */
-export function pruneCommunitySummaries(db: DatabaseSyncInstance): number {
-  const result = db.prepare(`
-    DELETE FROM gm_communities WHERE id NOT IN (
-      SELECT DISTINCT community_id FROM gm_nodes WHERE community_id IS NOT NULL AND status='active'
-    )
-  `).run();
-  return result.changes;
 }
 
 // ─── TOPIC 节点查询 ─────────────────────────────────────────

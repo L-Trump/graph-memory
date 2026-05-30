@@ -41,7 +41,6 @@ import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts"
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { filterNoiseMessages } from "./src/extractor/noise-filter.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
-import { detectCommunities } from "./src/graph/community.ts";
 import { induceTopics, induceSession } from "./src/engine/induction.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
 
@@ -238,7 +237,7 @@ const graphMemoryPlugin = {
   id: "graph-memory",
   name: "Graph Memory",
   description:
-    "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类+向量去重自动维护",
+    "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，向量去重自动维护",
 
   register(api: OpenClawPluginApi) {
     // ── 读配置 ──────────────────────────────────────────────
@@ -301,7 +300,7 @@ const graphMemoryPlugin = {
     // ── Session 运行时状态 ──────────────────────────────────
     const msgSeq = new Map<string, number>();
     const recalled = new Map<string, { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }>();
-    const turnCounter = new Map<string, number>(); // 社区维护计数器
+    const turnCounter = new Map<string, number>(); // periodic maintenance counter
     const compactedActiveNodeIds = new Map<string, Set<string>>(); // compact 后需要补回上下文的 active 节点
 
     // ── Belief 追踪状态 ────────────────────────────────────────
@@ -970,31 +969,13 @@ ${suggestionsText}
               api.logger.warn(`[graph-memory] periodic session induction failed: ${err}`);
             }
 
-            // ★ 社区维护
+            // ★ 轻量图维护
             invalidateGraphCache();
             const pr = computeGlobalPageRank(db, cfg);
-            const comm = detectCommunities(db);
             api.logger.info(
               `[graph-memory] periodic maintenance (turn ${turns}): ` +
-              `pagerank top=${pr.topK.slice(0, 3).map(n => n.name).join(",")}, ` +
-              `communities=${comm.count}`,
+              `pagerank top=${pr.topK.slice(0, 3).map(n => n.name).join(",")}`,
             );
-
-            // 社区摘要：fire-and-forget（后台异步，不阻塞 afterTurn 返回）
-            if (comm.communities.size > 0) {
-              (async () => {
-                try {
-                  const { summarizeCommunities } = await import("./src/graph/community.ts");
-                  const embedFn = (recaller as any).embed ?? undefined;
-                  const summaries = await summarizeCommunities(db, comm.communities, llm, embedFn);
-                  api.logger.info(
-                    `[graph-memory] community summaries refreshed: ${summaries} summaries`,
-                  );
-                } catch (e) {
-                  api.logger.error(`[graph-memory] community summary failed: ${e}`);
-                }
-              })();
-            }
           } catch (err) {
             api.logger.error(`[graph-memory] periodic maintenance failed: ${err}`);
           }
@@ -1135,7 +1116,7 @@ ${suggestionsText}
           const retentionDays = Math.max(1, Math.floor(cfg.retention?.retentionDays ?? 30));
           const now = Date.now();
           const cutoff = now - retentionDays * 86_400_000;
-          const result = await runMaintenance(db, cfg, llm, embedFn, {
+          const result = await runMaintenance(db, cfg, {
             protectedSessionIds: getProtectedSessionIds(api, cutoff),
             now,
           });
@@ -1146,8 +1127,6 @@ ${suggestionsText}
             `[graph-memory] maintenance: ${result.durationMs}ms, ` +
             retentionText +
             `dedup=${result.dedup.merged}, ` +
-            `communities=${result.community.count}, ` +
-            `summaries=${result.communitySummaries}, ` +
             `top_pr=${result.pagerank.topK.slice(0, 3).map((n: any) => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
           );
         } catch (err) {
@@ -1274,7 +1253,6 @@ ${suggestionsText}
               flags: n.flags ?? [],
               validatedCount: n.validatedCount,
               pagerank: n.pagerank,
-              communityId: n.communityId,
               createdAt: n.createdAt,
               updatedAt: n.updatedAt,
               tier: n.tier,
@@ -1404,7 +1382,7 @@ ${suggestionsText}
       (_ctx: any) => ({
         name: "gm_stats",
         label: "Graph Memory Stats",
-        description: "查看知识图谱的统计信息：节点数、边数、社区数、Hot 节点数、PageRank Top 节点、Embedding 开启状态。",
+        description: "查看知识图谱的统计信息：节点数、边数、Hot 节点数、PageRank Top 节点、Embedding 开启状态。",
         parameters: Type.Object({}),
         async execute(_toolCallId: string, _params: any) {
           const stats = getStats(db);
@@ -1440,7 +1418,6 @@ ${suggestionsText}
             `知识图谱统计`,
             `节点：${stats.totalNodes} 个 (${["TASK","SKILL","EVENT","KNOWLEDGE","STATUS","TOPIC","SESSION"].map(t => `${t}: ${t === "TOPIC" ? topicCount : (stats.byType[t] ?? 0)}`).join(", ")})`,
             `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
-            `社区：${stats.communities} 个`,
             `Hot 节点：${stats.hotNodes} 个`,
             `Embedding：${embedEnabled ? "✅ 已开启" : "❌ 未开启"}${pendingCount > 0 ? ` (待处理: ${pendingCount})` : ""}${embedReady && !embedFnExists ? " (embedFn 未赋值)" : ""}`,
             `PageRank Top 5：`,
@@ -1460,14 +1437,14 @@ ${suggestionsText}
       (_ctx: any) => ({
         name: "gm_maintain",
         label: "Graph Memory Maintenance",
-        description: "手动触发图维护：运行去重、PageRank 重算、社区检测。通常 session_end 时自动运行，这个工具用于手动触发。",
+        description: "手动触发图维护：运行去重和 PageRank 重算。通常 session_end 时自动运行，这个工具用于手动触发。",
         parameters: Type.Object({}),
         async execute(_toolCallId: string, _params: any) {
           const embedFn = (recaller as any).embed ?? undefined;
           const retentionDays = Math.max(1, Math.floor(cfg.retention?.retentionDays ?? 30));
           const now = Date.now();
           const cutoff = now - retentionDays * 86_400_000;
-          const result = await runMaintenance(db, cfg, llm, embedFn, {
+          const result = await runMaintenance(db, cfg, {
             protectedSessionIds: getProtectedSessionIds(api, cutoff),
             now,
           });
@@ -1485,7 +1462,6 @@ ${suggestionsText}
               ? result.dedup.pairs.slice(0, 5).map(p =>
                   `  "${p.nameA}" ≈ "${p.nameB}" (${(p.similarity * 100).toFixed(1)}%)`)
               : []),
-            `社区：${result.community.count} 个`,
             `PageRank Top 5：`,
             ...result.pagerank.topK.slice(0, 5).map((n, i) =>
               `  ${i + 1}. ${n.name} (${n.score.toFixed(4)})`),
@@ -1495,7 +1471,6 @@ ${suggestionsText}
             details: {
               durationMs: result.durationMs,
               dedupMerged: result.dedup.merged,
-              communities: result.community.count,
               retention: result.retention,
             },
           };
