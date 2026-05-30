@@ -70,6 +70,7 @@ export function createTestDb(): DatabaseSyncInstance {
       created_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS ix_gm_msg_session ON gm_messages(session_id, turn_index);
+    CREATE INDEX IF NOT EXISTS ix_gm_msg_retention ON gm_messages(created_at, session_id);
   `);
 
   // m3: 信号
@@ -156,6 +157,7 @@ export function createTestDb(): DatabaseSyncInstance {
     );
     CREATE INDEX IF NOT EXISTS ix_gm_recalled_session ON gm_recalled(session_id, turn_index);
     CREATE INDEX IF NOT EXISTS ix_gm_recalled_node ON gm_recalled(node_id);
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_retention ON gm_recalled(created_at, session_id);
   `);
 
   return db;

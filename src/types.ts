@@ -192,6 +192,16 @@ export interface GmConfig {
   pagerankIterations: number;
   /** 提取时传给 LLM 的本 session 历史消息轮次数（以 user 消息为边界），默认 3 */
   extractionRecentTurns: number;
+  /** inactive session 历史记录清理配置（清理 gm_messages 与 gm_recalled），默认启用 */
+  retention?: {
+    enabled?: boolean;
+    /** 非 active session 的保留天数，默认 30 */
+    retentionDays?: number;
+    /** 单次最多删除行数，避免长时间锁库，默认 20000 */
+    maxDeletePerRun?: number;
+    /** 是否在清理后执行 VACUUM，默认 false */
+    vacuum?: boolean;
+  };
   /** 是否启用衰减引擎（access-based decay scoring），默认 true */
   decayEnabled?: boolean;
   /** 调试：输出 stable/dynamic 注入上下文前后片段，默认 false */
@@ -208,6 +218,12 @@ export const DEFAULT_CONFIG: GmConfig = {
   pagerankDamping: 0.85,
   pagerankIterations: 20,
   extractionRecentTurns: 3,
+  retention: {
+    enabled: true,
+    retentionDays: 30,
+    maxDeletePerRun: 20_000,
+    vacuum: false,
+  },
   decayEnabled: true,
   debugContextPreview: false,
 };

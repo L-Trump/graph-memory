@@ -203,6 +203,35 @@ let _gmExtractor: Extractor | null = null;
 type LlmCompleteFn = (system: string, user: string) => Promise<string>;
 let _gmLlm: LlmCompleteFn | null = null;
 
+function getProtectedSessionIds(api: OpenClawPluginApi, cutoff: number): string[] {
+  const sessionRuntime = api.runtime?.agent?.session;
+  if (!sessionRuntime?.resolveStorePath || !sessionRuntime?.loadSessionStore) {
+    return [];
+  }
+
+  const agentList = Array.isArray(api.config?.agents?.list) ? api.config.agents.list : [];
+  const agentIds = agentList.length ? agentList.map((agent: any) => agent?.id).filter(Boolean) : ["main"];
+  const protectedSessions = new Set<string>();
+
+  for (const agentId of agentIds) {
+    try {
+      const storePath = sessionRuntime.resolveStorePath(api.config.session?.store, { agentId });
+      const store = sessionRuntime.loadSessionStore(storePath, { skipCache: true });
+      for (const entry of Object.values(store) as any[]) {
+        if (!entry?.sessionId) continue;
+        const updatedAt = typeof entry.updatedAt === "number" ? entry.updatedAt : 0;
+        if (entry.status === "running" || updatedAt >= cutoff) {
+          protectedSessions.add(entry.sessionId);
+        }
+      }
+    } catch (err) {
+      api.logger.warn(`[graph-memory] retention: failed to load session store for agent=${agentId}: ${err}`);
+    }
+  }
+
+  return [...protectedSessions];
+}
+
 // ─── 插件对象 ─────────────────────────────────────────────────
 
 const graphMemoryPlugin = {
@@ -218,6 +247,11 @@ const graphMemoryPlugin = {
         ? (api.pluginConfig as any)
         : {};
     const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
+    const retentionCfg = {
+      ...DEFAULT_CONFIG.retention,
+      ...(raw.retention && typeof raw.retention === "object" ? raw.retention : {}),
+    };
+    cfg.retention = retentionCfg;
     const { provider, model } = readProviderModel(api.config);
 
     // ── 初始化核心模块（幂等，仅首次执行）──────────────────────
@@ -1098,9 +1132,19 @@ ${suggestionsText}
       (async () => {
         try {
           const embedFn = (recaller as any).embed ?? undefined;
-          const result = await runMaintenance(db, cfg, llm, embedFn);
+          const retentionDays = Math.max(1, Math.floor(cfg.retention?.retentionDays ?? 30));
+          const now = Date.now();
+          const cutoff = now - retentionDays * 86_400_000;
+          const result = await runMaintenance(db, cfg, llm, embedFn, {
+            protectedSessionIds: getProtectedSessionIds(api, cutoff),
+            now,
+          });
+          const retentionText = result.retention
+            ? `retention_messages=${result.retention.messagesDeleted}, retention_recalled=${result.retention.recalledDeleted}, `
+            : "";
           api.logger.info(
             `[graph-memory] maintenance: ${result.durationMs}ms, ` +
+            retentionText +
             `dedup=${result.dedup.merged}, ` +
             `communities=${result.community.count}, ` +
             `summaries=${result.communitySummaries}, ` +
@@ -1420,9 +1464,22 @@ ${suggestionsText}
         parameters: Type.Object({}),
         async execute(_toolCallId: string, _params: any) {
           const embedFn = (recaller as any).embed ?? undefined;
-          const result = await runMaintenance(db, cfg, llm, embedFn);
+          const retentionDays = Math.max(1, Math.floor(cfg.retention?.retentionDays ?? 30));
+          const now = Date.now();
+          const cutoff = now - retentionDays * 86_400_000;
+          const result = await runMaintenance(db, cfg, llm, embedFn, {
+            protectedSessionIds: getProtectedSessionIds(api, cutoff),
+            now,
+          });
+          const retentionLines = result.retention
+            ? [
+                `Retention：messages 删除 ${result.retention.messagesDeleted} 行，recalled 删除 ${result.retention.recalledDeleted} 行`,
+                `  protected sessions：${result.retention.protectedSessionCount}，cutoff：${new Date(result.retention.cutoff).toISOString()}`,
+              ]
+            : [];
           const text = [
             `图维护完成（${result.durationMs}ms）`,
+            ...retentionLines,
             `去重：发现 ${result.dedup.pairs.length} 对相似节点，合并 ${result.dedup.merged} 对`,
             ...(result.dedup.pairs.length > 0
               ? result.dedup.pairs.slice(0, 5).map(p =>
@@ -1439,6 +1496,7 @@ ${suggestionsText}
               durationMs: result.durationMs,
               dedupMerged: result.dedup.merged,
               communities: result.community.count,
+              retention: result.retention,
             },
           };
         },

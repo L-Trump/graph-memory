@@ -9,6 +9,13 @@ import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite"
 import { createHash } from "crypto";
 import type { GmNode, GmEdge, EdgeType, NodeType, Signal } from "../types.ts";
 
+export type RetentionCleanupResult = {
+  cutoff: number;
+  protectedSessionCount: number;
+  messagesDeleted: number;
+  recalledDeleted: number;
+};
+
 // ─── 工具 ─────────────────────────────────────────────────────
 
 function uid(p: string): string {
@@ -514,7 +521,105 @@ export function getEpisodicMessages(
   return results;
 }
 
+// ─── Retention cleanup ───────────────────────────────────────
+
+function prepareProtectedSessionTempTable(db: DatabaseSyncInstance, protectedSessionIds: string[]): void {
+  db.exec("DROP TABLE IF EXISTS temp.gm_protected_sessions");
+  db.exec("CREATE TEMP TABLE gm_protected_sessions (session_id TEXT PRIMARY KEY)");
+
+  if (!protectedSessionIds.length) return;
+
+  const insert = db.prepare("INSERT OR IGNORE INTO temp.gm_protected_sessions (session_id) VALUES (?)");
+  for (const sid of protectedSessionIds) {
+    if (sid) insert.run(sid);
+  }
+}
+
+function deleteInactiveSessionRows(
+  db: DatabaseSyncInstance,
+  tableName: "gm_messages" | "gm_recalled",
+  cutoff: number,
+  maxRows: number,
+): number {
+  const before = (db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM (
+      SELECT t.id
+      FROM ${tableName} AS t
+      WHERE t.created_at < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM temp.gm_protected_sessions AS a
+          WHERE a.session_id = t.session_id
+        )
+      LIMIT ?
+    )
+  `).get(cutoff, maxRows) as any)?.c ?? 0;
+  if (before <= 0) return 0;
+
+  db.prepare(`
+    DELETE FROM ${tableName}
+    WHERE id IN (
+      SELECT t.id
+      FROM ${tableName} AS t
+      WHERE t.created_at < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM temp.gm_protected_sessions AS a
+          WHERE a.session_id = t.session_id
+        )
+      ORDER BY t.created_at ASC
+      LIMIT ?
+    )
+  `).run(cutoff, maxRows);
+
+  return Math.min(before, maxRows);
+}
+
+export function cleanupInactiveSessionHistory(
+  db: DatabaseSyncInstance,
+  protectedSessionIds: string[],
+  opts: {
+    retentionDays: number;
+    maxDeletePerRun: number;
+    now?: number;
+    vacuum?: boolean;
+  },
+): RetentionCleanupResult {
+  const now = opts.now ?? Date.now();
+  const retentionDays = Math.max(1, Math.floor(opts.retentionDays));
+  const maxDeletePerRun = Math.max(1, Math.floor(opts.maxDeletePerRun));
+  const cutoff = now - retentionDays * 86_400_000;
+  const protectedSessions = [...new Set(protectedSessionIds.filter(Boolean))];
+
+  db.exec("BEGIN");
+  try {
+    prepareProtectedSessionTempTable(db, protectedSessions);
+    const messagesDeleted = deleteInactiveSessionRows(db, "gm_messages", cutoff, maxDeletePerRun);
+    const remainingBudget = Math.max(0, maxDeletePerRun - messagesDeleted);
+    const recalledDeleted = remainingBudget > 0
+      ? deleteInactiveSessionRows(db, "gm_recalled", cutoff, remainingBudget)
+      : 0;
+    db.exec("DROP TABLE IF EXISTS temp.gm_protected_sessions");
+    db.exec("COMMIT");
+
+    if (opts.vacuum && (messagesDeleted > 0 || recalledDeleted > 0)) {
+      db.exec("VACUUM");
+    }
+
+    return {
+      cutoff,
+      protectedSessionCount: protectedSessions.length,
+      messagesDeleted,
+      recalledDeleted,
+    };
+  } catch (err) {
+    try { db.exec("ROLLBACK"); } catch {}
+    try { db.exec("DROP TABLE IF EXISTS temp.gm_protected_sessions"); } catch {}
+    throw err;
+  }
+}
+
 // ─── 信号 CRUD ───────────────────────────────────────────────
+
 
 export function saveSignal(db: DatabaseSyncInstance, sid: string, s: Signal): void {
   db.prepare(`INSERT INTO gm_signals (id, session_id, turn_index, type, data, created_at)

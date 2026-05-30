@@ -22,8 +22,10 @@ import type { EmbedFn } from "../engine/embed.ts";
 import { computeGlobalPageRank, invalidateGraphCache, type GlobalPageRankResult } from "./pagerank.ts";
 import { detectCommunities, summarizeCommunities, type CommunityResult } from "./community.ts";
 import { dedup, type DedupResult } from "./dedup.ts";
+import { cleanupInactiveSessionHistory, type RetentionCleanupResult } from "../store/store.ts";
 
 export interface MaintenanceResult {
+  retention?: RetentionCleanupResult;
   dedup: DedupResult;
   pagerank: GlobalPageRankResult;
   community: CommunityResult;
@@ -31,10 +33,27 @@ export interface MaintenanceResult {
   durationMs: number;
 }
 
+export type MaintenanceOptions = {
+  protectedSessionIds?: string[];
+  now?: number;
+};
+
 export async function runMaintenance(
-  db: DatabaseSyncInstance, cfg: GmConfig, llm?: CompleteFn, embedFn?: EmbedFn,
+  db: DatabaseSyncInstance, cfg: GmConfig, llm?: CompleteFn, embedFn?: EmbedFn, opts: MaintenanceOptions = {},
 ): Promise<MaintenanceResult> {
   const start = Date.now();
+  const now = opts.now ?? Date.now();
+  let retention: RetentionCleanupResult | undefined;
+
+  // 0. Retention cleanup（仅清理超过保留期且非 protected 的 session 历史）
+  if (cfg.retention?.enabled !== false && opts.protectedSessionIds && opts.protectedSessionIds.length > 0) {
+    retention = cleanupInactiveSessionHistory(db, opts.protectedSessionIds, {
+      retentionDays: cfg.retention?.retentionDays ?? 30,
+      maxDeletePerRun: cfg.retention?.maxDeletePerRun ?? 20_000,
+      now,
+      vacuum: cfg.retention?.vacuum === true,
+    });
+  }
 
   // 去重/新增节点后清除图结构缓存
   invalidateGraphCache();
@@ -73,6 +92,7 @@ export async function runMaintenance(
   }
 
   return {
+    retention,
     dedup: dedupResult,
     pagerank: pagerankResult,
     community: communityResult,

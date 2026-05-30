@@ -87,7 +87,7 @@ function recreateNodeIndexes(db: DatabaseSyncInstance): void {
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes, m12_recalled, m13_access_tracking, m14_session_type];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes, m12_recalled, m13_access_tracking, m14_session_type, m15_retention_indexes];
 
 function m11_scopes(db: DatabaseSyncInstance): void {
   try {
@@ -128,6 +128,7 @@ function m12_recalled(db: DatabaseSyncInstance): void {
     );
     CREATE INDEX IF NOT EXISTS ix_gm_recalled_session ON gm_recalled(session_id, turn_index);
     CREATE INDEX IF NOT EXISTS ix_gm_recalled_node ON gm_recalled(node_id);
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_retention ON gm_recalled(created_at, session_id);
   `);
 }
 
@@ -236,6 +237,13 @@ function m14_session_type(db: DatabaseSyncInstance): void {
   }
 }
 
+function m15_retention_indexes(db: DatabaseSyncInstance): void {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS ix_gm_msg_retention ON gm_messages(created_at, session_id);
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_retention ON gm_recalled(created_at, session_id);
+  `);
+}
+
 // ─── 核心表：节点 + 边 ──────────────────────────────────────
 
 function m1_core(db: DatabaseSyncInstance): void {
@@ -287,6 +295,7 @@ function m2_messages(db: DatabaseSyncInstance): void {
       created_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS ix_gm_msg_session ON gm_messages(session_id, turn_index);
+    CREATE INDEX IF NOT EXISTS ix_gm_msg_retention ON gm_messages(created_at, session_id);
   `);
 }
 

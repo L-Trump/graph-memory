@@ -310,3 +310,76 @@ describe("gm_recalled 记录召回节点", () => {
     expect(getRecalledNodes(db, "s2", 1).map(r => r.nodeName)).toEqual(["S2T1"]);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────
+// 测试：inactive session retention 清理
+// ─────────────────────────────────────────────────────────────────
+describe("inactive session retention 清理", () => {
+  it("只清理超过保留期且非 active session 的 messages 和 recalled", async () => {
+    const { cleanupInactiveSessionHistory } = await import("../src/store/store.ts");
+    const db = createTestDb();
+    const now = Date.UTC(2026, 4, 31);
+    const old = now - 31 * 86_400_000;
+    const recent = now - 3 * 86_400_000;
+
+    const insertMsg = db.prepare(`
+      INSERT INTO gm_messages (id, session_id, turn_index, role, content, extracted, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertMsg.run("m-active-old", "active", 1, "user", "active old", 1, old);
+    insertMsg.run("m-inactive-old", "inactive", 1, "user", "inactive old", 0, old);
+    insertMsg.run("m-inactive-recent", "inactive", 2, "user", "inactive recent", 1, recent);
+
+    const insertRecall = db.prepare(`
+      INSERT INTO gm_recalled (id, session_id, turn_index, node_id, node_name, node_type, tier, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertRecall.run("r-active-old", "active", 1, "n1", "Active", "KNOWLEDGE", "L1", old);
+    insertRecall.run("r-inactive-old", "inactive", 1, "n2", "Inactive", "KNOWLEDGE", "L1", old);
+    insertRecall.run("r-inactive-recent", "inactive", 2, "n3", "Recent", "KNOWLEDGE", "L1", recent);
+
+    const result = cleanupInactiveSessionHistory(db, ["active"], {
+      retentionDays: 30,
+      maxDeletePerRun: 10,
+      now,
+    });
+
+    expect(result.messagesDeleted).toBe(1);
+    expect(result.recalledDeleted).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM gm_messages").get() as any).c).toBe(2);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM gm_recalled").get() as any).c).toBe(2);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM gm_messages WHERE id='m-active-old'").get() as any).c).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM gm_recalled WHERE id='r-active-old'").get() as any).c).toBe(1);
+  });
+
+  it("遵守 maxDeletePerRun 总预算", async () => {
+    const { cleanupInactiveSessionHistory } = await import("../src/store/store.ts");
+    const db = createTestDb();
+    const now = Date.UTC(2026, 4, 31);
+    const old = now - 31 * 86_400_000;
+
+    const insertMsg = db.prepare(`
+      INSERT INTO gm_messages (id, session_id, turn_index, role, content, extracted, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (let i = 0; i < 3; i++) {
+      insertMsg.run(`m-${i}`, "inactive", i, "user", `old ${i}`, 1, old + i);
+    }
+    db.prepare(`
+      INSERT INTO gm_recalled (id, session_id, turn_index, node_id, node_name, node_type, tier, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("r-1", "inactive", 1, "n1", "N1", "KNOWLEDGE", "L1", old);
+
+    const result = cleanupInactiveSessionHistory(db, ["active"], {
+      retentionDays: 30,
+      maxDeletePerRun: 2,
+      now,
+    });
+
+    expect(result.messagesDeleted + result.recalledDeleted).toBeLessThanOrEqual(2);
+    expect(result.messagesDeleted).toBe(2);
+    expect(result.recalledDeleted).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM gm_messages").get() as any).c).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM gm_recalled").get() as any).c).toBe(1);
+  });
+});
