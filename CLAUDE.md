@@ -50,7 +50,7 @@ npx vitest run --grep "recall"   # 按测试名运行
 
 ### 格式 (src/format/assemble.ts)
 
-assembleContext 将节点/边渲染为文本注入 systemPrompt，含溯源片段（episodic）功能。
+assembleStableContext / assembleDynamicContext 将节点/边渲染为分层上下文：稳定层进入 appendSystemContext，动态 recall 层进入 prependContext。
 
 ### 引擎 (src/engine/)
 
@@ -71,8 +71,9 @@ recall（before_prompt_build）
   → TieredNode[] + GmEdge[] + pprScores
 
 assemble
-  → assembleContext（图谱渲染 + episodic 片段）
-  → 返回 { messages, systemPromptAddition, estimatedTokens }
+  → assembleStableContext（hot / scope_hot / compactActiveNodes → appendSystemContext）
+  → assembleDynamicContext（每轮 recall L1/L2/L3 → prependContext）
+  → 返回 { appendSystemContext, prependContext }
 ```
 
 ### 插件生命周期

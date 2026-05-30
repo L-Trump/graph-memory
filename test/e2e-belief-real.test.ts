@@ -23,7 +23,7 @@ import {
   recordBeliefSignal,
   updateNodeBelief,
 } from "../src/store/store.ts";
-import { assembleContext, buildExtractKnowledgeGraph } from "../src/format/assemble.ts";
+import { buildExtractKnowledgeGraph } from "../src/format/assemble.ts";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";

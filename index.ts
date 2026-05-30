@@ -36,7 +36,7 @@ import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Recaller, type TieredNode } from "./src/recaller/recall.ts";
 import { Extractor } from "./src/extractor/extract.ts";
-import { assembleContext, assembleStableContext, assembleDynamicContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
+import { assembleStableContext, assembleDynamicContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { filterNoiseMessages } from "./src/extractor/noise-filter.ts";

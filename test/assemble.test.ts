@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
-import { assembleContext, assembleStableContext, assembleDynamicContext, buildSystemPromptAddition } from "../src/format/assemble.ts";
+import { assembleStableContext, assembleDynamicContext, buildSystemPromptAddition } from "../src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "../src/format/transcript-repair.ts";
 import { findById } from "../src/store/store.ts";
 import type { GmNode, GmEdge } from "../src/types.ts";
@@ -57,106 +57,6 @@ describe("buildSystemPromptAddition", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// assembleContext
-// ═══════════════════════════════════════════════════════════════
-
-describe("assembleContext", () => {
-  it("有节点时生成 XML", () => {
-    const id = insertNode(db, { name: "test-skill", type: "SKILL", content: "## test\nsome content" });
-    const node = findById(db, id)!;
-
-    const { xml, systemPrompt, tokens } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
-      hotNodes: [] as GmNode[],
-      hotEdges: [] as GmEdge[],
-      scopeHotNodes: [] as GmNode[],
-      scopeHotEdges: [] as GmEdge[],
-      activeNodes: [node],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [] as any[],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
-    });
-
-    expect(xml).toContain("<knowledge_graph>");
-    expect(xml).toContain('name="test-skill"');
-    expect(xml).toContain("</knowledge_graph>");
-    expect(systemPrompt).toContain("Graph Memory");
-    expect(tokens).toBeGreaterThan(0);
-  });
-
-  it("空节点返回 null", () => {
-    const { xml, systemPrompt } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
-      hotNodes: [] as GmNode[],
-      hotEdges: [] as GmEdge[],
-      scopeHotNodes: [] as GmNode[],
-      scopeHotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [] as any[],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
-    });
-
-    expect(xml).toBeNull();
-    expect(systemPrompt).toBe("");
-  });
-
-  it("recalled 节点标记 source=recalled", () => {
-    const id = insertNode(db, { name: "recalled-skill", type: "SKILL" });
-    const node = findById(db, id)!;
-
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
-      hotNodes: [] as GmNode[],
-      hotEdges: [] as GmEdge[],
-      scopeHotNodes: [] as GmNode[],
-      scopeHotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [{ ...node, tier: "L1" as const, semanticScore: 0.8, pprScore: 0.1, pagerankScore: 0.3, combinedScore: 0.5 }],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
-    });
-
-    expect(xml).toContain('source="recalled"');
-  });
-
-  it("token 预算不截断节点（全量放入）", () => {
-    // 插入很多大节点
-    const nodes: GmNode[] = [];
-    for (let i = 0; i < 20; i++) {
-      const id = insertNode(db, {
-        name: `skill-${i}`,
-        content: "x".repeat(5000), // 每个节点 5000 字符
-      });
-      nodes.push(findById(db, id)!);
-    }
-
-    // 很小的 token 预算
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 1000, // 1000 * 0.15 * 3 = 450 字符
-      hotNodes: [] as GmNode[],
-      hotEdges: [] as GmEdge[],
-      scopeHotNodes: [] as GmNode[],
-      scopeHotEdges: [] as GmEdge[],
-      activeNodes: nodes,
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [] as any[],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
-    });
-
-    // 不应该包含所有 20 个节点
-    if (xml) {
-      const matches = xml.match(/name="skill-/g);
-      expect(matches!.length).toBe(20);
-    }
-  });
-});
-
-// ═══════════════════════════════════════════════════════════════
 // hot 节点渲染
 // ═══════════════════════════════════════════════════════════════
 
@@ -169,17 +69,11 @@ describe("hot 节点渲染", () => {
     const node2 = findById(db, id2)!;
 
     // 单独渲染 hot 节点（active 和 recalled 都为空）
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml } = assembleStableContext(db, null!, {
       hotNodes: [node2],
       hotEdges: [] as GmEdge[],
       scopeHotNodes: [] as GmNode[],
       scopeHotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [] as any[],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
     });
 
     expect(xml).toContain('name="hot-skill"');
@@ -192,17 +86,11 @@ describe("hot 节点渲染", () => {
     const id = insertNode(db, { name: "conflict-skill", type: "SKILL" });
     const node = findById(db, id)!;
 
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml } = assembleStableContext(db, null!, {
       hotNodes: [{ ...node, flags: ["hot"] } as GmNode],
       hotEdges: [] as GmEdge[],
       scopeHotNodes: [] as GmNode[],
       scopeHotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [{ ...node, tier: "L1" as const, semanticScore: 0.8, pprScore: 0.1, pagerankScore: 0.3, combinedScore: 0.5 }],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
     });
 
     expect(xml).toContain('name="conflict-skill"');
@@ -214,17 +102,11 @@ describe("hot 节点渲染", () => {
     const id = insertNode(db, { name: "hot-with-desc", type: "SKILL", description: "hot 节点描述", content: "hot 节点内容" });
     const node = findById(db, id)!;
 
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml } = assembleStableContext(db, null!, {
       hotNodes: [{ ...node, flags: ["hot"] } as GmNode],
       hotEdges: [] as GmEdge[],
       scopeHotNodes: [] as GmNode[],
       scopeHotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [] as any[],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
     });
 
     // hot tier 非 L3，应带 desc
@@ -238,17 +120,13 @@ describe("hot 节点渲染", () => {
     const node1 = findById(db, id1)!;
     const node2 = findById(db, id2)!;
 
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml } = assembleStableContext(db, null!, {
       hotNodes: [node2],
       hotEdges: [] as GmEdge[],
       scopeHotNodes: [] as GmNode[],
       scopeHotEdges: [] as GmEdge[],
-      activeNodes: [node1],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [] as any[],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
+      compactActiveNodes: [node1],
+      compactActiveEdges: [] as GmEdge[],
     });
 
     // 两个节点都应存在
@@ -263,7 +141,7 @@ describe("hot 节点渲染", () => {
     const id2 = insertNode(db, { name: "hot-to", type: "TASK" });
     const node1 = findById(db, id1)!;
     const node2 = findById(db, id2)!;
-    // 手动构建 hot 边（assembleContext 不自动查 hot 边，由调用方传入）
+    // 手动构建 hot 边（由调用方传入）
     const hotEdge: GmEdge = {
       id: "e-hot-test",
       fromId: node1.id,
@@ -274,17 +152,11 @@ describe("hot 节点渲染", () => {
       createdAt: Date.now(),
     };
 
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml } = assembleStableContext(db, null!, {
       hotNodes: [{ ...node1, flags: ["hot"] } as GmNode, node2],
       hotEdges: [hotEdge],
       scopeHotNodes: [] as GmNode[],
       scopeHotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [] as any[],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
     });
 
     // 边应该渲染
@@ -319,7 +191,7 @@ describe("分层 assemble", () => {
     expect(stable.xml).toContain('tier="hot"');
   });
 
-  it("dynamic context 过滤 stable 已包含节点，保留 L1 和 compact active", () => {
+  it("dynamic context 过滤 stable 已包含节点，compact active 保留在 stable", () => {
     const hotId = insertNode(db, { name: "shared-hot", type: "SKILL", content: "hot content" });
     const l1Id = insertNode(db, { name: "dynamic-l1", type: "KNOWLEDGE", content: "l1 content" });
     const activeId = insertNode(db, { name: "compact-active", type: "TASK", content: "active content" });

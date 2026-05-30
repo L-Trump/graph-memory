@@ -8,7 +8,7 @@ import {
   setScopesForSession, getScopesForSession, getScopeHotNodes, listScopes,
   getEdgesForNodes,
 } from "../src/store/store.ts";
-import { assembleContext } from "../src/format/assemble.ts";
+import { assembleStableContext } from "../src/format/assemble.ts";
 import type { GmNode, GmEdge } from "../src/types.ts";
 
 let dbPath: string;
@@ -117,17 +117,13 @@ describe("assemble with scope_hot tier", () => {
     const scopeHotNodes = getScopeHotNodes(db, ["gm开发"]);
     const scopeHotEdges: GmEdge[] = [];
 
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml } = assembleStableContext(db, null!, {
       scopeHotNodes,
       scopeHotEdges,
       hotNodes: [] as GmNode[],
       hotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {},
+      compactActiveNodes: [] as GmNode[],
+      compactActiveEdges: [] as GmEdge[],
     });
 
     expect(xml).toContain("<knowledge_graph>");
@@ -144,17 +140,13 @@ describe("assemble with scope_hot tier", () => {
     const scopeHotNodes = getScopeHotNodes(db, ["gm开发"]);
     const hotNodes: GmNode[] = [{ ...node, flags: ["hot"] }];
 
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml } = assembleStableContext(db, null!, {
       scopeHotNodes,
       scopeHotEdges: [],
       hotNodes,
       hotEdges: [],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {},
+      compactActiveNodes: [] as GmNode[],
+      compactActiveEdges: [] as GmEdge[],
     });
 
     expect(xml).toContain('name="shared-skill"');
@@ -168,20 +160,17 @@ describe("assemble with scope_hot tier", () => {
 
     const scopeHotNodes = getScopeHotNodes(db, ["gm开发"]);
 
-    const { systemPrompt } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml, systemPrompt } = assembleStableContext(db, null!, {
       scopeHotNodes,
       scopeHotEdges: [],
       hotNodes: [] as GmNode[],
       hotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {},
+      compactActiveNodes: [] as GmNode[],
+      compactActiveEdges: [] as GmEdge[],
     });
 
-    expect(systemPrompt).toContain("1 scope_hot");
+    expect(systemPrompt).toContain("scope_hot");
+    expect(xml).toContain('tier="scope_hot"');
   });
 
   // Skipped: edge insertion triggers a migration edge case in test environment

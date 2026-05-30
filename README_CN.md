@@ -24,7 +24,8 @@ before_prompt_build hook（每次 LLM 调用前）
   ├─ Input-layer 噪声过滤：跳过拒绝回复/元问题/Boilerplate 消息
   ├─ recallV2()：精确召回 → 分层节点
   ├─ saveRecalledNodes()：缓存召回节点到 gm_recalled
-  └─ assembleContext()：渲染 KG XML → 通过 appendSystemContext 注入
+  ├─ assembleStableContext()：hot/scope_hot/compactActive → appendSystemContext
+  └─ assembleDynamicContext()：每轮 recalled L1/L2/L3 → prependContext
 
 afterTurn hook（后台异步，不阻塞用户对话）
   ├─ Input-layer 噪声过滤
@@ -59,7 +60,7 @@ session_end hook
 
 | Hook | 时机 | 作用 |
 |------|------|------|
-| `before_prompt_build` | 每次 LLM 调用前 | 召回 → 渲染 KG XML → 注入 system prompt |
+| `before_prompt_build` | 每次 LLM 调用前 | 召回 → 分层渲染 KG XML → 稳定层注入 appendSystemContext，动态层注入 prependContext |
 | `session_end` | Session 结束时 | finalize + 主题归纳 + 维护 + 置信度信号 |
 
 ## 核心功能

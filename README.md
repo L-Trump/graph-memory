@@ -27,7 +27,8 @@ Message in
 before_prompt_build hook
   ├─ recallV2(): dual-path recall → tiered nodes
   ├─ saveRecalledNodes(): cache recalled nodes to gm_recalled
-  └─ assembleContext(): render KG XML → inject via appendSystemContext
+  ├─ assembleStableContext(): hot/scope_hot/compactActive → appendSystemContext
+  └─ assembleDynamicContext(): recalled L1/L2/L3 → prependContext
 
 afterTurn hook (async, non-blocking)
   ├─ Input-layer noise filter
@@ -62,7 +63,7 @@ Implements OpenClaw's `ContextEngine` interface:
 
 | Hook | When | Purpose |
 |------|-------|---------|
-| `before_prompt_build` | Before each LLM call | Recall + render KG XML → system prompt |
+| `before_prompt_build` | Before each LLM call | Recall + split KG XML into stable appendSystemContext and dynamic prependContext |
 | `session_end` | Session terminates | Finalize + topic induction + maintenance + belief updates (weight=0.3) |
 
 ## Features

@@ -4,13 +4,13 @@
  * 验证：
  * 1. TOPIC 类型节点在 extract 阶段被正确排除
  * 2. 连接到 TOPIC 节点的边在 extract 阶段被正确排除
- * 3. TOPIC 节点在 recall 阶段正常返回（assembleContext）
+ * 3. TOPIC 节点在 recall 阶段正常返回（assembleDynamicContext）
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
-import { assembleContext, buildExtractKnowledgeGraph } from "../src/format/assemble.ts";
+import { assembleStableContext, assembleDynamicContext, buildExtractKnowledgeGraph } from "../src/format/assemble.ts";
 import { findById } from "../src/store/store.ts";
 import type { GmNode, GmEdge } from "../src/types.ts";
 
@@ -281,22 +281,15 @@ describe("buildExtractKnowledgeGraph — TOPIC 节点排除", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// TOPIC 节点在其他场景的保留行为（assembleContext）
+// TOPIC 节点在其他场景的保留行为（分层 assemble）
 // ═══════════════════════════════════════════════════════════════
 
-describe("TOPIC 节点在 assembleContext 中的保留", () => {
-  it("TOPIC 节点在 recall 阶段可以正常出现在图中", () => {
+describe("TOPIC 节点在分层 assemble 中的保留", () => {
+  it("TOPIC 节点在 recall 阶段可以正常出现在动态图中", () => {
     const topicId = insertTopicNode(db, "topic-for-recall", "召回测试主题");
     const topicNode = findById(db, topicId)!;
 
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
-      hotNodes: [] as GmNode[],
-      hotEdges: [] as GmEdge[],
-      scopeHotNodes: [] as GmNode[],
-      scopeHotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
+    const { xml } = assembleDynamicContext(db, null!, {
       recalledNodes: [{ ...topicNode, tier: "L1" as const, semanticScore: 0.8, pprScore: 0.1, pagerankScore: 0.3, combinedScore: 0.5 }],
       recalledEdges: [] as GmEdge[],
       pprScores: {} as Record<string, number>,
@@ -307,42 +300,34 @@ describe("TOPIC 节点在 assembleContext 中的保留", () => {
     expect(xml).toContain("<topic");
   });
 
-  it("TOPIC 节点在 active 阶段可以正常出现在图中", () => {
+  it("TOPIC 节点在 compact active 阶段可以正常出现在稳定图中", () => {
     const topicId = insertTopicNode(db, "topic-active", "活跃主题");
     const topicNode = findById(db, topicId)!;
 
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml } = assembleStableContext(db, null!, {
       hotNodes: [] as GmNode[],
       hotEdges: [] as GmEdge[],
       scopeHotNodes: [] as GmNode[],
       scopeHotEdges: [] as GmEdge[],
-      activeNodes: [topicNode],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [] as any[],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
+      compactActiveNodes: [topicNode],
+      compactActiveEdges: [] as GmEdge[],
     });
 
     expect(xml).toContain("topic-active");
     expect(xml).toContain("<topic");
   });
 
-  it("TOPIC 节点在 hot 阶段可以正常出现在图中", () => {
+  it("TOPIC 节点在 hot 阶段可以正常出现在稳定图中", () => {
     const topicId = insertTopicNode(db, "topic-hot", "热门主题");
     const topicNode = { ...findById(db, topicId)!, flags: ["hot"] } as GmNode;
 
-    const { xml } = assembleContext(db, null!, {
-      tokenBudget: 128_000,
+    const { xml } = assembleStableContext(db, null!, {
       hotNodes: [topicNode],
       hotEdges: [] as GmEdge[],
       scopeHotNodes: [] as GmNode[],
       scopeHotEdges: [] as GmEdge[],
-      activeNodes: [] as GmNode[],
-      activeEdges: [] as GmEdge[],
-      recalledNodes: [] as any[],
-      recalledEdges: [] as GmEdge[],
-      pprScores: {} as Record<string, number>,
+      compactActiveNodes: [] as GmNode[],
+      compactActiveEdges: [] as GmEdge[],
     });
 
     expect(xml).toContain("topic-hot");

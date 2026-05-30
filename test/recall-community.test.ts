@@ -9,7 +9,7 @@
  * 2. communityRepresentatives 按社区+时间排序
  * 3. 并行双路径召回（精确+泛化同时跑，合并去重）
  * 4. 社区描述生成 + 存储
- * 5. assemble 输出带社区分组和时间
+ * 5. assemble 相关输出已迁移到分层 API 的专项测试
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
@@ -21,7 +21,6 @@ import {
   getAllCommunitySummaries, pruneCommunitySummaries,
 } from "../src/store/store.ts";
 import { detectCommunities, getCommunityPeers } from "../src/graph/community.ts";
-import { assembleContext } from "../src/format/assemble.ts";
 import type { GmNode, GmEdge } from "../src/types.ts";
 
 let db: DatabaseSyncInstance;

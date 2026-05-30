@@ -1171,7 +1171,7 @@ export function recordNodeAccess(
 
 /**
  * Record access for multiple nodes at once (batch version for efficiency).
- * Called after each assembleContext to record which recalled nodes were used.
+ * Called after each prompt assembly to record which recalled nodes were used.
  */
 export function recordNodeAccessBatch(
   db: DatabaseSyncInstance,
