@@ -149,12 +149,13 @@ function formatEdge(e: GmEdge, fromName: string, toName: string, hasDescription:
  */
 
 export function buildSystemPromptAddition(params: {
-  selectedNodes: Array<{ type: string; src: "active" | "recalled"; tier: string }>;
-  edgeCount: number;
+  selectedNodes?: Array<{ type: string; src: "active" | "recalled"; tier: string }>;
+  edgeCount?: number;
   scopeHotCount?: number;
-}): string {
-  const { selectedNodes, edgeCount, scopeHotCount = 0 } = params;
-  if (selectedNodes.length === 0) return "";
+  force?: boolean;
+} = {}): string {
+  const { selectedNodes = [], edgeCount = 0, scopeHotCount = 0, force = false } = params;
+  if (selectedNodes.length === 0 && !force) return "";
 
   const recalledCount = selectedNodes.filter(n => n.src === "recalled").length;
   const skillCount = selectedNodes.filter(n => n.type === "SKILL").length;
@@ -241,7 +242,207 @@ export function buildSystemPromptAddition(params: {
   return sections.join("\n");
 }
 
+
+function renderKnowledgeGraph(params: {
+  nodes: MergedNode[];
+  edges: GmEdge[];
+  includeEpisodic?: boolean;
+  db?: DatabaseSyncInstance;
+  logLabel?: string;
+}): { xml: string | null; tokens: number; episodicXml: string; episodicTokens: number; renderedEdges: number; rawEdges: number } {
+  const passNodes = params.nodes.filter(n => n.tier !== "filtered");
+
+  if (!passNodes.length) {
+    return { xml: null, tokens: 0, episodicXml: "", episodicTokens: 0, renderedEdges: 0, rawEdges: params.edges.length };
+  }
+
+  const idToName = new Map<string, string>();
+  for (const n of passNodes) idToName.set(n.id, n.name);
+
+  const xmlParts: string[] = [];
+  for (const n of passNodes) {
+    const tag = n.type.toLowerCase();
+    const tier = n.tier;
+    const srcAttr = (tier !== "L1" && tier !== "L2" && tier !== "L3") ? ` source="${tier}"` : ` source="recalled"`;
+    const tierAttr = ` tier="${tier.toLowerCase()}"`;
+    const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
+    const beliefAttr = n.belief !== undefined ? ` confidence="${n.belief.toFixed(2)}"` : "";
+
+    if (tier === "L3") {
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}/>`);
+    } else if (tier === "L2") {
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}/>`);
+    } else {
+      const scopeAttr = tier === "scope_hot" ? ` scope_hot="true"` : "";
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}${scopeAttr}>\n${n.content.trim()}\n  </${tag}>`);
+    }
+  }
+
+  const seenEdgeIds = new Set<string>();
+  const edgesXmlParts: string[] = [];
+  for (const e of params.edges) {
+    if (seenEdgeIds.has(e.id)) continue;
+
+    const fromNode = passNodes.find(n => n.id === e.fromId);
+    const toNode = passNodes.find(n => n.id === e.toId);
+    const fromTier = (fromNode as any)?.tier as RecallTier ?? "filtered";
+    const toTier = (toNode as any)?.tier as RecallTier ?? "filtered";
+
+    if (!shouldRenderEdge(fromTier, toTier)) continue;
+    seenEdgeIds.add(e.id);
+
+    const fromName = idToName.get(e.fromId) ?? e.fromId;
+    const toName = idToName.get(e.toId) ?? e.toId;
+    const hasDesc = edgeHasDescription(fromTier, toTier);
+    edgesXmlParts.push(formatEdge(e, fromName, toName, hasDesc));
+  }
+
+  const tierCount = (tier: string) => passNodes.filter(n => n.tier === tier).length;
+  console.log(
+    `[graph-memory] assemble${params.logLabel ? `:${params.logLabel}` : ""}: ` +
+    `scope_hot=${tierCount("scope_hot")} ` +
+    `hot=${tierCount("hot")} ` +
+    `active=${tierCount("active")} ` +
+    `L1=${tierCount("L1")} ` +
+    `L2=${tierCount("L2")} ` +
+    `L3=${tierCount("L3")} ` +
+    `renderedEdges=${seenEdgeIds.size} (raw=${params.edges.length})`
+  );
+
+  const nodesXml = xmlParts.join("\n");
+  const edgesXml = edgesXmlParts.length
+    ? `\n  <edges>\n${edgesXmlParts.join("\n")}\n  </edges>`
+    : "";
+  const xml = `<knowledge_graph>\n${nodesXml}${edgesXml}\n</knowledge_graph>`;
+
+  let episodicXml = "";
+  if (params.includeEpisodic && params.db) {
+    const topNodes = passNodes.filter(n => n.tier !== "active").slice(0, 3);
+    const episodicParts: string[] = [];
+
+    for (const node of topNodes) {
+      if (!(node as any).sourceSessions?.length) continue;
+      const recentSessions = (node as any).sourceSessions.slice(-2);
+      const msgs = getEpisodicMessages(params.db, recentSessions, node.updatedAt, 500);
+      if (!msgs.length) continue;
+
+      const lines = msgs.map(m =>
+        `    [${m.role.toUpperCase()}] ${escapeXml(m.text.slice(0, 200))}`
+      ).join("\n");
+      episodicParts.push(`  <trace node="${node.name}">\n${lines}\n  </trace>`);
+    }
+
+    episodicXml = episodicParts.length
+      ? `<episodic_context>\n${episodicParts.join("\n")}\n</episodic_context>`
+      : "";
+  }
+
+  const content = xml + (episodicXml ? "\n\n" + episodicXml : "");
+  return {
+    xml,
+    tokens: Math.ceil(content.length / CHARS_PER_TOKEN),
+    episodicXml,
+    episodicTokens: Math.ceil(episodicXml.length / CHARS_PER_TOKEN),
+    renderedEdges: seenEdgeIds.size,
+    rawEdges: params.edges.length,
+  };
+}
+
 // ─── 组装主函数 ──────────────────────────────────────────────
+
+
+export interface AssembleStableParams {
+  scopeHotNodes: GmNode[];
+  scopeHotEdges: GmEdge[];
+  hotNodes: GmNode[];
+  hotEdges: GmEdge[];
+  compactActiveNodes?: GmNode[];
+  compactActiveEdges?: GmEdge[];
+}
+
+export interface AssembleDynamicParams {
+  recalledNodes: TieredNode[];
+  recalledEdges: GmEdge[];
+  stableNodeIds?: Set<string>;
+  pprScores?: Record<string, number>;
+  graphWalkDepth?: number;
+}
+
+export function assembleStableContext(
+  db: DatabaseSyncInstance,
+  cfg: GmConfig | null,
+  params: AssembleStableParams,
+): { xml: string | null; systemPrompt: string; context: string; tokens: number } {
+  const compactActiveNodes = params.compactActiveNodes ?? [];
+  const compactActiveEdges = params.compactActiveEdges ?? [];
+  const mergedNodes = mergeNodes(params.scopeHotNodes, params.hotNodes, [], compactActiveNodes);
+  const allEdges = mergeEdges(params.scopeHotEdges, mergeEdges(params.hotEdges, compactActiveEdges));
+  const rendered = renderKnowledgeGraph({ nodes: mergedNodes, edges: allEdges, logLabel: "stable" });
+
+  const systemPrompt = buildSystemPromptAddition({
+    selectedNodes: mergedNodes.filter(n => n.tier !== "filtered").map(n => ({
+      type: n.type,
+      src: "recalled" as const,
+      tier: n.tier.toLowerCase(),
+    })),
+    edgeCount: rendered.renderedEdges,
+    scopeHotCount: params.scopeHotNodes.length,
+    force: true,
+  });
+  const body = rendered.xml ? `${systemPrompt}\n\n<gm_memory>\n\n${rendered.xml}\n\n</gm_memory>` : systemPrompt;
+
+  console.log(
+    `[graph-memory] assemble tokens: stableSys=${Math.ceil(systemPrompt.length / 3)} ` +
+    `stableXml=${Math.ceil((rendered.xml ?? "").length / 3)} ` +
+    `total=${Math.ceil(body.length / 3)}`
+  );
+
+  return {
+    xml: rendered.xml,
+    systemPrompt,
+    context: body,
+    tokens: Math.ceil(body.length / CHARS_PER_TOKEN),
+  };
+}
+
+export function assembleDynamicContext(
+  db: DatabaseSyncInstance,
+  cfg: GmConfig | null,
+  params: AssembleDynamicParams,
+): { xml: string | null; context: string; tokens: number; episodicXml: string; episodicTokens: number } {
+  const stableNodeIds = params.stableNodeIds ?? new Set<string>();
+  const recalledNodes = params.recalledNodes.filter(n => !stableNodeIds.has(n.id));
+  const recalledNodeIds = new Set(recalledNodes.map(n => n.id));
+  const dynamicNodeIds = new Set([...recalledNodeIds]);
+
+  const recalledEdges = params.recalledEdges.filter(e => dynamicNodeIds.has(e.fromId) && dynamicNodeIds.has(e.toId));
+  const mergedNodes = mergeNodes([], [], recalledNodes, []);
+  const allEdges = recalledEdges;
+  const rendered = renderKnowledgeGraph({
+    nodes: mergedNodes,
+    edges: allEdges,
+    includeEpisodic: true,
+    db,
+    logLabel: "dynamic",
+  });
+
+  const gmBody = [rendered.xml, rendered.episodicXml].filter(Boolean).join("\n\n");
+  const context = gmBody ? `<gm_memory>\n\n${gmBody}\n\n</gm_memory>` : "";
+
+  console.log(
+    `[graph-memory] assemble tokens: dynamicXml=${Math.ceil((rendered.xml ?? "").length / 3)} ` +
+    `episodic=${Math.ceil(rendered.episodicXml.length / 3)} ` +
+    `total=${Math.ceil(context.length / 3)}`
+  );
+
+  return {
+    xml: rendered.xml,
+    context,
+    tokens: Math.ceil(context.length / CHARS_PER_TOKEN),
+    episodicXml: rendered.episodicXml,
+    episodicTokens: rendered.episodicTokens,
+  };
+}
 
 export interface AssembleParams {
   tokenBudget: number;

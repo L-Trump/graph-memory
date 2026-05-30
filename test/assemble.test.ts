@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
-import { assembleContext, buildSystemPromptAddition } from "../src/format/assemble.ts";
+import { assembleContext, assembleStableContext, assembleDynamicContext, buildSystemPromptAddition } from "../src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "../src/format/transcript-repair.ts";
 import { findById } from "../src/store/store.ts";
 import type { GmNode, GmEdge } from "../src/types.ts";
@@ -37,7 +37,7 @@ describe("buildSystemPromptAddition", () => {
     });
 
     expect(result).toContain("Graph Memory");
-    expect(result).toContain("1 recalled nodes from other conversations");
+    expect(result).toContain("知识图谱记忆");
   });
 
   it("丰富图谱包含导航说明", () => {
@@ -291,6 +291,66 @@ describe("hot 节点渲染", () => {
     expect(xml).toContain('name="使用"');
     expect(xml).toContain('from="hot-from"');
     expect(xml).toContain('to="hot-to"');
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════
+// 分层 assemble
+// ═══════════════════════════════════════════════════════════════
+
+describe("分层 assemble", () => {
+  it("stable context 只渲染 hot/scope_hot，不渲染 recalled", () => {
+    const hotId = insertNode(db, { name: "stable-hot", type: "SKILL", content: "hot content" });
+    const recalledId = insertNode(db, { name: "dynamic-recalled", type: "TASK", content: "dynamic content" });
+    const hotNode = findById(db, hotId)!;
+    const recalledNode = findById(db, recalledId)!;
+
+    const stable = assembleStableContext(db, null!, {
+      hotNodes: [hotNode],
+      hotEdges: [] as GmEdge[],
+      scopeHotNodes: [] as GmNode[],
+      scopeHotEdges: [] as GmEdge[],
+    });
+
+    expect(stable.context).toContain("Graph Memory");
+    expect(stable.context).toContain("stable-hot");
+    expect(stable.context).not.toContain("dynamic-recalled");
+    expect(stable.xml).toContain('tier="hot"');
+  });
+
+  it("dynamic context 过滤 stable 已包含节点，保留 L1 和 compact active", () => {
+    const hotId = insertNode(db, { name: "shared-hot", type: "SKILL", content: "hot content" });
+    const l1Id = insertNode(db, { name: "dynamic-l1", type: "KNOWLEDGE", content: "l1 content" });
+    const activeId = insertNode(db, { name: "compact-active", type: "TASK", content: "active content" });
+    const hotNode = findById(db, hotId)!;
+    const l1Node = findById(db, l1Id)!;
+    const activeNode = findById(db, activeId)!;
+
+    const stable = assembleStableContext(db, null!, {
+      hotNodes: [hotNode],
+      hotEdges: [] as GmEdge[],
+      scopeHotNodes: [] as GmNode[],
+      scopeHotEdges: [] as GmEdge[],
+      compactActiveNodes: [activeNode],
+      compactActiveEdges: [] as GmEdge[],
+    });
+
+    const dynamic = assembleDynamicContext(db, null!, {
+      recalledNodes: [
+        { ...hotNode, tier: "L1" as const, semanticScore: 1, pprScore: 0, pagerankScore: 0, combinedScore: 1 },
+        { ...l1Node, tier: "L1" as const, semanticScore: 1, pprScore: 0, pagerankScore: 0, combinedScore: 1 },
+      ],
+      recalledEdges: [] as GmEdge[],
+      stableNodeIds: new Set([hotNode.id, activeNode.id]),
+    });
+
+    expect(stable.context).toContain("compact-active");
+    expect(stable.context).toContain('tier="active"');
+    expect(dynamic.context).toContain("<gm_memory>");
+    expect(dynamic.context).toContain("dynamic-l1");
+    expect(dynamic.context).not.toContain("compact-active");
+    expect(dynamic.context).not.toContain("shared-hot");
   });
 });
 

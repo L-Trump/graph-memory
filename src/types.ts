@@ -194,6 +194,8 @@ export interface GmConfig {
   extractionRecentTurns: number;
   /** 是否启用衰减引擎（access-based decay scoring），默认 true */
   decayEnabled?: boolean;
+  /** 调试：输出 stable/dynamic 注入上下文前后片段，默认 false */
+  debugContextPreview?: boolean;
 }
 
 export const DEFAULT_CONFIG: GmConfig = {
@@ -207,4 +209,5 @@ export const DEFAULT_CONFIG: GmConfig = {
   pagerankIterations: 20,
   extractionRecentTurns: 3,
   decayEnabled: true,
+  debugContextPreview: false,
 };

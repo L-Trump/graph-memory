@@ -36,7 +36,7 @@ import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Recaller, type TieredNode } from "./src/recaller/recall.ts";
 import { Extractor } from "./src/extractor/extract.ts";
-import { assembleContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
+import { assembleContext, assembleStableContext, assembleDynamicContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { filterNoiseMessages } from "./src/extractor/noise-filter.ts";
@@ -156,6 +156,15 @@ function compactStripSessionFile(sessionFile: string): void {
 
 // ─── 规范化消息 content，确保 OpenClaw 对 content.filter() 不崩 ──
 
+
+function previewContextForLog(label: string, value: string, chars = 100): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return `${label}: empty`;
+  const head = normalized.slice(0, chars);
+  const tail = normalized.length > chars ? normalized.slice(-chars) : "";
+  return `${label}: len=${value.length} head="${head}"${tail ? ` tail="${tail}"` : ""}`;
+}
+
 function normalizeMessageContent(messages: any[]): any[] {
   return messages.map((msg: any) => {
     if (!msg || typeof msg !== "object") return msg;
@@ -259,6 +268,7 @@ const graphMemoryPlugin = {
     const msgSeq = new Map<string, number>();
     const recalled = new Map<string, { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }>();
     const turnCounter = new Map<string, number>(); // 社区维护计数器
+    const compactedActiveNodeIds = new Map<string, Set<string>>(); // compact 后需要补回上下文的 active 节点
 
     // ── Belief 追踪状态 ────────────────────────────────────────
     // 追踪每个 session 中本轮 recall 的节点
@@ -595,9 +605,18 @@ ${suggestionsText}
           })));
         }
 
-        // ── 组装 KG 并注入 appendSystemContext（优先级低于 Claw 核心设定）──
+        // ── 组装 KG：稳定层 → appendSystemContext，动态层 → prependContext ──
         const rec = recalled.get(sid) ?? { nodes: [], edges: [], pprScores: {} };
-        let activeNodes = getBySession(db, sid);
+        const hotNodes = getHotNodes(db);
+        const hotEdges = hotNodes.length > 0 ? getEdgesForNodes(db, hotNodes.map(n => n.id)) : [];
+        const sessionScopes = getScopesForSession(db, ctx?.sessionKey ?? ctx?.sessionId);
+        const scopeHotNodes = sessionScopes.length > 0 ? getScopeHotNodes(db, sessionScopes) : [];
+        const scopeHotEdges = scopeHotNodes.length > 0 ? getEdgesForNodes(db, scopeHotNodes.map(n => n.id)) : [];
+        const stableNodeIds = new Set<string>([...hotNodes, ...scopeHotNodes].map(n => n.id));
+
+        // compact 前 activeNodes 不注入；compact 后仅补回被压缩上下文中的 session 节点。
+        const compactActiveIds = compactedActiveNodeIds.get(sid) ?? new Set<string>();
+        let activeNodes = getBySession(db, sid).filter(n => compactActiveIds.has(n.id) && !stableNodeIds.has(n.id));
 
         // ── Active nodes 数量裁剪：从旧到新删除，配额保底 ────────
         if (activeNodes.length > 100) {
@@ -616,40 +635,41 @@ ${suggestionsText}
             else if (!["SKILL", "TASK", "EVENT", "KNOWLEDGE"].includes(node.type)) { toRemove.add(node.id); }
           }
           activeNodes = activeNodes.filter(n => !toRemove.has(n.id));
+          compactedActiveNodeIds.set(sid, new Set(activeNodes.map(n => n.id)));
         }
+
         const activeEdges = activeNodes.flatMap((n) => [
           ...edgesFrom(db, n.id),
           ...edgesTo(db, n.id),
         ]);
-        const hotNodes = getHotNodes(db);
-        const hotEdges = hotNodes.length > 0 ? getEdgesForNodes(db, hotNodes.map(n => n.id)) : [];
-        const sessionScopes = getScopesForSession(db, ctx?.sessionKey ?? ctx?.sessionId);
-        const scopeHotNodes = sessionScopes.length > 0 ? getScopeHotNodes(db, sessionScopes) : [];
-        const scopeHotEdges = scopeHotNodes.length > 0 ? getEdgesForNodes(db, scopeHotNodes.map(n => n.id)) : [];
 
         if (activeNodes.length === 0 && rec.nodes.length === 0 && hotNodes.length === 0 && scopeHotNodes.length === 0) {
           return;
         }
 
-        const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, cfg, {
-          tokenBudget: 0,
+        const stable = assembleStableContext(db, cfg, {
           scopeHotNodes,
           scopeHotEdges,
           hotNodes,
           hotEdges,
-          activeNodes,
-          activeEdges,
+          compactActiveNodes: activeNodes,
+          compactActiveEdges: activeEdges,
+        });
+
+        const dynamic = assembleDynamicContext(db, cfg, {
           recalledNodes: rec.nodes,
           recalledEdges: rec.edges,
+          stableNodeIds,
           pprScores: rec.pprScores,
           graphWalkDepth: cfg.recallMaxDepth,
         });
 
-        if (gmTokens > 0 || episodicTokens > 0) {
+        if (stable.tokens > 0 || dynamic.tokens > 0) {
           api.logger.info(
-            `[graph-memory] bpb inject: graph ~${gmTokens} tok` +
+            `[graph-memory] bpb inject split: stable ~${stable.tokens} tok, dynamic ~${dynamic.tokens} tok` +
             (scopeHotNodes.length > 0 ? `, scope_hot=${scopeHotNodes.length}` : "") +
-            (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
+            (activeNodes.length > 0 ? `, compact_active=${activeNodes.length}` : "") +
+            (dynamic.episodicTokens > 0 ? `, episodic ~${dynamic.episodicTokens} tok` : ""),
           );
         }
 
@@ -659,15 +679,17 @@ ${suggestionsText}
           recordNodeAccessBatch(db, l1NodeIds);
         }
 
-        // systemPrompt → appendSystemContext（追加在 prompt 末尾）
-        // xml + episodicXml → <gm_memory> 包裹后作为 prependContext（前置）
-        const gmBody = [xml, episodicXml].filter(Boolean).join("\n\n");
-        const append = gmBody ? `${systemPrompt}\n\n<gm_memory>\n\n${gmBody}\n\n</gm_memory>` : "";
-        // const append = systemPrompt;
+        const append = stable.context;
+        const prepend = dynamic.context;
 
-        if (append) {
+        if (cfg.debugContextPreview || process.env.GM_DEBUG_CONTEXT_PREVIEW === "1") {
+          api.logger.info(`[graph-memory] context preview ${previewContextForLog("stable", append)}`);
+          api.logger.info(`[graph-memory] context preview ${previewContextForLog("dynamic", prepend)}`);
+        }
+
+        if (append || prepend) {
           return {
-            // ...(prepend ? { prependContext: prepend } : {}),
+            ...(prepend ? { prependContext: prepend } : {}),
             ...(append ? { appendSystemContext: append } : {}),
           };
         }
@@ -746,11 +768,22 @@ ${suggestionsText}
         // ── 先清理 sessionFile 中的 gm_memory 标签 ────────────
         compactStripSessionFile(sessionFile);
 
+        const markCompactedActiveNodes = () => {
+          const stableIds = new Set<string>([
+            ...getHotNodes(db).map(n => n.id),
+            ...getScopeHotNodes(db, getScopesForSession(db, sessionKey ?? sessionId)).map(n => n.id),
+          ]);
+          const sessionNodes = getBySession(db, sessionId).filter(n => !stableIds.has(n.id));
+          compactedActiveNodeIds.set(sessionId, new Set(sessionNodes.map(n => n.id)));
+          api.logger.info(`[graph-memory] compact active nodes marked: ${sessionNodes.length}`);
+        };
+
         const msgs = getUnextracted(db, sessionId, 50);
 
         // ── Input-layer noise filter ───────────────────────
         const filteredMsgs = filterNoiseMessages(msgs, extractUserText);
         if (!filteredMsgs.length) {
+          markCompactedActiveNodes();
           return await delegateCompactionToRuntime(params);
           // return {
           //   ok: true, compacted: false,
@@ -790,6 +823,7 @@ ${suggestionsText}
           }
         }
 
+        markCompactedActiveNodes();
         return await delegateCompactionToRuntime(params);
         // return {
         //   ok: true, compacted: false,
