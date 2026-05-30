@@ -13,6 +13,7 @@ import {
 } from "../src/store/store.ts";
 
 const TEST_DB = "/tmp/gm-test.db";
+const describeRealDb = process.env.RUN_GM_REAL_DB_TESTS === "1" ? describe : describe.skip;
 
 // 真实 buildSubgraphResult（从 index.ts 复制，tier 过滤版，无连通性过滤）
 function buildSubgraphResult(roots: any[], nodes: any[], edges: any[]) {
@@ -44,7 +45,7 @@ function buildSubgraphResult(roots: any[], nodes: any[], edges: any[]) {
   };
 }
 
-describe("gm_dream 真实数据库测试", () => {
+describeRealDb("gm_dream 真实数据库测试", () => {
   it("池A和池B有数据", () => {
     const db = new DatabaseSync(TEST_DB);
     const POOL_HOURS = 168;

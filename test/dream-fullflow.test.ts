@@ -12,6 +12,7 @@ import {
 } from "../src/store/store.ts";
 
 const TEST_DB = "/tmp/gm-test.db";
+const describeRealDb = process.env.RUN_GM_REAL_DB_TESTS === "1" ? describe : describe.skip;
 
 // 复制 gm_dream 的 exponentialDecayPick
 function exponentialDecayPick<T extends Record<string, unknown>>(
@@ -66,7 +67,7 @@ function buildSubgraphResult(roots: any[], nodes: any[], edges: any[]) {
   };
 }
 
-describe("gm_dream 完整流程", () => {
+describeRealDb("gm_dream 完整流程", () => {
   it("一次做梦，两个 seed 各自带 45 节点", async () => {
     const db = new DatabaseSync(TEST_DB);
     const recaller = new Recaller(db, { ...DEFAULT_CONFIG, recallMaxNodes: 45 });

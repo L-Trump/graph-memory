@@ -2,6 +2,7 @@
  * graph-memory — gm_dream 真实数据库隔离测试
  * 使用 /tmp/gm-test.db（真实数据库副本）进行测试
  */
+import { describe, it } from "vitest";
 import { DatabaseSync } from "@photostructure/sqlite";
 import { Recaller } from "../src/recaller/recall.ts";
 import { DEFAULT_CONFIG } from "../src/types.ts";
@@ -10,6 +11,10 @@ import {
   getRecentlyCreatedNodes,
 } from "../src/store/store.ts";
 
+const describeRealDb = process.env.RUN_GM_REAL_DB_TESTS === "1" ? describe : describe.skip;
+
+describeRealDb("gm_dream 真实数据库脚本测试", () => {
+  it("runs against /tmp/gm-test.db", async () => {
 // ─── 加载真实数据库副本 ─────────────────────────────────────────
 const TEST_DB_PATH = "/tmp/gm-test.db";
 const db = new DatabaseSync(`file:${TEST_DB_PATH}?mode=ro`, { readOnly: true });
@@ -192,3 +197,5 @@ if (recalledCandidates.length > 0) {
 console.log("\n=== 测试完成 ===");
 db.close();
 dbRw.close();
+  });
+});

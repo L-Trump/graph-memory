@@ -4,7 +4,7 @@
  * By: adoresever
  * Email: Wywelljob@gmail.com
  *
- * 测试个性化 PageRank、全局 PageRank、社区检测、向量去重
+ * 测试个性化 PageRank、全局 PageRank、向量去重
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
@@ -138,7 +138,7 @@ describe("Global PageRank", () => {
 // ═══════════════════════════════════════════════════════════════
 
 describe("Vector Dedup", () => {
-  it("相似向量被检测为重复", () => {
+  it("相似向量被检测为重复", async () => {
     const a = insertNode(db, { name: "conda-env-create", type: "SKILL" });
     const b = insertNode(db, { name: "conda-create-environment", type: "SKILL" });
 
@@ -149,12 +149,12 @@ describe("Vector Dedup", () => {
     saveVector(db, a, "content a", vecA);
     saveVector(db, b, "content b", vecB);
 
-    const pairs = detectDuplicates(db, { ...cfg, dedupThreshold: 0.9 });
+    const pairs = await detectDuplicates(db, { ...cfg, dedupThreshold: 0.9 });
     expect(pairs.length).toBeGreaterThanOrEqual(1);
     expect(pairs[0].similarity).toBeGreaterThan(0.9);
   });
 
-  it("不同向量不被当作重复", () => {
+  it("不同向量不被当作重复", async () => {
     const a = insertNode(db, { name: "docker-build", type: "SKILL" });
     const b = insertNode(db, { name: "conda-create", type: "SKILL" });
 
@@ -165,11 +165,11 @@ describe("Vector Dedup", () => {
     saveVector(db, a, "content a", vecA);
     saveVector(db, b, "content b", vecB);
 
-    const pairs = detectDuplicates(db, { ...cfg, dedupThreshold: 0.9 });
+    const pairs = await detectDuplicates(db, { ...cfg, dedupThreshold: 0.9 });
     expect(pairs).toHaveLength(0);
   });
 
-  it("dedup 自动合并同类型重复节点", () => {
+  it("dedup 自动合并同类型重复节点", async () => {
     const a = insertNode(db, { name: "skill-v1", type: "SKILL", validatedCount: 5 });
     const b = insertNode(db, { name: "skill-v1-dup", type: "SKILL", validatedCount: 2 });
 
@@ -177,7 +177,7 @@ describe("Vector Dedup", () => {
     saveVector(db, a, "content", vec);
     saveVector(db, b, "content", vec); // 完全相同的向量
 
-    const { merged } = dedup(db, { ...cfg, dedupThreshold: 0.9 });
+    const { merged } = await dedup(db, { ...cfg, dedupThreshold: 0.9 });
     expect(merged).toBe(1);
 
     // a 应该还是 active（validatedCount 更高）
@@ -190,7 +190,7 @@ describe("Vector Dedup", () => {
     expect(bAfter.status).toBe("deprecated");
   });
 
-  it("不同类型不合并", () => {
+  it("不同类型不合并", async () => {
     const a = insertNode(db, { name: "skill-x", type: "SKILL" });
     const b = insertNode(db, { name: "event-x", type: "EVENT" });
 
@@ -198,13 +198,13 @@ describe("Vector Dedup", () => {
     saveVector(db, a, "content", vec);
     saveVector(db, b, "content", vec);
 
-    const { merged } = dedup(db, { ...cfg, dedupThreshold: 0.9 });
+    const { merged } = await dedup(db, { ...cfg, dedupThreshold: 0.9 });
     expect(merged).toBe(0);
   });
 
-  it("没有向量时安全跳过", () => {
+  it("没有向量时安全跳过", async () => {
     insertNode(db, { name: "no-vec" });
-    const { pairs, merged } = dedup(db, cfg);
+    const { pairs, merged } = await dedup(db, cfg);
     expect(pairs).toHaveLength(0);
     expect(merged).toBe(0);
   });

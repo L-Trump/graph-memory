@@ -308,7 +308,7 @@ export function graphWalk(
   let frontier = new Set<string>(seedIds);
   const nodeIdList: string[] = [...seedIds];
 
-  for (let depth = 1; depth < maxDepth && frontier.size > 0; depth++) {
+  for (let depth = 0; depth < maxDepth && frontier.size > 0; depth++) {
     if (visited.size >= maxNodes) break;
 
     const frontierArr = Array.from(frontier);
@@ -318,7 +318,7 @@ export function graphWalk(
     const rows = db.prepare(`
       SELECT from_id, to_id FROM gm_edges
       WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})
-    `).all(...frontierArr) as any[];
+    `).all(...frontierArr, ...frontierArr) as any[];
 
     const nextFrontier = new Set<string>();
     for (const { from_id, to_id } of rows) {

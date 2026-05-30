@@ -8,8 +8,9 @@ import { DEFAULT_CONFIG } from "../src/types.ts";
 import { findById } from "../src/store/store.ts";
 
 const TEST_DB = "/tmp/gm-test.db";
+const describeRealDb = process.env.RUN_GM_REAL_DB_TESTS === "1" ? describe : describe.skip;
 
-describe("exploreSubgraph 调试", () => {
+describeRealDb("exploreSubgraph 调试", () => {
   it("findById 能找到节点", () => {
     const db = new DatabaseSync(TEST_DB);
     const node = findById(db, "session-scan-strictly-greater-than-3-hours");
