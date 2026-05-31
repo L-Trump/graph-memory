@@ -14,7 +14,6 @@
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { delegateCompactionToRuntime } from "openclaw/plugin-sdk";
-import { readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { getDb } from "./src/store/db.ts";
@@ -97,58 +96,31 @@ function cleanPrompt(raw: string): string {
   return prompt;
 }
 
-// ─── 去掉消息开头的 <gm_memory>...</gm_memory> 标签（防止每轮累积）───
+// ─── Remove transient Graph Memory context from persisted message content ───
 
 function stripGmMemoryFromText(text: string): string {
-  // 只去掉字符串开头的 <gm_memory>...</gm_memory> 块
   return text.trim().replace(/^<gm_memory>[\s\S]*?<\/gm_memory>/i, "").trim();
 }
 
-// ─── Compact 时清理 sessionFile 中每条消息开头的 gm_memory 标签 ───
-
-// ─── Compact 时清理 sessionFile 中每条消息开头的 gm_memory 标签 ───
-
-
 function stripContentBlocks(content: any): any {
   if (typeof content === "string") {
-    return stripGmMemoryFromText(content);
+    const stripped = stripGmMemoryFromText(content);
+    return stripped === content ? content : stripped;
   } else if (Array.isArray(content)) {
-    return content.map((block: any) => {
+    let changed = false;
+    const fixed = content.map((block: any) => {
       if (block && block.type === "text" && typeof block.text === "string") {
-        return { ...block, text: stripGmMemoryFromText(block.text) };
+        const stripped = stripGmMemoryFromText(block.text);
+        if (stripped !== block.text) {
+          changed = true;
+          return { ...block, text: stripped };
+        }
       }
       return block;
     });
+    return changed ? fixed : content;
   }
   return content;
-}
-
-function compactStripSessionFile(sessionFile: string): void {
-  try {
-    const content = readFileSync(sessionFile, "utf-8");
-    const lines = content.split("\n").filter((line) => line.trim());
-    const cleaned = lines.map((line) => {
-      try {
-        const msg = JSON.parse(line);
-        // 处理顶层 content（assembler/ingest 直接存入的格式）
-        if (msg.content !== undefined) {
-          msg.content = stripContentBlocks(msg.content);
-        }
-        // 处理 message.content（JSONL session 标准格式）
-        if (msg.message?.content !== undefined) {
-          msg.message.content = stripContentBlocks(msg.message.content);
-        }
-        return JSON.stringify(msg);
-      } catch {
-        // 非 JSON 行直接保留
-        return line;
-      }
-    });
-    writeFileSync(sessionFile, cleaned.join("\n") + "\n", "utf-8");
-    console.debug(`[graph-memory] stripped gm_memory from sessionFile: ${sessionFile}`);
-  } catch (err) {
-    console.warn(`[graph-memory] failed to strip gm_memory from sessionFile: ${err}`);
-  }
 }
 
 // ─── 规范化消息 content，确保 OpenClaw 对 content.filter() 不崩 ──
@@ -568,6 +540,31 @@ ${suggestionsText}
       return next;
     }
 
+    // Keep per-turn Graph Memory context out of the persisted transcript.
+    // `prependContext` is still included in the current LLM request, but the
+    // persisted user message must not carry it forward into future turns.
+    api.on("before_message_write", (event: any) => {
+      const message = event?.message;
+      if (!message || typeof message !== "object") return;
+      let changed = false;
+      const next: any = { ...message };
+      if (next.content !== undefined) {
+        const stripped = stripContentBlocks(next.content);
+        if (stripped !== next.content) {
+          next.content = stripped;
+          changed = true;
+        }
+      }
+      if (next.message?.content !== undefined) {
+        const stripped = stripContentBlocks(next.message.content);
+        if (stripped !== next.message.content) {
+          next.message = { ...next.message, content: stripped };
+          changed = true;
+        }
+      }
+      return changed ? { message: next } : undefined;
+    });
+
         // ── before_prompt_build：召回 + 渲染 KG（注入 appendSystemContext）───
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {
@@ -793,8 +790,9 @@ ${suggestionsText}
         // 知识提取使用 fire-and-forget，不阻塞 compaction 返回
         const { sessionId, sessionKey, sessionFile, force, currentTokenCount } = params;
 
-        // ── 先清理 sessionFile 中的 gm_memory 标签 ────────────
-        compactStripSessionFile(sessionFile);
+        // Session transcripts are owned by the OpenClaw runtime.  Do not
+        // rewrite `sessionFile` from compact hooks; transcript cleanup belongs
+        // on the guarded write path (`before_message_write`).
 
         const markCompactedActiveNodes = () => {
           const stableIds = new Set<string>([
@@ -881,8 +879,10 @@ ${suggestionsText}
       }) {
         if (isHeartbeat) return;
 
-        // 清理 sessionFile 中的 gm_memory 标签
-        if (sessionFile) compactStripSessionFile(sessionFile);
+        // Session transcripts are owned by the OpenClaw runtime.  Do not
+        // rewrite `sessionFile` from afterTurn; persisted cleanup is handled by
+        // `before_message_write`, while the sliced messages below are sanitized
+        // before storage/extraction.
 
         // 消息入库（同步，零 LLM）
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
