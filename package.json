@@ -1,7 +1,7 @@
 {
   "name": "graph-memory",
   "version": "3.0.0",
-  "description": "Knowledge Graph Memory Engine for OpenClaw — with Personalized PageRank, community detection, and vector dedup",
+  "description": "Knowledge Graph Memory Engine for OpenClaw — precise recall with Personalized PageRank, access decay, vector dedup, and retention maintenance",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {

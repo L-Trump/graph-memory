@@ -25,7 +25,6 @@ Message in
   └─ ContextEngine.ingest(): save raw message to gm_messages synchronously
 
 before_prompt_build hook
-  ├─ filterNoiseMessages(): skip obvious boilerplate / denial / memory-meta messages
   ├─ Recaller.recallV2(): precise recall only
   ├─ saveRecalledNodes(): persist per-turn recalled nodes to gm_recalled
   ├─ assembleStableContext(): scope_hot + hot + compacted active nodes → appendSystemContext
@@ -102,7 +101,7 @@ This means graph-memory is not called from a CLI loop. It runs inside the OpenCl
 
 1. Clean the current prompt with `cleanPrompt`.
 2. Build two recall queries:
-   - `historyQuery`: the last few messages, excluding the current prompt.
+   - `historyQuery`: the last 2 user-bounded turns, excluding the current prompt.
    - `promptQuery`: the cleaned current user prompt.
 3. Run `parallelRecall(recaller, historyQuery, promptQuery)` and merge results.
 4. Persist recalled nodes into `gm_recalled` for dream/retention/debugging.
@@ -175,6 +174,10 @@ Query
       ├─ access-based decay adjusts combinedScore when decayEnabled !== false
       └─ tiers: L1 / L2 / L3 / filtered
 ```
+
+`before_prompt_build` runs recall twice: once from the last 2 user-bounded history turns and once from the current prompt, then merges by node name with tier priority. The merged recall result is persisted to `gm_recalled`; only L1 nodes update access tracking after assembly.
+
+PPR teleports to semantic seeds. Global PageRank candidates are only expansion anchors, not PPR seeds. Dangling PPR mass is returned to the semantic seeds.
 
 Keyword hybrid scoring mixes vector similarity with keyword overlap:
 
@@ -293,25 +296,17 @@ Node type controls decay speed and floor:
 
 | Type | Behavior |
 |------|----------|
-| `SKILL`, `TOPIC` | Very stable; high floor; slow decay |
-| `KNOWLEDGE` | Moderately stable |
-| `EVENT` | Medium/fast decay |
-| `TASK` | Completed tasks fade faster |
-| `STATUS` | Fastest decay; intended for snapshots |
+| `SKILL`, `TOPIC` | Very stable; floor 0.8; slow decay |
+| `KNOWLEDGE` | Moderately stable; floor 0.65 |
+| `EVENT` | Medium/fast decay; floor 0.35 |
+| `TASK` | Completed tasks fade faster; floor 0.35 |
+| `STATUS` | Fastest decay; floor 0.2; intended for snapshots |
 
-The recall score is multiplied by a factor derived from this composite score. `decayEnabled=false` disables this ranking adjustment.
+The recall score is multiplied by `0.3 + 0.7 × max(typeFloor, composite)`, then results are re-sorted and re-tiered. `decayEnabled=false` disables this ranking adjustment.
 
 #### 4. Semantic soft deletion
 
-Nodes are not hard-deleted by normal tools. `gm_remove` and `gm_merge` mark nodes as `deprecated`. Deprecated nodes are filtered out of normal search/recall and edge creation. If a deprecated node is later upserted or receives flags, it can be revived to `active`.
-
-### Access-based decay
-
-Recall results are adjusted by a Weibull-style access-based decay engine:
-
-- `access_count` and `last_accessed_at` are recorded for L1 recalled nodes.
-- Node type controls intrinsic stability: SKILL/TOPIC decay slowest, STATUS/TASK decay fastest.
-- `decayEnabled=false` disables the adjustment.
+Nodes are not hard-deleted by normal tools. `gm_remove` and `gm_merge` mark nodes as `deprecated`; `gm_remove` also removes incident edges. Deprecated nodes are filtered out of normal search/recall and edge creation. If a deprecated node is later upserted or receives flags, it can be revived to `active`.
 
 ### Topic and session induction
 
@@ -339,8 +334,18 @@ Community detection/runtime code has been removed. The legacy `gm_nodes.communit
 
 ### gm_dream and gm_explore
 
-- `gm_explore(nodeName, maxNodes?)`: explores a node-centered subgraph using semantic neighbors + graph walk; returns L1-oriented subgraph text for LLM use.
-- `gm_dream()`: samples one seed from recently recalled nodes and one seed from recently created nodes using exponential time decay, explores both subgraphs, and returns material for maintenance/reflection.
+- `gm_explore(nodeName, maxNodes?)`: explores a node-centered subgraph using semantic neighbors + graph walk; returns an L1-oriented subgraph text for LLM use. It records access for returned L1 nodes. If the seed has no related nodes, it returns an `isolated: true` result instead of fabricating context.
+- `gm_dream()`: samples anchors from two recent pools: recalled nodes and newly created nodes. Each pool is limited to the last 168 hours (7 days) and 50 entries, then sampled with exponential time decay. For each sampled seed, it explores the seed subgraph and also supplements active nodes from the seed's most recent session.
+
+## Extraction, induction, and testing details
+
+- `extract.ts` renders each message block with an ~800-character cap and skips thinking blocks.
+- Extraction prompts reject common-sense knowledge; `beliefUpdates` only update existing recalled nodes, not nodes created in the same extraction.
+- `beliefUpdates` use verdict `supported` / `contradicted`, weight `0.5..2.0`, and truncated reasons.
+- `advisorySuggestions` are only acted on for newly created nodes and are usually triggered by long content or complex structured data.
+- Topic induction only creates/updates TOPIC nodes and topic edges. It hard-validates `semantic → TOPIC` as `主题属于`, and `TOPIC ↔ TOPIC` as `主题包含` / `主题父级`.
+- LLM calls disable tool calls (`tool_choice: none`), use low temperature, timeout/retry; embedding startup pings the endpoint and falls back to FTS5 if unavailable.
+- Most tests use mocked LLMs. `belief-e2e.test.ts` uses a production DB copy plus real LLM config. Dream real-DB tests require `RUN_GM_REAL_DB_TESTS=1`.
 
 ## Agent tools (22 total)
 
@@ -367,7 +372,7 @@ Community detection/runtime code has been removed. The legacy `gm_nodes.communit
 | `gm_reembedding_all(confirm, force?)` | Recompute embeddings for all active nodes; requires `confirm=true` |
 | `gm_induce_topics(name)` | Induce topics centered on a node |
 | `gm_explore(nodeName, maxNodes?)` | Explore a node-centered subgraph |
-| `gm_dream()` | Random decayed exploration from recent recalled/created memory pools |
+| `gm_dream()` | Random decayed exploration from recent recalled/created pools; 7-day/50-entry seed windows |
 
 ## Configuration
 
@@ -389,7 +394,9 @@ Community detection/runtime code has been removed. The legacy `gm_nodes.communit
 | `retention.maxDeletePerRun` | `20000` | Shared deletion budget for `gm_messages` then `gm_recalled` |
 | `retention.vacuum` | `false` | Run SQLite `VACUUM` after cleanup; disabled by default |
 
-### Embedding providers
+### LLM and embedding providers
+
+LLM extraction/finalization calls use either plugin `llm.apiKey + llm.baseURL` (OpenAI-compatible chat completions) or Anthropic config fallback. GM sets `tool_choice: "none"`, temperature 0.1, 90s timeout, and retries 429/500/502/503/529.
 
 Embeddings are OpenAI-compatible HTTP calls. Known working targets include:
 
@@ -400,7 +407,7 @@ Embeddings are OpenAI-compatible HTTP calls. Known working targets include:
 | MiniMax | `https://api.minimax.chat/v1` | `embo-01` |
 | Ollama | `http://localhost:11434/v1` | `nomic-embed-text` |
 
-Without embedding config, graph-memory falls back to FTS5/LIKE search.
+Without embedding config, or if the startup embedding ping fails, graph-memory falls back to FTS5/LIKE search. Embedding calls use an OpenAI-compatible `/embeddings` endpoint with optional `dimensions`, a 10s timeout, and retries.
 
 ## Database
 
@@ -416,7 +423,7 @@ SQLite WAL mode at `~/.openclaw/graph-memory.db`.
 | `gm_vectors` | Embedding vectors keyed by node id |
 | `gm_communities` | Legacy compatibility table; runtime no longer uses it |
 | `gm_scopes` | Session ↔ scope bindings |
-| `gm_recalled` | Per-session recalled node records used by retention and dream |
+| `gm_recalled` | Per-session merged recall records written by `before_prompt_build`; used by retention and dream recalled-pool sampling |
 | `gm_belief_signals` | Belief evidence records |
 | `_migrations` | Migration tracker |
 
@@ -436,7 +443,7 @@ npm run build
 npm test
 ```
 
-Default `npm test` skips real-DB dream/debug tests that require `/tmp/gm-test.db`. To run them explicitly:
+Default `npm test` uses mocked LLMs for most unit tests and skips real-DB dream/debug tests that require `/tmp/gm-test.db`. `belief-e2e.test.ts` is the notable real-LLM e2e test: it copies the production graph DB to a temp DB and reads graph-memory LLM config from OpenClaw config. To run the gated real-DB dream/debug tests explicitly:
 
 ```bash
 RUN_GM_REAL_DB_TESTS=1 npm test

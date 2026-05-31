@@ -23,7 +23,6 @@ graph-memory 将对话转化为持久化知识图谱，并在之后的 OpenClaw 
   └─ ContextEngine.ingest(): 同步保存原始消息到 gm_messages，不调用 LLM
 
 before_prompt_build hook
-  ├─ filterNoiseMessages(): 过滤明显 boilerplate / 拒绝回复 / 记忆元问题
   ├─ Recaller.recallV2(): 仅精确召回路径
   ├─ saveRecalledNodes(): 将本轮召回节点写入 gm_recalled
   ├─ assembleStableContext(): scope_hot + hot + compact 后 active 节点 → appendSystemContext
@@ -100,7 +99,7 @@ graph-memory 通过两层入口接入 OpenClaw：
 
 1. 用 `cleanPrompt` 清理当前 prompt。
 2. 构造两条召回 query：
-   - `historyQuery`：最近几条历史消息，不包含当前 prompt。
+   - `historyQuery`：最近 2 个以用户消息为边界的历史轮次，不包含当前 prompt。
    - `promptQuery`：清理后的当前用户 prompt。
 3. 执行 `parallelRecall(recaller, historyQuery, promptQuery)` 并合并结果。
 4. 将召回节点写入 `gm_recalled`，供 dream、retention 和调试使用。
@@ -173,6 +172,10 @@ Query
       ├─ decayEnabled !== false 时应用访问衰减评分
       └─ 分层：L1 / L2 / L3 / filtered
 ```
+
+`before_prompt_build` 会跑两次 recall：一次基于最近 2 个用户边界历史轮次，一次基于当前 prompt，然后按节点名和 tier 优先级合并。合并后的召回结果会写入 `gm_recalled`；只有 L1 节点在 assemble 后更新 access tracking。
+
+PPR teleport 回语义种子。全局 PageRank 候选只作为扩展锚点，不作为 PPR seed。PPR dangling mass 也回到语义种子。
 
 关键词混合语义评分：
 
@@ -291,25 +294,17 @@ intrinsic = 节点类型重要性 × belief
 
 | 类型 | 行为 |
 |------|------|
-| `SKILL`, `TOPIC` | 最稳定，高 floor，慢衰减 |
-| `KNOWLEDGE` | 较稳定 |
-| `EVENT` | 中等/偏快衰减 |
-| `TASK` | 完成任务会更快淡出 |
-| `STATUS` | 最快衰减，适合快照 |
+| `SKILL`, `TOPIC` | 最稳定，floor 0.8，慢衰减 |
+| `KNOWLEDGE` | 较稳定，floor 0.65 |
+| `EVENT` | 中等/偏快衰减，floor 0.35 |
+| `TASK` | 完成任务会更快淡出，floor 0.35 |
+| `STATUS` | 最快衰减，floor 0.2，适合快照 |
 
-召回分数会乘以由 composite 推导出的因子。`decayEnabled=false` 可关闭该排名调整。
+召回分数会乘以 `0.3 + 0.7 × max(typeFloor, composite)`，然后重新排序和分层。`decayEnabled=false` 可关闭该排名调整。
 
 #### 4. 语义软删除
 
-常规工具不会硬删除节点。`gm_remove` 和 `gm_merge` 会把节点标记为 `deprecated`。Deprecated 节点会从正常搜索、召回和边创建中过滤掉。如果 deprecated 节点之后被重新 upsert 或设置 flags，会被复活为 `active`。
-
-### 访问衰减
-
-召回结果会经过 Weibull 风格访问衰减引擎调整：
-
-- L1 召回节点会记录 `access_count` 和 `last_accessed_at`。
-- 节点类型决定固有稳定性：SKILL/TOPIC 最稳定，STATUS/TASK 衰减最快。
-- `decayEnabled=false` 可关闭该调整。
+常规工具不会硬删除节点。`gm_remove` 和 `gm_merge` 会把节点标记为 `deprecated`；`gm_remove` 还会删除该节点的关联边。Deprecated 节点会从正常搜索、召回和边创建中过滤掉。如果 deprecated 节点之后被重新 upsert 或设置 flags，会被复活为 `active`。
 
 ### 主题归纳和 Session 归纳
 
@@ -337,8 +332,18 @@ community 运行逻辑已经移除。只保留 legacy schema：`gm_nodes.communi
 
 ### gm_dream 与 gm_explore
 
-- `gm_explore(nodeName, maxNodes?)`：从指定节点出发探索语义邻居 + 图结构子图，返回适合 LLM 阅读的 L1 子图文本。
-- `gm_dream()`：从最近召回池和最近创建池各按指数时间衰减随机选一个锚点，探索子图，供后续整理/合并/冲突发现。
+- `gm_explore(nodeName, maxNodes?)`：从指定节点出发，使用语义邻居 + 图遍历探索子图，返回 L1 导向的子图文本供 LLM 使用，并记录返回 L1 节点的访问。如果种子没有关联节点，会返回 `isolated: true`，不会编造上下文。
+- `gm_dream()`：从两个最近池中抽样锚点：最近召回节点池和最近创建节点池。每个池限定最近 168 小时（7 天）且最多 50 条，然后按指数时间衰减抽样。对每个种子探索其子图，并补充该种子最近 session 的 active nodes。
+
+## 提取、归纳与测试细节
+
+- extract 阶段每个 message block 最多渲染约 800 字，跳过 thinking block。
+- 提取 prompt 会拒绝普通常识；`beliefUpdates` 只更新已召回旧节点，不更新本轮新节点。
+- `beliefUpdates` 的 weight 范围是 0.5-2.0，reason 会截断。
+- `advisorySuggestions` 只对本轮新建节点生效，常由长内容或复杂结构数据触发。
+- Topic induction 只创建/更新 TOPIC 和 topic 边；硬约束为 semantic→TOPIC 的“主题属于”，以及 TOPIC↔TOPIC 的“主题包含/主题父级”。
+- LLM 调用禁止工具调用（`tool_choice: none`），低温度，带 timeout/retry；embedding 启动会 ping，失败则 FTS5 fallback。
+- 多数测试用 mock LLM；`belief-e2e.test.ts` 使用生产 DB copy + 真实 LLM 配置；dream 真实 DB 测试需 `RUN_GM_REAL_DB_TESTS=1`。
 
 ## Agent 工具（22 个）
 
@@ -365,7 +370,7 @@ community 运行逻辑已经移除。只保留 legacy schema：`gm_nodes.communi
 | `gm_reembedding_all(confirm, force?)` | 重算所有 active 节点 embedding，必须 `confirm=true` |
 | `gm_induce_topics(name)` | 以节点为中心归纳主题 |
 | `gm_explore(nodeName, maxNodes?)` | 探索节点中心子图 |
-| `gm_dream()` | 从最近召回/创建记忆池随机漫游子图 |
+| `gm_dream()` | 从最近召回/创建池随机漫游子图；种子窗口为 7 天/50 条 |
 
 ## 配置参数
 
@@ -414,7 +419,7 @@ SQLite WAL 模式，默认路径 `~/.openclaw/graph-memory.db`。
 | `gm_vectors` | 按 node_id 存储的 embedding 向量 |
 | `gm_communities` | legacy 兼容表，运行逻辑不再使用 |
 | `gm_scopes` | Session ↔ scope 绑定 |
-| `gm_recalled` | 每 session 的召回节点记录，用于 retention 和 dream |
+| `gm_recalled` | `before_prompt_build` 写入的每 session 合并召回记录，用于 retention 和 dream 召回池抽样 |
 | `gm_belief_signals` | 置信度证据记录 |
 | `_migrations` | 迁移记录 |
 
@@ -434,7 +439,7 @@ npm run build
 npm test
 ```
 
-默认 `npm test` 会跳过依赖 `/tmp/gm-test.db` 的真实 DB dream/debug 测试。如需显式运行：
+默认 `npm test` 中大多数单元测试使用 mock LLM，并会跳过依赖 `/tmp/gm-test.db` 的真实 DB dream/debug 测试。`belief-e2e.test.ts` 是主要的真实 LLM e2e：它复制生产图数据库到临时 DB，并从 OpenClaw 配置读取 graph-memory 的 LLM 配置。如需显式运行 gated 的真实 DB dream/debug 测试：
 
 ```bash
 RUN_GM_REAL_DB_TESTS=1 npm test

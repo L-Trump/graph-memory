@@ -66,7 +66,7 @@ The important design point: KG rendering is primarily done from the `before_prom
 ### Entry-point responsibilities
 
 - `ingest`: synchronous raw message storage into `gm_messages`; skip heartbeats; no LLM.
-- `before_prompt_build`: clean prompt, build `historyQuery` and `promptQuery`, run `parallelRecall`, persist `gm_recalled`, load hot/scope_hot/compacted active nodes, render stable+dynamic KG, record L1 access.
+- `before_prompt_build`: clean prompt, build `historyQuery` from the last 2 user-bounded turns plus `promptQuery` from the current prompt, run `parallelRecall`, persist merged recall results to `gm_recalled`, load hot/scope_hot/compacted active nodes, render stable+dynamic KG, record L1 access only.
 - `afterTurn`: save newly generated messages, fire `runTurnExtract`, run periodic topic/session induction and lightweight PageRank every `compactTurnCount` turns.
 - `compact`: strip old `<gm_memory>`, fallback extract unextracted messages, mark compacted active nodes, delegate real compaction to runtime.
 - `prepareSubagentSpawn`: copy parent recalled graph context into the child session.
@@ -109,7 +109,6 @@ incoming message
   → ingest(): save gm_messages
 
 before_prompt_build
-  → filterNoiseMessages
   → recaller.recallV2
   → saveRecalledNodes
   → assembleStableContext + assembleDynamicContext
@@ -147,6 +146,18 @@ Pipeline:
 7. Combined score = semantic `0.5` + PPR `0.4` + global PageRank `0.1`.
 8. Access-based decay adjusts combined score unless `decayEnabled === false`.
 9. Tier assignment uses `recallMaxNodes`: top third L1, second third L2, third third L3, rest filtered.
+10. Access tracking is intentionally only recorded for L1 nodes that are actually assembled/injected.
+
+## Extraction, induction, and tests
+
+- `extract.ts` renders message blocks with an 800-character per-block truncation and skips thinking blocks.
+- Extractor prompts reject common-sense knowledge and only emit `beliefUpdates` for existing recalled nodes, not newly created nodes.
+- `beliefUpdates` use verdict `supported` / `contradicted`, weight `0.5..2.0`, and reason text capped around 200 chars.
+- `advisorySuggestions` are only acted on for newly created nodes and are meant for long or structured knowledge that may deserve a document.
+- Topic induction hard-validates edge shapes: semantic → TOPIC uses `主题属于`; TOPIC ↔ TOPIC uses `主题包含` / `主题父级`; semantic ↔ semantic edges are discarded in induction.
+- LLM calls use OpenAI-compatible chat completions or Anthropic fallback, `tool_choice: none`, temperature 0.1, 90s timeout, and retry on 429/500/502/503/529.
+- Embedding calls use OpenAI-compatible `/embeddings`, optional dimensions, 10s timeout, startup ping, and FTS5 fallback on failure.
+- Most tests use mocked LLMs. `belief-e2e.test.ts` uses a production DB copy plus real LLM config. Dream real/debug/fullflow tests are gated behind `RUN_GM_REAL_DB_TESTS=1`.
 
 ## Maintenance and retention
 
@@ -171,7 +182,7 @@ Do not expose internal table names as user-facing config. Do not hardcode `sessi
 - `gm_vectors`: embeddings by node id.
 - `gm_communities`: legacy compatibility table; runtime no longer uses it.
 - `gm_scopes`: scope/session bindings.
-- `gm_recalled`: recalled node records for retention and dream pools.
+- `gm_recalled`: merged recall records written by `before_prompt_build`; used for retention and gm_dream recalled-pool sampling.
 - `gm_belief_signals`: belief evidence records.
 - `_migrations`: migration tracker.
 
