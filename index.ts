@@ -540,30 +540,11 @@ ${suggestionsText}
       return next;
     }
 
-    // Keep per-turn Graph Memory context out of the persisted transcript.
-    // `prependContext` is still included in the current LLM request, but the
-    // persisted user message must not carry it forward into future turns.
-    api.on("before_message_write", (event: any) => {
-      const message = event?.message;
-      if (!message || typeof message !== "object") return;
-      let changed = false;
-      const next: any = { ...message };
-      if (next.content !== undefined) {
-        const stripped = stripContentBlocks(next.content);
-        if (stripped !== next.content) {
-          next.content = stripped;
-          changed = true;
-        }
-      }
-      if (next.message?.content !== undefined) {
-        const stripped = stripContentBlocks(next.message.content);
-        if (stripped !== next.message.content) {
-          next.message = { ...next.message, content: stripped };
-          changed = true;
-        }
-      }
-      return changed ? { message: next } : undefined;
-    });
+    // Do not strip `<gm_memory>` in `before_message_write`.
+    // The current turn may continue through tool calls after the first LLM pass;
+    // cleaning the persisted user message here would remove dynamic recall from
+    // later LLM passes in the same turn.  Instead, strip only the assembled
+    // in-memory history below, leaving the transcript file untouched.
 
         // ── before_prompt_build：召回 + 渲染 KG（注入 appendSystemContext）───
 
@@ -761,16 +742,14 @@ ${suggestionsText}
         messages: any[];
         tokenBudget?: number;
       }) {
-        // KG 渲染已移至 before_prompt_build（appendSystemContext）
-        // assemble 只截断消息 (省token，按次数收费模型中可以考虑禁用，已禁用)
-        // const activeNodes = getBySession(db, sessionId);
-        // if (activeNodes.length === 0) {
-        //   return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
-        // }
-        const repaired = messages;
+        // KG 渲染已移至 before_prompt_build。
+        // assemble 只处理运行时消息副本：规范化 content，并剥离历史中残留的
+        // transient `<gm_memory>`。这里不改 sessionFile，避免绕过 OpenClaw
+        // SessionManager/lock；同一轮工具链内的 dynamic memory 仍保留到 turn 结束。
+        const sanitizedMessages = normalizeMessageContent(messages);
 
         return {
-          messages: normalizeMessageContent(repaired),
+          messages: sanitizedMessages,
           estimatedTokens: 0,
         };
       },
@@ -791,8 +770,8 @@ ${suggestionsText}
         const { sessionId, sessionKey, sessionFile, force, currentTokenCount } = params;
 
         // Session transcripts are owned by the OpenClaw runtime.  Do not
-        // rewrite `sessionFile` from compact hooks; transcript cleanup belongs
-        // on the guarded write path (`before_message_write`).
+        // rewrite `sessionFile` from compact hooks.  Transient `<gm_memory>`
+        // cleanup is an assemble-time in-memory transform, not a file rewrite.
 
         const markCompactedActiveNodes = () => {
           const stableIds = new Set<string>([
@@ -880,9 +859,9 @@ ${suggestionsText}
         if (isHeartbeat) return;
 
         // Session transcripts are owned by the OpenClaw runtime.  Do not
-        // rewrite `sessionFile` from afterTurn; persisted cleanup is handled by
-        // `before_message_write`, while the sliced messages below are sanitized
-        // before storage/extraction.
+        // rewrite `sessionFile` from afterTurn.  The sliced messages below are
+        // sanitized before GM storage/extraction; prompt-history cleanup happens
+        // in assemble as an in-memory transform.
 
         // 消息入库（同步，零 LLM）
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
