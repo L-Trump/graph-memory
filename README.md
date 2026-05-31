@@ -60,6 +60,83 @@ session_end hook
 | `onSubagentEnded` | Cleanup subagent session state |
 | `dispose` | Clear in-memory session state |
 
+
+## Runtime entry points
+
+graph-memory enters OpenClaw through two integration surfaces:
+
+1. **ContextEngine registration**
+
+   ```ts
+   api.registerContextEngine("graph-memory", () => engine)
+   ```
+
+   The engine implements `bootstrap`, `ingest`, `assemble`, `compact`, `afterTurn`, `prepareSubagentSpawn`, `onSubagentEnded`, and `dispose`.
+
+2. **Runtime hooks and tools**
+
+   - `api.on("before_prompt_build", ...)` performs recall and KG context injection.
+   - `api.on("session_end", ...)` performs finalization and background maintenance.
+   - `api.registerTool(...)` exposes the 22 `gm_*` tools.
+
+This means graph-memory is not called from a CLI loop. It runs inside the OpenClaw Gateway lifecycle and is invoked automatically as sessions progress.
+
+### Lifecycle details
+
+| Entry point | Trigger | Main work | Blocking behavior |
+|-------------|---------|-----------|-------------------|
+| `bootstrap` | Context engine session init | Lightweight acknowledgement | awaited by runtime |
+| `ingest` | Message ingestion | Store non-heartbeat message in `gm_messages` | synchronous DB write; no LLM |
+| `before_prompt_build` hook | Before model prompt construction | Parallel recall from recent history + current prompt; assemble stable/dynamic KG XML | awaited; returns `appendSystemContext` / `prependContext` |
+| `assemble` | ContextEngine assemble phase | Normalizes message content only; KG rendering has moved to `before_prompt_build` | awaited |
+| `compact` | Runtime compaction | Strip stale `<gm_memory>` blocks, run fallback extraction, mark compacted active nodes, delegate real compaction back to runtime | awaited, with extraction/induction treated as background where possible |
+| `afterTurn` | After each assistant turn | Save new messages, trigger extraction, periodic topic/session induction, lightweight PageRank | extraction/topic induction are fire-and-forget; session induction is awaited in the periodic block |
+| `prepareSubagentSpawn` | Before subagent creation | Copy current recalled graph context to child session | awaited |
+| `onSubagentEnded` | Child session end | Remove child recalled context and counters | awaited |
+| `session_end` hook | Session close | finalize, topic/session induction, retention+dedup+PageRank maintenance, belief signals | handler starts fire-and-forget tasks and returns quickly |
+| `dispose` | Plugin unload | Clear in-memory maps | awaited |
+
+### before_prompt_build in detail
+
+`before_prompt_build` is the primary injection entry point:
+
+1. Clean the current prompt with `cleanPrompt`.
+2. Build two recall queries:
+   - `historyQuery`: the last few messages, excluding the current prompt.
+   - `promptQuery`: the cleaned current user prompt.
+3. Run `parallelRecall(recaller, historyQuery, promptQuery)` and merge results.
+4. Persist recalled nodes into `gm_recalled` for dream/retention/debugging.
+5. Load stable nodes:
+   - global `hot` nodes,
+   - `scope_hot:<scope>` nodes for scopes bound to this session,
+   - compacted active nodes that need to survive compaction.
+6. Render stable context with `assembleStableContext` and dynamic recall context with `assembleDynamicContext`.
+7. Record access for L1 nodes (`access_count`, `last_accessed_at`) for the forgetting/decay mechanism.
+8. Return `appendSystemContext` for stable KG and `prependContext` for dynamic KG.
+
+### afterTurn in detail
+
+`afterTurn` is the main extraction entry point:
+
+1. Strip old `<gm_memory>` blocks from the session file.
+2. Save new messages into `gm_messages` without calling the LLM.
+3. Trigger `runTurnExtract` on new messages. Extraction is serialized per session with `extractChain` so overlapping turns do not corrupt writes.
+4. Every `compactTurnCount` turns:
+   - run topic induction in the background,
+   - run session induction for the current session,
+   - recompute lightweight global PageRank.
+
+`runTurnExtract` handles node/edge extraction, belief updates, embeddings, and optional memory-advisor suggestions.
+
+### session_end in detail
+
+`session_end` starts four background tasks:
+
+1. **Finalize**: promote reusable knowledge, add missed edges, invalidate obsolete nodes.
+2. **Topic/session induction**: update TOPIC and SESSION summaries.
+3. **Maintenance**: retention cleanup, vector dedup, global PageRank.
+4. **Belief signal**: emit low-weight `task_completed` evidence for session nodes.
+
 ## Current features
 
 ### Node types
@@ -126,6 +203,34 @@ KEYWORD_WEIGHT = 0.4
 
 Stable context is appended to system context; dynamic context is prepended as turn context. `debugContextPreview` or `GM_DEBUG_CONTEXT_PREVIEW=1` logs context previews.
 
+
+### Scope Hot
+
+Scope Hot is the scoped version of Hot memory. It is implemented through node flags and session-scope bindings:
+
+- A node with flag `hot` is rendered in every session.
+- A node with flag `scope_hot:<scope>` is rendered only when the current session is bound to `<scope>`.
+- Session bindings are stored in `gm_scopes`.
+- Matching scope-hot nodes are loaded by `getScopeHotNodes()` during `before_prompt_build`.
+
+Typical flow:
+
+```text
+gm_set_scope(["gm开发"])
+  → current session bound to gm开发
+
+gm_set_scope_hot("gm-plugin-development-core-principles", "gm开发")
+  → node gets flag scope_hot:gm开发
+
+next before_prompt_build
+  → getScopesForSession(session)
+  → getScopeHotNodes(scopes)
+  → assembleStableContext(... scopeHotNodes ...)
+  → node rendered with tier="scope_hot" and scope_hot="true"
+```
+
+`scope_hot` has higher tier priority than global `hot`, so if the same node appears in both places it is rendered once as `scope_hot`.
+
 ### Belief/confidence system
 
 Each node can have a `belief` score in `[0, 1]`.
@@ -137,6 +242,68 @@ Signal sources:
 - Manual tools such as `gm_record` store knowledge but intentionally do not process belief updates.
 
 The stats tool reports average/high/low belief and signal counts.
+
+
+### Forgetting, retention, and decay
+
+graph-memory has two different "forgetting" layers. They intentionally solve different problems.
+
+#### 1. Context forgetting: compaction + active-node carry-over
+
+Raw chat context is still compacted by the normal OpenClaw runtime. graph-memory does not own full compaction (`ownsCompaction=false`). During `compact`, it:
+
+- removes stale `<gm_memory>` blocks from the session file,
+- runs fallback extraction for any unextracted messages,
+- marks current-session nodes as `active` carry-over nodes,
+- delegates the actual text compaction back to the runtime.
+
+After compaction, those marked active nodes are rendered in the stable KG layer so important in-session knowledge does not disappear immediately. Active nodes are capped at 100, with minimum retention for TASK/EVENT/KNOWLEDGE and SKILL protected from trimming.
+
+#### 2. Storage forgetting: retention cleanup
+
+Retention cleanup deletes old raw session history rows, not semantic knowledge nodes. It affects:
+
+- `gm_messages`
+- `gm_recalled`
+
+It does **not** delete `gm_nodes` or `gm_edges`. Semantic forgetting is represented separately by soft deletion (`status='deprecated'`), merge, and recall decay.
+
+Retention only targets inactive sessions older than `retention.retentionDays`. Protected sessions are derived from the OpenClaw session store: running sessions plus sessions updated within the cutoff. The delete budget is shared: `gm_messages` first, then `gm_recalled`.
+
+#### 3. Recall forgetting: access-based decay
+
+Access decay does not delete memory. It lowers recall ranking for stale/low-value nodes. L1 nodes that are actually injected are recorded with:
+
+- `access_count`
+- `last_accessed_at`
+
+The decay engine computes:
+
+```text
+composite = recencyWeight × recency
+          + frequencyWeight × frequency
+          + intrinsicWeight × intrinsic
+
+recency   = Weibull stretched-exponential decay since last access
+frequency = saturated function of access_count
+intrinsic = type importance × belief
+```
+
+Node type controls decay speed and floor:
+
+| Type | Behavior |
+|------|----------|
+| `SKILL`, `TOPIC` | Very stable; high floor; slow decay |
+| `KNOWLEDGE` | Moderately stable |
+| `EVENT` | Medium/fast decay |
+| `TASK` | Completed tasks fade faster |
+| `STATUS` | Fastest decay; intended for snapshots |
+
+The recall score is multiplied by a factor derived from this composite score. `decayEnabled=false` disables this ranking adjustment.
+
+#### 4. Semantic soft deletion
+
+Nodes are not hard-deleted by normal tools. `gm_remove` and `gm_merge` mark nodes as `deprecated`. Deprecated nodes are filtered out of normal search/recall and edge creation. If a deprecated node is later upserted or receives flags, it can be revived to `active`.
 
 ### Access-based decay
 

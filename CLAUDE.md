@@ -49,6 +49,59 @@ RUN_GM_REAL_DB_TESTS=1 npm test
 - `src/extractor/noise-filter.ts` — input-layer noise filtering.
 - `src/format/assemble.ts` — stable/dynamic KG XML rendering and KG system guidance.
 
+
+## OpenClaw runtime entry points
+
+Runtime registration happens in `index.ts`:
+
+```ts
+api.registerContextEngine("graph-memory", () => engine)
+api.on("before_prompt_build", ...)
+api.on("session_end", ...)
+api.registerTool(...)
+```
+
+The important design point: KG rendering is primarily done from the `before_prompt_build` hook, not from `engine.assemble`. `assemble` now mostly normalizes message content.
+
+### Entry-point responsibilities
+
+- `ingest`: synchronous raw message storage into `gm_messages`; skip heartbeats; no LLM.
+- `before_prompt_build`: clean prompt, build `historyQuery` and `promptQuery`, run `parallelRecall`, persist `gm_recalled`, load hot/scope_hot/compacted active nodes, render stable+dynamic KG, record L1 access.
+- `afterTurn`: save newly generated messages, fire `runTurnExtract`, run periodic topic/session induction and lightweight PageRank every `compactTurnCount` turns.
+- `compact`: strip old `<gm_memory>`, fallback extract unextracted messages, mark compacted active nodes, delegate real compaction to runtime.
+- `prepareSubagentSpawn`: copy parent recalled graph context into the child session.
+- `onSubagentEnded`: clear child recalled context/counters.
+- `session_end`: fire-and-forget finalize, topic/session induction, retention+dedup+PageRank maintenance, task_completed belief signals.
+
+### In-memory runtime state
+
+- `recalled`: session key/id → latest recall result used by prompt injection and subagent sharing.
+- `msgSeq`: session id → monotonically increasing message/turn count.
+- `turnCounter`: session id → afterTurn periodic maintenance counter.
+- `compactedActiveNodeIds`: session id → active node ids that should be re-injected after compaction.
+- `extractChain`: session id → promise chain that serializes LLM extraction writes.
+
+### Scope Hot mechanics
+
+Scope Hot is implemented with ordinary node flags plus `gm_scopes`:
+
+- Node flag `hot` means render in every session.
+- Node flag `scope_hot:<scope>` means render only when the current session is bound to `<scope>`.
+- `gm_set_scope(scopes)` overwrites current session scope bindings.
+- `gm_set_scope_hot(name, scope)` appends the corresponding node flag.
+- `before_prompt_build` calls `getScopesForSession()` then `getScopeHotNodes()` and passes the result to `assembleStableContext`.
+- `scope_hot` has the highest tier priority, above `hot`.
+
+### Forgetting model
+
+There are three different mechanisms. Do not conflate them:
+
+1. **Runtime context forgetting**: normal OpenClaw compaction. graph-memory marks current session nodes as compacted active nodes and re-injects them in stable context after compaction.
+2. **Storage retention**: maintenance deletes old inactive `gm_messages` and `gm_recalled` rows. It does not delete semantic `gm_nodes` or `gm_edges`.
+3. **Recall decay**: access-based decay reduces ranking of stale memories using `access_count`, `last_accessed_at`, node type, and belief. It does not delete anything.
+
+Semantic deletion is soft deletion only: tools mark nodes `deprecated`; normal recall/search/edge creation excludes deprecated nodes.
+
 ## Runtime data flow
 
 ```text

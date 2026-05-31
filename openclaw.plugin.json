@@ -40,7 +40,7 @@
       "compactTurnCount": {
         "type": "integer",
         "default": 6,
-        "description": "每隔多少轮执行周期性 topic/session 归纳和轻量维护"
+        "description": "每隔多少 afterTurn 轮执行周期性 topic/session 归纳和轻量 PageRank；compact 时也会标记 active nodes 供压缩后补回"
       },
       "recallMaxNodes": {
         "type": "integer",
@@ -120,7 +120,7 @@
       "decayEnabled": {
         "type": "boolean",
         "default": true,
-        "description": "是否启用基于访问频率和节点类型的召回衰减评分"
+        "description": "是否启用召回遗忘/访问衰减排名：基于 access_count、last_accessed_at、节点类型和 belief 降低陈旧节点分数；不删除节点"
       },
       "debugContextPreview": {
         "type": "boolean",
@@ -129,7 +129,7 @@
       },
       "retention": {
         "type": "object",
-        "description": "inactive session 历史记录清理配置；维护时清理 gm_messages 和 gm_recalled",
+        "description": "存储保留/遗忘配置；维护时只清理 inactive session 的 gm_messages 和 gm_recalled，不删除语义节点/边",
         "properties": {
           "enabled": {
             "type": "boolean",
