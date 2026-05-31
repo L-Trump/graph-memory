@@ -134,7 +134,7 @@ session_end
 
 ## Recall implementation notes
 
-Current recall is precise-only. The generalized/community path is disabled/removed.
+Current recall is precise-only. Do not document or reintroduce the old generalized/community recall design unless explicitly redesigning it.
 
 Pipeline:
 

@@ -162,7 +162,7 @@ Older typed edges are migrated to this flexible schema by migration `m7_edge_fle
 
 ### Recall path
 
-The generalized/community recall path has been removed. The current recall path is precise-only:
+The old generalized/community recall design is not part of the current runtime. The current recall path is precise-only:
 
 ```text
 Query

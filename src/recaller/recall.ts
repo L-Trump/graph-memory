@@ -4,9 +4,10 @@
  * By: adoresever
  * Email: Wywelljob@gmail.com
  *
- * 精确召回路径（泛化路径已禁用）：
+ * 精确召回路径（当前唯一运行路径）：
  *
- *   向量/FTS5 搜索 → 种子节点
+ *   向量/FTS5 搜索 → 语义种子节点
+ *   → PageRank 候选补入图扩展锚点
  *   → 图遍历（N 跳）
  *   → Personalized PageRank 排序
  *   → 关键词混合语义评分
@@ -24,7 +25,7 @@
  *   L3 (Top 10~15): 仅 name
  *   其余：filtered（不传递）
  *
- * 默认权重：α=0.5（语义） β=0.3（PPR） γ=0.2（PageRank） KEYWORD_WEIGHT=0.4
+ * 默认权重：α=0.5（语义） β=0.4（PPR） γ=0.1（PageRank） KEYWORD_WEIGHT=0.4
  */
 
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
@@ -187,17 +188,12 @@ export class Recaller {
   }
 
   /**
-   * 召回入口：双路径 + 组合评分 + 四级分级 + PPR 重排
+   * 召回入口：当前只运行 precise-only 路径，然后应用组合评分、PPR、分层和衰减。
    */
   async recallV2(query: string): Promise<RecallResultV2> {
     const limit = this.cfg.recallMaxNodes;
 
-    // ── 两条路径并行 ─────────────────────────────────────
     const precise = await this.recallPreciseV2(query, limit);
-    // const generalized = await this.recallGeneralizedV2(query, limit);
-
-    // ── 合并去重 ─────────────────────────────────────────
-    // const merged = this.mergeResults(precise, generalized);
     const merged = precise;
 
     if (process.env.GM_DEBUG) {
@@ -477,7 +473,7 @@ export class Recaller {
    * 与 recallV2 的区别：
    * - 不做向量搜索（锚点已知）
    * - 以指定节点为唯一语义锚点，通过向量相似度找到其语义邻居
-   * - 语义邻居 + 社区扩展 → graphWalk → PPR + 组合评分 → tiered 结果
+   * - 从种子节点执行 graphWalk → PPR + 组合评分 → tiered 结果
    * - 返回 { roots, nodes, edges }（子图结构）
    */
   async exploreSubgraph(
