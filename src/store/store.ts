@@ -439,73 +439,6 @@ export function markExtracted(db: DatabaseSyncInstance, sid: string, upToTurn: n
     .run(sid, upToTurn);
 }
 
-/**
- * 溯源选拉：按 session 拉取 user/assistant 核心对话（跳过 tool/toolResult）
- * 用于 assemble 时补充三元组的原始上下文
- *
- * @param nearTime  优先取时间最接近的消息（节点的 updatedAt）
- * @param maxChars  总字符上限
- */
-export function getEpisodicMessages(
-  db: DatabaseSyncInstance,
-  sessionIds: string[],
-  nearTime: number,
-  maxChars: number = 1500,
-): Array<{ sessionId: string; turnIndex: number; role: string; text: string; createdAt: number }> {
-  if (!sessionIds.length) return [];
-
-  const results: Array<{ sessionId: string; turnIndex: number; role: string; text: string; createdAt: number }> = [];
-  let usedChars = 0;
-
-  // 按 session 逐个拉，优先最近的 session
-  for (const sid of sessionIds) {
-    if (usedChars >= maxChars) break;
-
-    // 只拉 user 和 assistant，按时间距离 nearTime 最近排序
-    const rows = db.prepare(`
-      SELECT turn_index, role, content, created_at FROM gm_messages
-      WHERE session_id = ? AND role IN ('user', 'assistant')
-      ORDER BY ABS(created_at - ?) ASC
-      LIMIT 6
-    `).all(sid, nearTime) as any[];
-
-    for (const r of rows) {
-      if (usedChars >= maxChars) break;
-      let text = "";
-      try {
-        const parsed = JSON.parse(r.content);
-        if (typeof parsed === "string") {
-          text = parsed;
-        } else if (typeof parsed?.content === "string") {
-          text = parsed.content;
-        } else if (Array.isArray(parsed)) {
-          text = parsed
-            .filter((b: any) => b.type === "text")
-            .map((b: any) => b.text ?? "")
-            .join("\n");
-        } else {
-          text = String(parsed).slice(0, 300);
-        }
-      } catch {
-        text = String(r.content).slice(0, 300);
-      }
-
-      if (!text.trim()) continue;
-      const truncated = text.slice(0, Math.min(text.length, maxChars - usedChars));
-      results.push({
-        sessionId: sid,
-        turnIndex: r.turn_index,
-        role: r.role,
-        text: truncated,
-        createdAt: r.created_at,
-      });
-      usedChars += truncated.length;
-    }
-  }
-
-  return results;
-}
-
 // ─── Retention cleanup ───────────────────────────────────────
 
 function prepareProtectedSessionTempTable(db: DatabaseSyncInstance, protectedSessionIds: string[]): void {
@@ -722,8 +655,6 @@ export function vectorSearch(db: DatabaseSyncInstance, queryVec: number[], limit
 }
 
 // ─── TOPIC 节点查询 ─────────────────────────────────────────
-
-const SEMANTIC_TYPES = new Set(["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"]);
 
 /**
  * 获取所有 TOPIC 类型的节点（排除 deprecated）
@@ -1007,15 +938,6 @@ export function getSemanticToTopicEdges(db: DatabaseSyncInstance): GmEdge[] {
 }
 
 /**
- * 获取所有 semantic 类型的节点（KNOWLEDGE/SKILL/TASK/EVENT/STATUS，排除 deprecated）
- */
-export function getSemanticNodes(db: DatabaseSyncInstance): GmNode[] {
-  const rows = db.prepare(
-    "SELECT * FROM gm_nodes WHERE type IN ('TASK','SKILL','EVENT','KNOWLEDGE','STATUS') AND status='active'"
-  ).all() as any[];
-  return rows.map(toNode);
-}
-/**
  * 保存当前轮次召回的节点到 gm_recalled 表（过滤掉 filtered 节点）
  */
 export function saveRecalledNodes(
@@ -1083,27 +1005,6 @@ export function getRecalledNodes(
 // ─── Access Tracking ──────────────────────────────────────────
 
 /**
- * Record access for a single node: increment access_count and update last_accessed_at.
- * Idempotent: safe to call multiple times for the same node.
- */
-export function recordNodeAccess(
-  db: DatabaseSyncInstance,
-  nodeId: string,
-  now = Date.now(),
-): void {
-  const existing = db.prepare(
-    "SELECT access_count, last_accessed_at FROM gm_nodes WHERE id=?"
-  ).get(nodeId) as any;
-
-  if (!existing) return; // node doesn't exist
-
-  const newCount = (existing.access_count ?? 0) + 1;
-  db.prepare(
-    "UPDATE gm_nodes SET access_count=?, last_accessed_at=? WHERE id=?"
-  ).run(newCount, now, nodeId);
-}
-
-/**
  * Record access for multiple nodes at once (batch version for efficiency).
  * Called after each prompt assembly to record which recalled nodes were used.
  */
@@ -1131,36 +1032,6 @@ export function recordNodeAccessBatch(
     db.exec("ROLLBACK");
     throw err;
   }
-}
-
-/**
- * Get all active nodes as DecayableNode (for stale node scanning).
- * Returns nodes with their current access tracking fields.
- */
-export function getAllActiveDecayableNodes(
-  db: DatabaseSyncInstance,
-): Array<{
-  id: string;
-  type: string;
-  belief: number;
-  accessCount: number;
-  createdAt: number;
-  updatedAt: number;
-  lastAccessedAt: number;
-}> {
-  const rows = db.prepare(
-    "SELECT id, type, belief, access_count, created_at, updated_at, last_accessed_at FROM gm_nodes WHERE status='active'"
-  ).all() as any[];
-
-  return rows.map(r => ({
-    id: r.id,
-    type: r.type,
-    belief: r.belief ?? 0.5,
-    accessCount: r.access_count ?? 0,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
-    lastAccessedAt: r.last_accessed_at ?? 0,
-  }));
 }
 
 /**

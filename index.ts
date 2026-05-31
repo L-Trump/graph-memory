@@ -24,7 +24,6 @@ import {
   upsertNode, upsertEdge, findByName, findById,
   getBySession, edgesFrom, edgesTo,
   deprecate, getStats, getHotNodes, getEdgesForNodes, setNodeFlags,
-  getTopicNodes, getTopicToTopicEdges, getSemanticToTopicEdges,
   updateNodeBelief, recordBeliefSignal,
   setScopesForSession, getScopesForSession, getScopeHotNodes, listScopes,
   getNodeFullInfo, updateNodeFields,
@@ -37,7 +36,6 @@ import { createEmbedFn } from "./src/engine/embed.ts";
 import { Recaller, type TieredNode } from "./src/recaller/recall.ts";
 import { Extractor } from "./src/extractor/extract.ts";
 import { assembleStableContext, assembleDynamicContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
-import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { filterNoiseMessages } from "./src/extractor/noise-filter.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
@@ -772,8 +770,6 @@ ${suggestionsText}
         // if (activeNodes.length === 0) {
         //   return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
         // }
-        // const lastTurn = sliceLastTurn(messages);
-        // const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
         const repaired = messages;
 
         return {
