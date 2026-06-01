@@ -204,6 +204,10 @@ export interface GmConfig {
   };
   /** 是否启用衰减引擎（access-based decay scoring），默认 true */
   decayEnabled?: boolean;
+  /** compact 后是否把当前 session active nodes 注入 stable 层，默认 false */
+  compactActiveNodesEnabled?: boolean;
+  /** compact active nodes 注入 stable 层的最大数量，默认 100 */
+  compactActiveNodesMax?: number;
   /** 调试：输出 stable/dynamic 注入上下文前后片段，默认 false */
   debugContextPreview?: boolean;
 }
@@ -225,5 +229,7 @@ export const DEFAULT_CONFIG: GmConfig = {
     vacuum: false,
   },
   decayEnabled: true,
+  compactActiveNodesEnabled: false,
+  compactActiveNodesMax: 100,
   debugContextPreview: false,
 };

@@ -134,6 +134,66 @@ function previewContextForLog(label: string, value: string, chars = 100): string
   return `${label}: len=${value.length} head="${head}"${tail ? ` tail="${tail}"` : ""}`;
 }
 
+function digestContext(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function summarizeStableNodeForLog(node: any, tier: string): string {
+  const updatedAt = typeof node?.updatedAt === "number" ? new Date(node.updatedAt).toISOString().slice(0, 10) : "unknown";
+  return `${tier}:${node?.type ?? "?"}:${node?.name ?? node?.id ?? "?"}@${updatedAt}`;
+}
+
+function summarizeStableEdgeForLog(edge: any, nodeNameById: Map<string, string>): string {
+  const from = nodeNameById.get(edge?.fromId) ?? edge?.fromId ?? "?";
+  const to = nodeNameById.get(edge?.toId) ?? edge?.toId ?? "?";
+  return `${edge?.name ?? "?"}:${from}->${to}`;
+}
+
+function summarizeStableLayerForLog(params: {
+  scopeHotNodes: any[];
+  hotNodes: any[];
+  compactActiveNodes: any[];
+  scopeHotEdges: any[];
+  hotEdges: any[];
+  compactActiveEdges: any[];
+}): string[] {
+  const parts: string[] = [];
+  const nodeNameById = new Map<string, string>();
+  const pushNode = (node: any, tier: string) => {
+    if (!node?.id) return;
+    nodeNameById.set(node.id, node.name ?? node.id);
+    parts.push(`node:${summarizeStableNodeForLog(node, tier)}`);
+  };
+  for (const node of params.scopeHotNodes) pushNode(node, "scope_hot");
+  for (const node of params.hotNodes) pushNode(node, "hot");
+  for (const node of params.compactActiveNodes) pushNode(node, "active");
+
+  const pushEdge = (edge: any, source: string) => {
+    if (!edge?.id) return;
+    parts.push(`edge:${source}:${summarizeStableEdgeForLog(edge, nodeNameById)}`);
+  };
+  for (const edge of params.scopeHotEdges) pushEdge(edge, "scope_hot");
+  for (const edge of params.hotEdges) pushEdge(edge, "hot");
+  for (const edge of params.compactActiveEdges) pushEdge(edge, "active");
+
+  return parts.sort();
+}
+
+function diffSortedStrings(prev: string[], next: string[]): { added: string[]; removed: string[] } {
+  const prevSet = new Set(prev);
+  const nextSet = new Set(next);
+  return {
+    added: next.filter(item => !prevSet.has(item)),
+    removed: prev.filter(item => !nextSet.has(item)),
+  };
+}
+
+function previewListForLog(items: string[], limit = 8): string {
+  if (!items.length) return "-";
+  const shown = items.slice(0, limit).join(", ");
+  return items.length > limit ? `${shown}, ...(+${items.length - limit})` : shown;
+}
+
 function normalizeMessageContent(messages: any[]): any[] {
   return messages.map((msg: any) => {
     if (!msg || typeof msg !== "object") return msg;
@@ -272,6 +332,7 @@ const graphMemoryPlugin = {
     const recalled = new Map<string, { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }>();
     const turnCounter = new Map<string, number>(); // periodic maintenance counter
     const compactedActiveNodeIds = new Map<string, Set<string>>(); // compact 后需要补回上下文的 active 节点
+    const previousStableLayerBySession = new Map<string, { digest: string; items: string[]; contextLength: number }>(); // debug: stable 层变化对比
 
     // ── Belief 追踪状态 ────────────────────────────────────────
     // 追踪每个 session 中本轮 recall 的节点
@@ -623,29 +684,11 @@ ${suggestionsText}
         const scopeHotEdges = scopeHotNodes.length > 0 ? getEdgesForNodes(db, scopeHotNodes.map(n => n.id)) : [];
         const stableNodeIds = new Set<string>([...hotNodes, ...scopeHotNodes].map(n => n.id));
 
-        // compact 前 activeNodes 不注入；compact 后仅补回被压缩上下文中的 session 节点。
-        const compactActiveIds = compactedActiveNodeIds.get(sid) ?? new Set<string>();
-        let activeNodes = getBySession(db, sid).filter(n => compactActiveIds.has(n.id) && !stableNodeIds.has(n.id));
-
-        // ── Active nodes 数量裁剪：从旧到新删除，配额保底 ────────
-        if (activeNodes.length > 100) {
-          activeNodes.sort((a, b) => a.updatedAt - b.updatedAt);
-          let taskCount = activeNodes.filter(n => n.type === "TASK").length;
-          let eventCount = activeNodes.filter(n => n.type === "EVENT").length;
-          let knowledgeCount = activeNodes.filter(n => n.type === "KNOWLEDGE").length;
-          const toRemove = new Set<string>();
-          for (const node of activeNodes) {
-            const curTotal = activeNodes.length - toRemove.size;
-            if (curTotal <= 100) break;
-            if (node.type === "SKILL") continue;
-            if (node.type === "TASK" && taskCount > 5) { toRemove.add(node.id); taskCount--; }
-            else if (node.type === "EVENT" && eventCount > 10) { toRemove.add(node.id); eventCount--; }
-            else if (node.type === "KNOWLEDGE" && knowledgeCount > 10) { toRemove.add(node.id); knowledgeCount--; }
-            else if (!["SKILL", "TASK", "EVENT", "KNOWLEDGE"].includes(node.type)) { toRemove.add(node.id); }
-          }
-          activeNodes = activeNodes.filter(n => !toRemove.has(n.id));
-          compactedActiveNodeIds.set(sid, new Set(activeNodes.map(n => n.id)));
-        }
+        // compact 前 activeNodes 不注入；compact 后仅在 compactActiveNodesEnabled=true 时补回被压缩上下文中的 session 节点。
+        const compactActiveIds = cfg.compactActiveNodesEnabled ? (compactedActiveNodeIds.get(sid) ?? new Set<string>()) : new Set<string>();
+        const activeNodes = cfg.compactActiveNodesEnabled
+          ? getBySession(db, sid).filter(n => compactActiveIds.has(n.id) && !stableNodeIds.has(n.id))
+          : [];
 
         const activeEdges = activeNodes.flatMap((n) => [
           ...edgesFrom(db, n.id),
@@ -691,6 +734,35 @@ ${suggestionsText}
         const prepend = dynamic.context;
 
         if (cfg.debugContextPreview || process.env.GM_DEBUG_CONTEXT_PREVIEW === "1") {
+          const stableDigest = digestContext(append);
+          const stableItems = summarizeStableLayerForLog({
+            scopeHotNodes,
+            scopeHotEdges,
+            hotNodes,
+            hotEdges,
+            compactActiveNodes: activeNodes,
+            compactActiveEdges: activeEdges,
+          });
+          const prevStable = previousStableLayerBySession.get(sid);
+          if (!prevStable) {
+            api.logger.info(
+              `[graph-memory] stable diff: first snapshot digest=${stableDigest} items=${stableItems.length} len=${append.length}`,
+            );
+          } else if (prevStable.digest === stableDigest) {
+            api.logger.info(
+              `[graph-memory] stable diff: unchanged digest=${stableDigest} items=${stableItems.length} len=${append.length}`,
+            );
+          } else {
+            const diff = diffSortedStrings(prevStable.items, stableItems);
+            api.logger.info(
+              `[graph-memory] stable diff: changed ${prevStable.digest}->${stableDigest} ` +
+              `items ${prevStable.items.length}->${stableItems.length} len ${prevStable.contextLength}->${append.length} ` +
+              `added=${diff.added.length}[${previewListForLog(diff.added)}] ` +
+              `removed=${diff.removed.length}[${previewListForLog(diff.removed)}]`,
+            );
+          }
+          previousStableLayerBySession.set(sid, { digest: stableDigest, items: stableItems, contextLength: append.length });
+
           api.logger.info(`[graph-memory] context preview ${previewContextForLog("stable", append)}`);
           api.logger.info(`[graph-memory] context preview ${previewContextForLog("dynamic", prepend)}`);
         }
@@ -774,11 +846,38 @@ ${suggestionsText}
         // cleanup is an assemble-time in-memory transform, not a file rewrite.
 
         const markCompactedActiveNodes = () => {
+          if (!cfg.compactActiveNodesEnabled) {
+            compactedActiveNodeIds.delete(sessionId);
+            api.logger.info(`[graph-memory] compact active nodes disabled`);
+            return;
+          }
+
           const stableIds = new Set<string>([
             ...getHotNodes(db).map(n => n.id),
             ...getScopeHotNodes(db, getScopesForSession(db, sessionKey ?? sessionId)).map(n => n.id),
           ]);
-          const sessionNodes = getBySession(db, sessionId).filter(n => !stableIds.has(n.id));
+          let sessionNodes = getBySession(db, sessionId).filter(n => !stableIds.has(n.id));
+          const maxCompactActiveNodes = Math.max(0, cfg.compactActiveNodesMax ?? DEFAULT_CONFIG.compactActiveNodesMax ?? 100);
+
+          // ── Active nodes 数量裁剪：compact 时一次性确定，避免 before_prompt_build 每轮裁剪造成缓存不稳定 ────────
+          if (sessionNodes.length > maxCompactActiveNodes) {
+            sessionNodes.sort((a, b) => a.updatedAt - b.updatedAt);
+            let taskCount = sessionNodes.filter(n => n.type === "TASK").length;
+            let eventCount = sessionNodes.filter(n => n.type === "EVENT").length;
+            let knowledgeCount = sessionNodes.filter(n => n.type === "KNOWLEDGE").length;
+            const toRemove = new Set<string>();
+            for (const node of sessionNodes) {
+              const curTotal = sessionNodes.length - toRemove.size;
+              if (curTotal <= maxCompactActiveNodes) break;
+              if (node.type === "SKILL") continue;
+              if (node.type === "TASK" && taskCount > 5) { toRemove.add(node.id); taskCount--; }
+              else if (node.type === "EVENT" && eventCount > 10) { toRemove.add(node.id); eventCount--; }
+              else if (node.type === "KNOWLEDGE" && knowledgeCount > 10) { toRemove.add(node.id); knowledgeCount--; }
+              else if (!["SKILL", "TASK", "EVENT", "KNOWLEDGE"].includes(node.type)) { toRemove.add(node.id); }
+            }
+            sessionNodes = sessionNodes.filter(n => !toRemove.has(n.id));
+          }
+
           compactedActiveNodeIds.set(sessionId, new Set(sessionNodes.map(n => n.id)));
           api.logger.info(`[graph-memory] compact active nodes marked: ${sessionNodes.length}`);
         };
