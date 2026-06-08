@@ -48,7 +48,7 @@ export function combinedScore<T>(
   getBelief?: (item: T) => number,
   delta = 0.15,
 ): Scored<T>[] {
-  const beta = 1 - alpha - gamma - delta;
+  const beta = getBelief ? 1 - alpha - gamma - delta : 1 - alpha - gamma;
 
   // 归一化
   const semScores = items.map(getSemantic);

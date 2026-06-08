@@ -130,6 +130,35 @@ function makeHybridSemanticFn(
   };
 }
 
+/**
+ * Lightweight keyword overlap for PageRank expansion gating.
+ * This intentionally differs from computeKeywordScore: for gating we only need
+ * to know whether a global hub shares concrete query terms before allowing it
+ * to become a graphWalk anchor.
+ */
+function computeKeywordOverlap(query: string, node: GmNode): number {
+  const keywords = extractKeywords(query);
+  if (keywords.size === 0) return 0;
+
+  const nodeText = `${node.name} ${node.description} ${node.content.slice(0, 500)}`.toLowerCase();
+  let matched = 0;
+  for (const kw of keywords) {
+    if (nodeText.includes(kw)) matched++;
+  }
+  return matched / keywords.size;
+}
+
+function cosineSimilarity(queryVec: Float32Array, queryNorm: number, nodeVec: Float32Array): number {
+  if (queryNorm === 0) return 0;
+  let dot = 0, nodeNorm = 0;
+  const len = Math.min(nodeVec.length, queryVec.length);
+  for (let i = 0; i < len; i++) {
+    dot += nodeVec[i] * queryVec[i];
+    nodeNorm += nodeVec[i] * nodeVec[i];
+  }
+  return dot / (Math.sqrt(nodeNorm) * queryNorm + 1e-9);
+}
+
 export type RecallTier = "L1" | "L2" | "L3" | "filtered" | "active" | "hot" | "scope_hot";
 
 export interface TieredNode extends GmNode {
@@ -224,13 +253,46 @@ export class Recaller {
           console.log(`  [DEBUG] preciseV2: bestScore=${scored[0].score.toFixed(3)}, semanticSeeds=${seeds.length}`);
         }
 
-        // 全局 PageRank top k/5：仅作图扩展候选节点，不作为 PPR 种子
+        // 全局 PageRank 候选：仅作图扩展候选节点，不作为 PPR 种子。
+        // 先取更大的高 PR 池，再用 query relevance gate 过滤，避免无关 hub 污染 graphWalk。
         const { topNodes } = await import("../store/store.ts");
-        const pagerankCandidates = topNodes(this.db, Math.ceil(k / 5));
-        pagerankCandidateIds = new Set(pagerankCandidates.map(n => n.id));
+        const rawPagerankCandidates = topNodes(this.db, Math.max(20, k));
+        const pagerankCandidateLimit = Math.ceil(k / 5);
+        const pagerankSemanticThreshold = 0.2;
+        const pagerankKeywordThreshold = 0.25;
+        const queryVec = new Float32Array(vec);
+        const queryNorm = Math.sqrt(queryVec.reduce((s, x) => s + x * x, 0));
+        const candidateVectorScores = new Map<string, number>();
 
-        if (process.env.GM_DEBUG && pagerankCandidates.length > 0) {
-          console.log(`  [DEBUG] preciseV2: pagerankCandidates=${pagerankCandidates.length} (用于图扩展，不参与 PPR 种子)`);
+        if (rawPagerankCandidates.length > 0 && queryNorm > 0) {
+          const placeholders = rawPagerankCandidates.map(() => "?").join(",");
+          const vectorRows = this.db.prepare(
+            `SELECT node_id, embedding FROM gm_vectors WHERE node_id IN (${placeholders})`
+          ).all(...rawPagerankCandidates.map(n => n.id)) as any[];
+          for (const row of vectorRows) {
+            const raw = row.embedding as Uint8Array;
+            const nodeVec = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+            candidateVectorScores.set(row.node_id, cosineSimilarity(queryVec, queryNorm, nodeVec));
+          }
+        }
+
+        const pagerankCandidates = rawPagerankCandidates
+          .filter(n => {
+            if (seeds.some(s => s.id === n.id)) return false;
+            const semanticScore = candidateVectorScores.get(n.id) ?? 0;
+            const keywordOverlap = computeKeywordOverlap(query, n);
+            return semanticScore >= pagerankSemanticThreshold || keywordOverlap >= pagerankKeywordThreshold;
+          })
+          .slice(0, pagerankCandidateLimit);
+
+        pagerankCandidateIds = new Set(pagerankCandidates.map(n => n.id));
+        for (const n of pagerankCandidates) {
+          const semanticScore = candidateVectorScores.get(n.id);
+          if (semanticScore !== undefined) semanticScores.set(n.id, semanticScore);
+        }
+
+        if (process.env.GM_DEBUG && rawPagerankCandidates.length > 0) {
+          console.log(`  [DEBUG] preciseV2: pagerankCandidates=${pagerankCandidates.length}/${rawPagerankCandidates.length} gated (用于图扩展，不参与 PPR 种子)`);
         }
 
         // 向量结果不足时补 FTS5（limit/3 ≈ 15，与向量搜索种子数一致）
