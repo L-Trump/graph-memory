@@ -77,8 +77,37 @@
         "description": "可选：向量搜索配置。配了用语义搜索+去重，没配用 FTS5 全文搜索",
         "properties": {
           "apiKey": {
-            "type": "string",
-            "description": "Embedding API Key"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "source",
+                  "provider",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "env",
+                      "file",
+                      "exec"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            ],
+            "description": "Embedding API Key or OpenClaw SecretRef"
           },
           "baseURL": {
             "type": "string",
@@ -102,7 +131,37 @@
         "description": "可选：LLM 配置。不配则用 OpenClaw 全局 provider",
         "properties": {
           "apiKey": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "source",
+                  "provider",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "env",
+                      "file",
+                      "exec"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            ],
+            "description": "LLM API Key or OpenClaw SecretRef"
           },
           "baseURL": {
             "type": "string"
@@ -153,6 +212,30 @@
           }
         }
       }
+    }
+  },
+  "uiHints": {
+    "llm.apiKey": {
+      "label": "LLM API Key",
+      "sensitive": true
+    },
+    "embedding.apiKey": {
+      "label": "Embedding API Key",
+      "sensitive": true
+    }
+  },
+  "configContracts": {
+    "secretInputs": {
+      "paths": [
+        {
+          "path": "llm.apiKey",
+          "expected": "string"
+        },
+        {
+          "path": "embedding.apiKey",
+          "expected": "string"
+        }
+      ]
     }
   }
 }

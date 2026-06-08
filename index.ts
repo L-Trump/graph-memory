@@ -261,6 +261,58 @@ function getProtectedSessionIds(api: OpenClawPluginApi, cutoff: number): string[
   return [...protectedSessions];
 }
 
+function normalizeSecretInputStringForRuntime(
+  value: unknown,
+  path: string,
+  logger: OpenClawPluginApi["logger"],
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value;
+
+  if (typeof value === "object") {
+    const ref = value as Record<string, unknown>;
+    if (typeof ref.source === "string" && typeof ref.id === "string") {
+      logger.warn(
+        `[graph-memory] ${path} is an unresolved SecretRef; declare secretInputs/materialize this field or use a plaintext fallback. Disabling this credential path for safety.`,
+      );
+      return undefined;
+    }
+  }
+
+  logger.warn(`[graph-memory] ${path} must resolve to a string credential; got ${typeof value}. Disabling this credential path for safety.`);
+  return undefined;
+}
+
+function sanitizeSecretConfig(raw: Record<string, any>, logger: OpenClawPluginApi["logger"]): Record<string, any> {
+  const sanitized: Record<string, any> = { ...raw };
+
+  if (raw.llm && typeof raw.llm === "object") {
+    const llm = { ...raw.llm };
+    const apiKey = normalizeSecretInputStringForRuntime(
+      llm.apiKey,
+      "plugins.entries.graph-memory.config.llm.apiKey",
+      logger,
+    );
+    if (apiKey === undefined) delete llm.apiKey;
+    else llm.apiKey = apiKey;
+    sanitized.llm = llm;
+  }
+
+  if (raw.embedding && typeof raw.embedding === "object") {
+    const embedding = { ...raw.embedding };
+    const apiKey = normalizeSecretInputStringForRuntime(
+      embedding.apiKey,
+      "plugins.entries.graph-memory.config.embedding.apiKey",
+      logger,
+    );
+    if (apiKey === undefined) delete embedding.apiKey;
+    else embedding.apiKey = apiKey;
+    sanitized.embedding = embedding;
+  }
+
+  return sanitized;
+}
+
 // ─── 插件对象 ─────────────────────────────────────────────────
 
 const graphMemoryPlugin = {
@@ -275,10 +327,11 @@ const graphMemoryPlugin = {
       api.pluginConfig && typeof api.pluginConfig === "object"
         ? (api.pluginConfig as any)
         : {};
-    const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
+    const sanitizedRaw = sanitizeSecretConfig(raw, api.logger);
+    const cfg: GmConfig = { ...DEFAULT_CONFIG, ...sanitizedRaw };
     const retentionCfg = {
       ...DEFAULT_CONFIG.retention,
-      ...(raw.retention && typeof raw.retention === "object" ? raw.retention : {}),
+      ...(sanitizedRaw.retention && typeof sanitizedRaw.retention === "object" ? sanitizedRaw.retention : {}),
     };
     cfg.retention = retentionCfg;
     const { provider, model } = readProviderModel(api.config);
