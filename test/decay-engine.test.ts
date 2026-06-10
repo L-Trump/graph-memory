@@ -8,6 +8,7 @@ import { describe, it, assert } from "vitest";
 import {
   createDecayEngine,
   getTypeImportance,
+  getTypeFloor,
   toDecayableNode,
   DEFAULT_DECAY_CONFIG,
   type DecayableNode,
@@ -40,6 +41,23 @@ describe("getTypeImportance", () => {
   it("TASK = 0.6", () => assert.closeTo(getTypeImportance("TASK"), 0.6, 0.01));
   it("EVENT = 0.5", () => assert.closeTo(getTypeImportance("EVENT"), 0.5, 0.01));
   it("STATUS = 0.3", () => assert.closeTo(getTypeImportance("STATUS"), 0.3, 0.01));
+});
+
+
+describe("getTypeFloor", () => {
+  it("uses lowered large-graph defaults per node type", () => {
+    assert.closeTo(getTypeFloor("SKILL"), 0.6, 0.001);
+    assert.closeTo(getTypeFloor("TOPIC"), 0.55, 0.001);
+    assert.closeTo(getTypeFloor("KNOWLEDGE"), 0.45, 0.001);
+    assert.closeTo(getTypeFloor("TASK"), 0.25, 0.001);
+    assert.closeTo(getTypeFloor("EVENT"), 0.2, 0.001);
+    assert.closeTo(getTypeFloor("STATUS"), 0.1, 0.001);
+    assert.closeTo(getTypeFloor("SESSION"), 0.1, 0.001);
+  });
+
+  it("honors config overrides", () => {
+    assert.closeTo(getTypeFloor("KNOWLEDGE", { ...DEFAULT_DECAY_CONFIG, floorKnowledge: 0.33 }), 0.33, 0.001);
+  });
 });
 
 describe("DecayEngine — recency", () => {
@@ -194,8 +212,8 @@ describe("DecayEngine — applySearchBoost", () => {
     engine.applySearchBoost(results, now);
     assert.isAbove(results[0].score, results[1].score);
     assert.isAtLeast(results[0].score, DEFAULT_DECAY_CONFIG.searchBoostMin);
-    // Note: stale STATUS has floor=0.4 which protects it from going too low
-    assert.isAtLeast(results[1].score, 0.2);
+    // Note: stale STATUS has floor=0.1 which still provides a small lower bound.
+    assert.isAtLeast(results[1].score, 0.18);
   });
 });
 

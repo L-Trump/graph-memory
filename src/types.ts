@@ -12,6 +12,8 @@
  * 边：USED_SKILL / SOLVED_BY / REQUIRES / PATCHES / CONFLICTS_WITH
  */
 
+import type { DecayConfig } from "./engine/decay.ts";
+
 // ─── 节点 ─────────────────────────────────────────────────────
 
 export type NodeType = "TASK" | "SKILL" | "EVENT" | "KNOWLEDGE" | "STATUS" | "TOPIC" | "SESSION";
@@ -204,6 +206,8 @@ export interface GmConfig {
   };
   /** 是否启用衰减引擎（access-based decay scoring），默认 true */
   decayEnabled?: boolean;
+  /** 衰减引擎参数覆盖，包括按类型 floor；默认使用 DEFAULT_DECAY_CONFIG */
+  decay?: Partial<DecayConfig>;
   /** compact 后是否把当前 session active nodes 注入 stable 层，默认 false */
   compactActiveNodesEnabled?: boolean;
   /** compact active nodes 注入 stable 层的最大数量，默认 100 */
@@ -229,6 +233,7 @@ export const DEFAULT_CONFIG: GmConfig = {
     vacuum: false,
   },
   decayEnabled: true,
+  decay: {},
   compactActiveNodesEnabled: false,
   compactActiveNodesMax: 100,
   debugContextPreview: false,

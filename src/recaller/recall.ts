@@ -41,9 +41,8 @@ import { personalizedPageRank } from "../graph/pagerank.ts";
 import { combinedScore, type Scored } from "./score.ts";
 import {
   createDecayEngine,
-  toDecayableNode,
+  getTypeFloor,
   DEFAULT_DECAY_CONFIG,
-  type DecayConfig,
 } from "../engine/decay.ts";
 
 // ─── 组合评分权重 ────────────────────────────────────────────
@@ -182,9 +181,11 @@ export class Recaller {
   // 竞态队列：embedFn 未就绪时积压的节点，setEmbedFn 时一次性处理
   private pendingEmbedNodes: GmNode[] = [];
   // Decay engine for access-based scoring
-  private decayEngine = createDecayEngine();
+  private decayEngine;
 
-  constructor(private db: DatabaseSyncInstance, private cfg: GmConfig) {}
+  constructor(private db: DatabaseSyncInstance, private cfg: GmConfig) {
+    this.decayEngine = createDecayEngine(cfg.decay);
+  }
 
   setEmbedFn(fn: EmbedFn): void {
     this.embed = fn;
@@ -431,32 +432,19 @@ export class Recaller {
     }
   }
 
-  /** Decay floor per node type — composite's floor */
-  private getDecayFloor(type: string): number {
-    switch (type) {
-      case "SKILL":    return 0.8;
-      case "TOPIC":    return 0.8;
-      case "KNOWLEDGE": return 0.65;
-      case "EVENT":    return 0.35;
-      case "TASK":     return 0.35;
-      case "STATUS":   return 0.2;
-      default:         return 0.5;
-    }
-  }
-
   /**
    * Apply decay scoring to tiered nodes.
    *
    * Decay composite = recencyWeight*recency + frequencyWeight*frequency + intrinsicWeight*intrinsic
    *
-   * The decay composite is floored per node type (SKILL/TOPIC=0.8, KNOWLEDGE=0.65,
-   * EVENT/TASK=0.35, STATUS=0.2), then used to adjust the combined score:
+   * The decay composite is floored per node type using decay.ts DEFAULT_DECAY_CONFIG
+   * plus optional cfg.decay overrides, then used to adjust the combined score:
    *   adjustedScore = combinedScore * (baseWeight + (1-baseWeight) * max(floor, composite))
    *
    * where baseWeight = 0.3. This means:
    * - Fresh/active nodes with high decayComposite (near 1.0) keep their full combined score
-   * - Old STATUS/EVENT/TASK nodes are capped at their type-specific floor
-   * - SKILL nodes barely decay due to high floor and long half-life
+   * - Old STATUS/EVENT/TASK/SESSION nodes can decay aggressively due to low floor
+   * - SKILL/TOPIC/KNOWLEDGE nodes retain moderate protection without bypassing decay
    *
    * After adjusting, nodes are re-sorted and re-tiered.
    */
@@ -497,7 +485,7 @@ export class Recaller {
 
       const ds = this.decayEngine.score(decayable, now);
       // Floor the composite so it can't drop below the type-specific floor
-      const flooredComposite = Math.max(this.getDecayFloor(node.type), ds.composite);
+      const flooredComposite = Math.max(getTypeFloor(node.type, { ...DEFAULT_DECAY_CONFIG, ...this.cfg.decay }), ds.composite);
       const decayFactor = DECAY_BASE + (1 - DECAY_BASE) * flooredComposite;
       const adjustedScore = node.combinedScore * decayFactor;
 

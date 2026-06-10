@@ -44,16 +44,20 @@ export interface DecayConfig {
   betaKnowledge: number;
   /** Weibull beta for SKILL/TOPIC nodes — very sub-exponential (stable) */
   betaSkill: number;
-  /** Decay floor for STATUS nodes (0.4 — can decay to near zero) */
+  /** Decay floor for STATUS nodes (0.1 — highly ephemeral) */
   floorStatus: number;
-  /** Decay floor for TASK nodes (0.5) */
+  /** Decay floor for TASK nodes (0.25 — completed tasks should fade) */
   floorTask: number;
-  /** Decay floor for EVENT nodes (0.55) */
+  /** Decay floor for EVENT nodes (0.2 — events should fade quickly) */
   floorEvent: number;
-  /** Decay floor for KNOWLEDGE nodes (0.65) */
+  /** Decay floor for KNOWLEDGE nodes (0.45 — moderate protection) */
   floorKnowledge: number;
-  /** Decay floor for SKILL/TOPIC nodes (0.8 — very stable) */
+  /** Decay floor for SKILL nodes (0.6 — stable but not over-protected) */
   floorSkill: number;
+  /** Decay floor for TOPIC nodes (0.55 — stable but below skills) */
+  floorTopic: number;
+  /** Decay floor for SESSION nodes (0.1 — sessions are timeline context) */
+  floorSession: number;
 }
 
 export const DEFAULT_DECAY_CONFIG: DecayConfig = {
@@ -69,11 +73,13 @@ export const DEFAULT_DECAY_CONFIG: DecayConfig = {
   betaEvent: 0.9,     // slightly slow
   betaKnowledge: 0.85, // slow
   betaSkill: 0.8,     // very slow
-  floorStatus: 0.4,
-  floorTask: 0.5,
-  floorEvent: 0.55,
-  floorKnowledge: 0.65,
-  floorSkill: 0.8,
+  floorStatus: 0.1,
+  floorTask: 0.25,
+  floorEvent: 0.2,
+  floorKnowledge: 0.45,
+  floorSkill: 0.6,
+  floorTopic: 0.55,
+  floorSession: 0.1,
 };
 
 export interface DecayScore {
@@ -128,15 +134,16 @@ export function getTypeImportance(type: NodeType): number {
 /**
  * Get the decay floor for a NodeType.
  */
-function getTypeFloor(type: NodeType, cfg: DecayConfig): number {
+export function getTypeFloor(type: NodeType, cfg: DecayConfig = DEFAULT_DECAY_CONFIG): number {
   switch (type) {
     case "SKILL":    return cfg.floorSkill;
-    case "TOPIC":    return cfg.floorSkill;
+    case "TOPIC":    return cfg.floorTopic;
     case "KNOWLEDGE": return cfg.floorKnowledge;
     case "EVENT":    return cfg.floorEvent;
     case "TASK":     return cfg.floorTask;
     case "STATUS":   return cfg.floorStatus;
-    default:         return 0.5;
+    case "SESSION":  return cfg.floorSession;
+    default:         return 0.2;
   }
 }
 
