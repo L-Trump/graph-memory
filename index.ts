@@ -1320,13 +1320,30 @@ ${suggestionsText}
           const displayNodes = res.nodes.filter((n: any) => n.tier !== "filtered");
           const nodeMap = new Map(displayNodes.map((n: any) => [n.id, n]));
 
-          const lines = displayNodes.map((n: any) => {
+          const normalizeDisplayScores = (values: Array<number | null | undefined>): Array<number | null> => {
+            const numeric = values.filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+            if (numeric.length === 0) return values.map(() => null);
+            const min = Math.min(...numeric);
+            const max = Math.max(...numeric);
+            return values.map((v) => {
+              if (typeof v !== "number" || !Number.isFinite(v)) return null;
+              if (max === min) return 1;
+              return (v - min) / (max - min);
+            });
+          };
+          // 语义分数展示原始值；PPR/PR 的原始绝对值不直观，展示时按本次结果集归一化。
+          const normalizedPprScores = normalizeDisplayScores(displayNodes.map((n: any) => n.pprScore));
+          const normalizedPagerankScores = normalizeDisplayScores(displayNodes.map((n: any) => n.pagerankScore));
+
+          const lines = displayNodes.map((n: any, i: number) => {
             const tierLabel = n.tier === "hot" ? "【🔥HOT】" : n.tier === "L1" ? "【L1-完整】" : n.tier === "L2" ? "【L2-描述】" : "【L3-名称】";
             const hotFlag = n.flags?.includes("hot") ? " 🔥" : "";
             const scores = [];
             if (n.semanticScore != null) scores.push(`语义=${n.semanticScore.toFixed(3)}`);
-            if (n.pprScore != null) scores.push(`PPR=${n.pprScore.toFixed(3)}`);
-            if (n.pagerankScore != null) scores.push(`PR=${n.pagerankScore.toFixed(3)}`);
+            const displayPpr = normalizedPprScores[i];
+            const displayPagerank = normalizedPagerankScores[i];
+            if (displayPpr != null) scores.push(`PPR=${displayPpr.toFixed(3)}`);
+            if (displayPagerank != null) scores.push(`PR=${displayPagerank.toFixed(3)}`);
             if (n.combinedScore != null) scores.push(`综合=${n.combinedScore.toFixed(3)}`);
             if (n.belief != null) scores.push(`置信度=${n.belief.toFixed(3)}`);
             const scoreStr = scores.length ? ` (${scores.join(", ")})` : "";
@@ -1356,7 +1373,7 @@ ${suggestionsText}
           ].join("\n\n");
 
           // 返回完整 TieredNode 信息（已过滤 filtered）
-          const tieredInfo = displayNodes.map((n: any) => {
+          const tieredInfo = displayNodes.map((n: any, i: number) => {
             // Get belief info if available
             let belief: number | null = null;
             let successCount: number | null = null;
@@ -1386,6 +1403,8 @@ ${suggestionsText}
               semanticScore: n.semanticScore ?? null,
               pprScore: n.pprScore ?? null,
               pagerankScore: n.pagerankScore ?? null,
+              displayPprScore: normalizedPprScores[i],
+              displayPagerankScore: normalizedPagerankScores[i],
               combinedScore: n.combinedScore ?? null,
               belief,
               successCount,
