@@ -37,6 +37,15 @@
         "default": "~/.openclaw/graph-memory.db",
         "description": "SQLite 图谱数据库路径"
       },
+      "autoRecallMode": {
+        "type": "string",
+        "enum": [
+          "full",
+          "index"
+        ],
+        "default": "full",
+        "description": "自动召回注入模式：full=完整 dynamic recall 通过 before_prompt_build/prependContext 临时注入；index=短 recall index 通过 before_message_write 写入 user message，改善前缀缓存。"
+      },
       "compactTurnCount": {
         "type": "integer",
         "default": 6,

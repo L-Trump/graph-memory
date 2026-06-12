@@ -34,7 +34,7 @@ import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Recaller, type TieredNode } from "./src/recaller/recall.ts";
 import { Extractor } from "./src/extractor/extract.ts";
-import { assembleStableContext, assembleDynamicContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
+import { assembleStableContext, assembleDynamicContext, renderRecallIndexContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { filterNoiseMessages } from "./src/extractor/noise-filter.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
@@ -122,9 +122,29 @@ function stripContentBlocks(content: any): any {
   }
   return content;
 }
+function prependTextToMessageContent(content: any, prefix: string): any {
+  if (!prefix.trim()) return content;
+  if (typeof content === "string") {
+    return `${prefix}\n\n${content}`;
+  }
+  if (Array.isArray(content)) {
+    const idx = content.findIndex((block: any) => block && block.type === "text" && typeof block.text === "string");
+    if (idx >= 0) {
+      const fixed = [...content];
+      fixed[idx] = { ...fixed[idx], text: `${prefix}\n\n${fixed[idx].text}` };
+      return fixed;
+    }
+    return [{ type: "text", text: prefix }, ...content];
+  }
+  return `${prefix}\n\n${String(content ?? "")}`.trim();
+}
 
-// ─── 规范化消息 content，确保 OpenClaw 对 content.filter() 不崩 ──
+function simpleHashText(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
 
+
+// ─── 日志预览工具 ───────────────────────────────────────────
 
 function previewContextForLog(label: string, value: string, chars = 100): string {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -136,6 +156,10 @@ function previewContextForLog(label: string, value: string, chars = 100): string
 
 function digestContext(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function summarizeContextForLog(label: string, value: string, chars = 100): string {
+  return `${label}: digest=${digestContext(value)} ${previewContextForLog("body", value, chars)}`;
 }
 
 function summarizeStableNodeForLog(node: any, tier: string): string {
@@ -192,35 +216,6 @@ function previewListForLog(items: string[], limit = 8): string {
   if (!items.length) return "-";
   const shown = items.slice(0, limit).join(", ");
   return items.length > limit ? `${shown}, ...(+${items.length - limit})` : shown;
-}
-
-function normalizeMessageContent(messages: any[]): any[] {
-  return messages.map((msg: any) => {
-    if (!msg || typeof msg !== "object") return msg;
-    const c = msg.content;
-    // 已经是数组 → 修复畸形 block（如 { type: "text" } 缺 text 属性）
-    if (Array.isArray(c)) {
-      const fixed = c.map((block: any) => {
-        if (block && typeof block === "object" && block.type === "text") {
-          const stripped = stripGmMemoryFromText(block.text ?? "");
-          return { ...block, text: stripped };
-        }
-        return block;
-      });
-      if (fixed !== c) return { ...msg, content: fixed };
-      return msg;
-    }
-    // string → 包装成标准 content block 数组，先去掉 gm_memory
-    if (typeof c === "string") {
-      const stripped = stripGmMemoryFromText(c);
-      return { ...msg, content: [{ type: "text", text: stripped }] };
-    }
-    // undefined/null → 空 text block
-    if (c == null) {
-      return { ...msg, content: [{ type: "text", text: "" }] };
-    }
-    return msg;
-  });
 }
 
 // ─── 全局初始化守卫 ─────────────────────────────────────────
@@ -386,6 +381,8 @@ const graphMemoryPlugin = {
     const turnCounter = new Map<string, number>(); // periodic maintenance counter
     const compactedActiveNodeIds = new Map<string, Set<string>>(); // compact 后需要补回上下文的 active 节点
     const previousStableLayerBySession = new Map<string, { digest: string; items: string[]; contextLength: number }>(); // debug: stable 层变化对比
+    const previousBeforePromptBuildReturnBySession = new Map<string, { digest: string; appendDigest: string; prependDigest: string; recallIndexDigest: string; contextLength: number }>(); // debug: before_prompt_build 最终返回变化对比
+    const pendingRecallIndexBySession = new Map<string, { promptHash: string; context: string; createdAt: number; consumed: boolean }>();
 
     // ── Belief 追踪状态 ────────────────────────────────────────
     // 追踪每个 session 中本轮 recall 的节点
@@ -662,6 +659,40 @@ ${suggestionsText}
 
         // ── before_prompt_build：召回 + 渲染 KG（注入 appendSystemContext）───
 
+    api.on("before_message_write", (event: any, ctx: any) => {
+      try {
+        if (cfg.autoRecallMode !== "index") return;
+        const message = event?.message;
+        if (!message || message.role !== "user") return;
+
+        const candidateKeys = [event?.sessionKey, ctx?.sessionKey, (event as any)?.sessionId, (ctx as any)?.sessionId].filter(Boolean);
+        const sid = candidateKeys.find((key: string) => pendingRecallIndexBySession.has(key));
+        if (!sid) return;
+        const pending = pendingRecallIndexBySession.get(sid);
+        if (!pending || pending.consumed) return;
+        if (Date.now() - pending.createdAt > 30_000) {
+          pendingRecallIndexBySession.delete(sid);
+          return;
+        }
+
+        const userText = cleanPrompt(extractUserText(message));
+        if (simpleHashText(userText) !== pending.promptHash) return;
+        if (typeof message.content === "string" && message.content.includes("<gm_memory>")) return;
+        if (Array.isArray(message.content) && message.content.some((b: any) => b?.type === "text" && typeof b.text === "string" && b.text.includes("<gm_memory>"))) return;
+
+        pending.consumed = true;
+        pendingRecallIndexBySession.delete(sid);
+        return {
+          message: {
+            ...message,
+            content: prependTextToMessageContent(message.content, pending.context),
+          },
+        };
+      } catch (err) {
+        api.logger.warn(`[graph-memory] before_message_write recall-index failed: ${err}`);
+      }
+    });
+
     api.on("before_prompt_build", async (event: any, ctx: any) => {
       try {
         const rawPrompt = typeof event?.prompt === "string" ? event.prompt : "";
@@ -670,6 +701,7 @@ ${suggestionsText}
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
 
         const sid = ctx?.sessionId ?? ctx?.sessionKey;
+        const autoRecallMode = cfg.autoRecallMode === "index" ? "index" : "full";
 
         // ── 构造两次独立 recall query ──────────────────────────────
         const recallSlice = sliceLastTurn(event.messages ?? [], RECALL_KEEP_TURNS, false);
@@ -682,7 +714,7 @@ ${suggestionsText}
                 : String(m.content ?? ""));
             const fenceEnd = text.lastIndexOf("```");
             const cleaned = fenceEnd >= 0 && text.includes("Sender") ? text.slice(fenceEnd + 3).trim() : text;
-            return `[${m.role}] ${cleaned}`;
+            return `[${m.role}] ${stripGmMemoryFromText(cleaned)}`;
           })
           .join("\n")
           .replace(/^\[[\w\s\-:]\s*/, "")
@@ -784,7 +816,27 @@ ${suggestionsText}
         }
 
         const append = stable.context;
-        const prepend = dynamic.context;
+        const prepend = autoRecallMode === "full" ? dynamic.context : "";
+        const recallIndex = autoRecallMode === "index"
+          ? renderRecallIndexContext({
+            recalledNodes: rec.nodes,
+            stableNodeIds,
+            logLabel: "recall-index",
+          })
+          : { context: "", tokens: 0 };
+
+        if (autoRecallMode === "index" && recallIndex.context) {
+          const pending = {
+            promptHash: simpleHashText(prompt),
+            context: recallIndex.context,
+            createdAt: Date.now(),
+            consumed: false,
+          };
+          if (ctx?.sessionId) pendingRecallIndexBySession.set(ctx.sessionId, pending);
+          if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) pendingRecallIndexBySession.set(ctx.sessionKey, pending);
+          if (!ctx?.sessionId && !ctx?.sessionKey) pendingRecallIndexBySession.set(sid, pending);
+          api.logger.info(`[graph-memory] recall index pending: ~${recallIndex.tokens} tok sid=${String(sid).slice(0, 8)}`);
+        }
 
         if (cfg.debugContextPreview || process.env.GM_DEBUG_CONTEXT_PREVIEW === "1") {
           const stableDigest = digestContext(append);
@@ -816,11 +868,54 @@ ${suggestionsText}
           }
           previousStableLayerBySession.set(sid, { digest: stableDigest, items: stableItems, contextLength: append.length });
 
-          api.logger.info(`[graph-memory] context preview ${previewContextForLog("stable", append)}`);
-          api.logger.info(`[graph-memory] context preview ${previewContextForLog("dynamic", prepend)}`);
+          api.logger.info(`[graph-memory] context preview ${summarizeContextForLog("stable", append)}`);
+          api.logger.info(`[graph-memory] context preview ${summarizeContextForLog("dynamic", prepend)}`);
+          if (autoRecallMode === "index") {
+            api.logger.info(`[graph-memory] context preview ${summarizeContextForLog("recallIndex", recallIndex.context)}`);
+          }
         }
 
         if (append || prepend) {
+          if (cfg.debugContextPreview || process.env.GM_DEBUG_CONTEXT_PREVIEW === "1") {
+            const returned: Record<string, string> = {};
+            if (prepend) returned.prependContext = prepend;
+            if (append) returned.appendSystemContext = append;
+            if (autoRecallMode === "index" && recallIndex.context) returned.recallIndexPendingContext = recallIndex.context;
+
+            const returnedJson = JSON.stringify(returned, Object.keys(returned).sort());
+            const returnDigest = digestContext(returnedJson);
+            const returnLen = returnedJson.length;
+            const appendDigest = digestContext(append);
+            const prependDigest = digestContext(prepend);
+            const recallIndexDigest = digestContext(recallIndex.context);
+            const prevReturn = previousBeforePromptBuildReturnBySession.get(sid);
+            if (!prevReturn) {
+              api.logger.info(
+                `[graph-memory] bpb return diff: first snapshot digest=${returnDigest} len=${returnLen} ` +
+                `append=${appendDigest}/${append.length} prepend=${prependDigest}/${prepend.length} recallIndex=${recallIndexDigest}/${recallIndex.context.length}`,
+              );
+            } else if (prevReturn.digest === returnDigest) {
+              api.logger.info(
+                `[graph-memory] bpb return diff: unchanged digest=${returnDigest} len=${returnLen} ` +
+                `append=${appendDigest}/${append.length} prepend=${prependDigest}/${prepend.length} recallIndex=${recallIndexDigest}/${recallIndex.context.length}`,
+              );
+            } else {
+              api.logger.info(
+                `[graph-memory] bpb return diff: changed ${prevReturn.digest}->${returnDigest} len ${prevReturn.contextLength}->${returnLen} ` +
+                `append ${prevReturn.appendDigest}->${appendDigest}/${append.length} ` +
+                `prepend ${prevReturn.prependDigest}->${prependDigest}/${prepend.length} ` +
+                `recallIndex ${prevReturn.recallIndexDigest}->${recallIndexDigest}/${recallIndex.context.length}`,
+              );
+            }
+            previousBeforePromptBuildReturnBySession.set(sid, {
+              digest: returnDigest,
+              appendDigest,
+              prependDigest,
+              recallIndexDigest,
+              contextLength: returnLen,
+            });
+            api.logger.info(`[graph-memory] bpb return preview ${summarizeContextForLog("return", returnedJson)}`);
+          }
           return {
             ...(prepend ? { prependContext: prepend } : {}),
             ...(append ? { appendSystemContext: append } : {}),
@@ -867,14 +962,12 @@ ${suggestionsText}
         messages: any[];
         tokenBudget?: number;
       }) {
-        // KG 渲染已移至 before_prompt_build。
-        // assemble 只处理运行时消息副本：规范化 content，并剥离历史中残留的
-        // transient `<gm_memory>`。这里不改 sessionFile，避免绕过 OpenClaw
-        // SessionManager/lock；同一轮工具链内的 dynamic memory 仍保留到 turn 结束。
-        const sanitizedMessages = normalizeMessageContent(messages);
-
+        // KG 渲染已移至 before_prompt_build / before_message_write。
+        // assemble 采用 legacy context engine 同款 passthrough：不改变 message content 形态，
+        // 避免 string ↔ text-block array 的中间转换干扰 prefix cache 分析。
+        // <gm_memory> 的清理只发生在 GM 自身入库/提取路径，不改模型侧 transcript view。
         return {
-          messages: sanitizedMessages,
+          messages,
           estimatedTokens: 0,
         };
       },
@@ -2714,6 +2807,9 @@ function extractUserText(msg: any): string {
   if (fenceEnd >= 0 && raw.includes("Sender")) {
     raw = raw.slice(fenceEnd + 3).trim();
   }
+
+  // 去掉 GM 运行时记忆块，避免 index 模式的持久化 recall 污染提取/检索
+  raw = stripGmMemoryFromText(raw);
 
   // 兜底：去掉命令前缀、时间戳标记等
   raw = raw.replace(/^\/\w+\s+/, "").trim();

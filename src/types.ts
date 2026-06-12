@@ -176,6 +176,8 @@ export interface EmbeddingConfig {
 
 export interface GmConfig {
   dbPath: string;
+  /** 自动召回注入模式：full=完整动态记忆经 before_prompt_build 注入；index=短索引写入 user message 以改善前缀缓存 */
+  autoRecallMode?: "full" | "index";
   compactTurnCount: number;
   recallMaxNodes: number;
   recallMaxDepth: number;
@@ -218,6 +220,7 @@ export interface GmConfig {
 
 export const DEFAULT_CONFIG: GmConfig = {
   dbPath: "~/.openclaw/graph-memory.db",
+  autoRecallMode: "full",
   compactTurnCount: 6,
   recallMaxNodes: 15,
   recallMaxDepth: 2,

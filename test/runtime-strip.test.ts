@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import plugin from "../index.ts";
 
-function makeApi() {
+function makeApi(config: Record<string, unknown> = {}) {
   const handlers = new Map<string, Function[]>();
   const api: any = {
     on(name: string, fn: Function) {
@@ -13,7 +13,7 @@ function makeApi() {
     registerTool() {},
     config: {
       get() {
-        return {};
+        return config;
       },
     },
     logger: {
@@ -27,9 +27,13 @@ function makeApi() {
 }
 
 describe("graph-memory runtime strip behavior", () => {
-  it("does not register before_message_write cleanup", () => {
-    const { api, handlers } = makeApi();
+  it("before_message_write is not a cleanup hook in full mode", () => {
+    const { api, handlers } = makeApi({ autoRecallMode: "full" });
     plugin.register(api);
-    expect(handlers.has("before_message_write")).toBe(false);
+    const hooks = handlers.get("before_message_write") ?? [];
+    expect(hooks.length).toBeGreaterThanOrEqual(1);
+
+    const result = hooks[0]({ message: { role: "user", content: "hello" }, sessionKey: "s1" }, { sessionKey: "s1" });
+    expect(result).toBeUndefined();
   });
 });

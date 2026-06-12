@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
-import { assembleStableContext, assembleDynamicContext, buildSystemPromptAddition } from "../src/format/assemble.ts";
+import { assembleStableContext, assembleDynamicContext, renderRecallIndexContext, buildSystemPromptAddition } from "../src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "../src/format/transcript-repair.ts";
 import { findById } from "../src/store/store.ts";
 import type { GmNode, GmEdge } from "../src/types.ts";
@@ -114,6 +114,32 @@ describe("hot 节点渲染", () => {
     expect(xml).toContain('tier="hot"');
   });
 
+
+  it("stable context 去掉 updated/confidence 并稳定排序", () => {
+    const bId = insertNode(db, { name: "b-hot", type: "SKILL", description: "b desc", content: "b content" });
+    const aId = insertNode(db, { name: "a-hot", type: "SKILL", description: "a desc", content: "a content" });
+    const bNode = { ...findById(db, bId)!, belief: 0.91, updatedAt: Date.now() } as GmNode;
+    const aNode = { ...findById(db, aId)!, belief: 0.42, updatedAt: Date.now() - 86400000 } as GmNode;
+
+    const first = assembleStableContext(db, null!, {
+      hotNodes: [bNode, aNode],
+      hotEdges: [] as GmEdge[],
+      scopeHotNodes: [] as GmNode[],
+      scopeHotEdges: [] as GmEdge[],
+    });
+    const second = assembleStableContext(db, null!, {
+      hotNodes: [{ ...aNode, updatedAt: Date.now(), belief: 0.11 }, { ...bNode, updatedAt: Date.now() + 9999, belief: 0.99 }],
+      hotEdges: [] as GmEdge[],
+      scopeHotNodes: [] as GmNode[],
+      scopeHotEdges: [] as GmEdge[],
+    });
+
+    expect(first.xml).not.toContain("updated=");
+    expect(first.xml).not.toContain("confidence=");
+    expect(first.xml!.indexOf('name="a-hot"')).toBeLessThan(first.xml!.indexOf('name="b-hot"'));
+    expect(second.xml).toBe(first.xml);
+  });
+
   it("hot 节点在 hot+active+recalled 混合场景中排序正确", () => {
     const id1 = insertNode(db, { name: "active-node", type: "TASK" });
     const id2 = insertNode(db, { name: "hot-node", type: "SKILL", flags: ["hot"] });
@@ -136,7 +162,7 @@ describe("hot 节点渲染", () => {
     expect(xml).toContain('tier="active"');
   });
 
-  it("hot 节点的边在两侧节点都在时正确渲染", () => {
+  it("stable context 不渲染 hot 节点边以保持 system prompt 前缀稳定", () => {
     const id1 = insertNode(db, { name: "hot-from", type: "SKILL" });
     const id2 = insertNode(db, { name: "hot-to", type: "TASK" });
     const node1 = findById(db, id1)!;
@@ -159,10 +185,11 @@ describe("hot 节点渲染", () => {
       scopeHotEdges: [] as GmEdge[],
     });
 
-    // 边应该渲染
-    expect(xml).toContain('name="使用"');
-    expect(xml).toContain('from="hot-from"');
-    expect(xml).toContain('to="hot-to"');
+    // stable 层故意不渲染边：边关系更容易变化，会破坏 system prompt 前缀缓存
+    expect(xml).not.toContain('<edges>');
+    expect(xml).not.toContain('name="使用"');
+    expect(xml).not.toContain('from="hot-from"');
+    expect(xml).not.toContain('to="hot-to"');
   });
 });
 
@@ -189,6 +216,40 @@ describe("分层 assemble", () => {
     expect(stable.context).toContain("stable-hot");
     expect(stable.context).not.toContain("dynamic-recalled");
     expect(stable.xml).toContain('tier="hot"');
+  });
+
+
+  it("recall index 只渲染 L1 name+desc、L2 name 且不渲染边/正文", () => {
+    const l1Id = insertNode(db, { name: "idx-l1", type: "KNOWLEDGE", description: "l1 desc", content: "full l1 content should not appear" });
+    const l2Id = insertNode(db, { name: "idx-l2", type: "SKILL", description: "l2 desc should not appear", content: "full l2 content should not appear" });
+    const l3Id = insertNode(db, { name: "idx-l3", type: "TASK", description: "l3 desc", content: "full l3 content" });
+    const stableId = insertNode(db, { name: "idx-stable", type: "EVENT", description: "stable desc", content: "stable content" });
+    const l1Node = findById(db, l1Id)!;
+    const l2Node = findById(db, l2Id)!;
+    const l3Node = findById(db, l3Id)!;
+    const stableNode = findById(db, stableId)!;
+
+    const result = renderRecallIndexContext({
+      recalledNodes: [
+        { ...l1Node, tier: "L1" as const, semanticScore: 1, pprScore: 0, pagerankScore: 0, combinedScore: 1 },
+        { ...l2Node, tier: "L2" as const, semanticScore: 1, pprScore: 0, pagerankScore: 0, combinedScore: 1 },
+        { ...l3Node, tier: "L3" as const, semanticScore: 1, pprScore: 0, pagerankScore: 0, combinedScore: 1 },
+        { ...stableNode, tier: "L1" as const, semanticScore: 1, pprScore: 0, pagerankScore: 0, combinedScore: 1 },
+      ],
+      stableNodeIds: new Set([stableNode.id]),
+    });
+
+    expect(result.context).toContain("<gm_memory>");
+    expect(result.context).toContain('name="idx-l1"');
+    expect(result.context).toContain('desc="l1 desc"');
+    expect(result.context).toContain('name="idx-l2"');
+    expect(result.context).not.toContain("l2 desc should not appear");
+    expect(result.context).not.toContain("idx-l3");
+    expect(result.context).not.toContain("idx-stable");
+    expect(result.context).not.toContain("full l1 content should not appear");
+    expect(result.context).not.toContain("<edges>");
+    expect(result.context).toContain("gm_get_node");
+    expect(result.context).toContain("gm_search");
   });
 
   it("dynamic context 过滤 stable 已包含节点，compact active 保留在 stable", () => {

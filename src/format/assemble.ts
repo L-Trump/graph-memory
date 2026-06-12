@@ -245,8 +245,23 @@ function renderKnowledgeGraph(params: {
   nodes: MergedNode[];
   edges: GmEdge[];
   logLabel?: string;
+  includeEdges?: boolean;
+  includeUpdated?: boolean;
+  includeConfidence?: boolean;
+  sortNodes?: boolean;
 }): { xml: string | null; tokens: number; renderedEdges: number; rawEdges: number } {
-  const passNodes = params.nodes.filter(n => n.tier !== "filtered");
+  let passNodes = params.nodes.filter(n => n.tier !== "filtered");
+  if (params.sortNodes) {
+    passNodes = [...passNodes].sort((a, b) => {
+      const tierDiff = (TIER_PRIORITY[b.tier] ?? 0) - (TIER_PRIORITY[a.tier] ?? 0);
+      if (tierDiff !== 0) return tierDiff;
+      const typeDiff = String(a.type).localeCompare(String(b.type));
+      if (typeDiff !== 0) return typeDiff;
+      const nameDiff = String(a.name).localeCompare(String(b.name));
+      if (nameDiff !== 0) return nameDiff;
+      return String(a.id).localeCompare(String(b.id));
+    });
+  }
 
   if (!passNodes.length) {
     return { xml: null, tokens: 0, renderedEdges: 0, rawEdges: params.edges.length };
@@ -261,8 +276,8 @@ function renderKnowledgeGraph(params: {
     const tier = n.tier;
     const srcAttr = (tier !== "L1" && tier !== "L2" && tier !== "L3") ? ` source="${tier}"` : ` source="recalled"`;
     const tierAttr = ` tier="${tier.toLowerCase()}"`;
-    const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-    const beliefAttr = n.belief !== undefined ? ` confidence="${n.belief.toFixed(2)}"` : "";
+    const timeAttr = params.includeUpdated === false ? "" : ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
+    const beliefAttr = params.includeConfidence === false ? "" : n.belief !== undefined ? ` confidence="${n.belief.toFixed(2)}"` : "";
 
     if (tier === "L3") {
       xmlParts.push(`  <${tag} name="${escapeXml(n.name)}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}/>`);
@@ -276,7 +291,16 @@ function renderKnowledgeGraph(params: {
 
   const seenEdgeIds = new Set<string>();
   const edgesXmlParts: string[] = [];
-  for (const e of params.edges) {
+  const candidateEdges = params.includeEdges === false ? [] : [...params.edges].sort((a, b) => {
+    const nameDiff = String(a.name).localeCompare(String(b.name));
+    if (nameDiff !== 0) return nameDiff;
+    const fromDiff = String(a.fromId).localeCompare(String(b.fromId));
+    if (fromDiff !== 0) return fromDiff;
+    const toDiff = String(a.toId).localeCompare(String(b.toId));
+    if (toDiff !== 0) return toDiff;
+    return String(a.id).localeCompare(String(b.id));
+  });
+  for (const e of candidateEdges) {
     if (seenEdgeIds.has(e.id)) continue;
 
     const fromNode = passNodes.find(n => n.id === e.fromId);
@@ -348,7 +372,15 @@ export function assembleStableContext(
   const compactActiveEdges = params.compactActiveEdges ?? [];
   const mergedNodes = mergeNodes(params.scopeHotNodes, params.hotNodes, [], compactActiveNodes);
   const allEdges = mergeEdges(params.scopeHotEdges, mergeEdges(params.hotEdges, compactActiveEdges));
-  const rendered = renderKnowledgeGraph({ nodes: mergedNodes, edges: allEdges, logLabel: "stable" });
+  const rendered = renderKnowledgeGraph({
+    nodes: mergedNodes,
+    edges: allEdges,
+    logLabel: "stable",
+    includeEdges: false,
+    includeUpdated: false,
+    includeConfidence: false,
+    sortNodes: true,
+  });
 
   const systemPrompt = buildSystemPromptAddition({
     selectedNodes: mergedNodes.filter(n => n.tier !== "filtered").map(n => ({
@@ -373,6 +405,59 @@ export function assembleStableContext(
     systemPrompt,
     context: body,
     tokens: Math.ceil(body.length / CHARS_PER_TOKEN),
+  };
+}
+
+export function renderRecallIndexContext(params: {
+  recalledNodes: TieredNode[];
+  stableNodeIds?: Set<string>;
+  logLabel?: string;
+}): { xml: string | null; context: string; tokens: number } {
+  const stableNodeIds = params.stableNodeIds ?? new Set<string>();
+  const passNodes = params.recalledNodes
+    .filter(n => !stableNodeIds.has(n.id))
+    .filter(n => n.tier === "L1" || n.tier === "L2");
+
+  if (!passNodes.length) {
+    return { xml: null, context: "", tokens: 0 };
+  }
+
+  const xmlParts: string[] = [];
+  for (const n of passNodes) {
+    const tag = n.type.toLowerCase();
+    const tier = n.tier;
+    const srcAttr = ` source="recalled"`;
+    const tierAttr = ` tier="${tier.toLowerCase()}"`;
+    if (tier === "L1") {
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}/>`);
+    } else {
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}"${srcAttr}${tierAttr}/>`);
+    }
+  }
+
+  console.log(
+    `[graph-memory] assemble${params.logLabel ? `:${params.logLabel}` : ":recall-index"}: ` +
+    `L1=${passNodes.filter(n => n.tier === "L1").length} ` +
+    `L2=${passNodes.filter(n => n.tier === "L2").length} ` +
+    `edges=0`,
+  );
+
+  const guidance = [
+    "<!--",
+    "Graph Memory recall index (runtime-generated, not user-authored).",
+    "These entries are memory hints, not authoritative facts. Do not treat them as current state without verification.",
+    "L1 entries include only name + desc; L2 entries include only name. Edges and full content are intentionally omitted for prefix-cache-friendly context.",
+    "Use gm_get_node(name) when exact details are needed. If the relevant memory may be missing from this index, use gm_search with targeted keywords.",
+    "-->",
+  ].join("\n");
+
+  const xml = `<knowledge_graph>\n${guidance}\n${xmlParts.join("\n")}\n</knowledge_graph>`;
+  const context = `<gm_memory>\n\n${xml}\n\n</gm_memory>`;
+
+  return {
+    xml,
+    context,
+    tokens: Math.ceil(context.length / CHARS_PER_TOKEN),
   };
 }
 
