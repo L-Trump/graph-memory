@@ -2230,22 +2230,40 @@ ${suggestionsText}
         }),
         async execute(_toolCallId: string, params: { confirm?: boolean; force?: boolean }) {
           const { confirm, force = false } = params;
-          const allNodes = db.prepare(
-            "SELECT id, name, type, content FROM gm_nodes WHERE status = 'active'"
-          ).all() as any[];
+          const allNodes = db.prepare(`
+            SELECT
+              n.id,
+              n.name,
+              n.type,
+              n.description,
+              COALESCE(n.content, '') AS content,
+              v.content_hash AS vectorHash
+            FROM gm_nodes n
+            LEFT JOIN gm_vectors v ON v.node_id = n.id
+            WHERE n.status = 'active'
+          `).all() as any[];
           if (!allNodes.length) {
             return {
               content: [{ type: "text", text: "图谱中没有任何 active 节点。" }],
               details: { count: 0 },
             };
           }
+          const nodesToEmbed = force
+            ? allNodes
+            : allNodes.filter(row => {
+                const hash = createHash("md5").update(row.content ?? "").digest("hex");
+                return row.vectorHash !== hash;
+              });
+          const skipped = allNodes.length - nodesToEmbed.length;
           if (!confirm) {
             return {
               content: [{
                 type: "text",
-                text: `图谱中共有 ${allNodes.length} 个 active 节点待重新嵌入。\n传入 confirm: true 确认执行。`,
+                text: force
+                  ? `图谱中共有 ${allNodes.length} 个 active 节点待强制重新嵌入。\n传入 confirm: true 确认执行。`
+                  : `图谱中共有 ${allNodes.length} 个 active 节点，其中 ${nodesToEmbed.length} 个缺失向量或 content hash 已变化，${skipped} 个可跳过。\n传入 confirm: true 确认执行。`,
               }],
-              details: { count: allNodes.length, confirmRequired: true },
+              details: { count: allNodes.length, candidates: nodesToEmbed.length, skipped, force, confirmRequired: true },
             };
           }
           if (!recaller.isEmbedReady()) {
@@ -2256,19 +2274,20 @@ ${suggestionsText}
           }
           let updated = 0;
           let failed = 0;
-          for (const row of allNodes) {
+          for (const row of nodesToEmbed) {
             try {
-              await recaller.syncEmbed(row, force);
+              // Hash 已在本工具中批量预筛选过，传 force=true 避免 syncEmbed 再逐节点查询 gm_vectors。
+              await recaller.syncEmbed(row, true);
               updated++;
             } catch {
               failed++;
             }
           }
-          const text = `全量重新嵌入完成：成功 ${updated} 个，失败 ${failed} 个（共 ${allNodes.length} 个节点，force=${force}）。`;
-          api.logger.info(`[graph-memory] reembedding_all: ${updated} ok, ${failed} failed`);
+          const text = `全量重新嵌入完成：成功 ${updated} 个，失败 ${failed} 个，跳过 ${skipped} 个（共 ${allNodes.length} 个 active 节点，force=${force}）。`;
+          api.logger.info(`[graph-memory] reembedding_all: ${updated} ok, ${failed} failed, ${skipped} skipped`);
           return {
             content: [{ type: "text", text }],
-            details: { success: true, total: allNodes.length, updated, failed },
+            details: { success: true, total: allNodes.length, candidates: nodesToEmbed.length, updated, failed, skipped, force },
           };
         },
       }),
