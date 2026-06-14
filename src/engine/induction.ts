@@ -596,7 +596,7 @@ function getSessionMessagesForInduction(
  *
  * 触发时机：
  * 1. session 第一次产生节点时（runTurnExtract 中）
- * 2. 每 N 轮自动维护（afterTurn periodic maintenance）
+ * 2. 每 N 轮自动维护（agent_end periodic maintenance）
  * 3. session_end
  * 4. compaction
  *

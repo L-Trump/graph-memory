@@ -5,15 +5,14 @@
  * Email: Wywelljob@gmail.com
  *
  * 实现：
- *   - ContextEngine 接口：bootstrap / ingest / assemble / compact / afterTurn
- *   - Hooks：before_prompt_build（召回+渲染）/ session_end（finalize+维护）
+ *   - Hook-only 记忆插件：before_prompt_build / before_message_write / agent_end / compaction / subagent / session_end
+ *   - 不注册 ContextEngine，不占用 OpenClaw contextEngine slot
  *   - 置信度系统：beliefUpdates（LLM 提取）+ session_end task_completed 信号
- *   - 17 个 gm_* 工具
+ *   - 22 个 gm_* 工具
  *   - 双层噪声过滤：input-layer（noise-filter.ts）+ output-layer（extract.ts）
  *   - 关键词混合召回：向量相似度 × (1 + keywordScore × 0.4)
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { delegateCompactionToRuntime } from "openclaw/plugin-sdk";
 import { createHash } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { getDb } from "./src/store/db.ts";
@@ -383,6 +382,15 @@ const graphMemoryPlugin = {
     const previousStableLayerBySession = new Map<string, { digest: string; items: string[]; contextLength: number }>(); // debug: stable 层变化对比
     const previousBeforePromptBuildReturnBySession = new Map<string, { digest: string; appendDigest: string; prependDigest: string; recallIndexDigest: string; contextLength: number }>(); // debug: before_prompt_build 最终返回变化对比
     const pendingRecallIndexBySession = new Map<string, { promptHash: string; context: string; createdAt: number; consumed: boolean }>();
+    const runStartMessageCount = new Map<string, number>();
+    const lastRuntimeMessageCount = new Map<string, number>();
+    const recentRuntimeMessageFingerprints = new Map<string, Set<string>>();
+
+    const debugRuntimeHooks = cfg.debugContextPreview || process.env.GM_DEBUG_CONTEXT_PREVIEW === "1" || process.env.GM_DEBUG_RUNTIME_HOOKS === "1";
+    const debugId = (value: unknown) => typeof value === "string" && value.length > 8 ? value.slice(0, 8) : String(value ?? "-");
+    const logRuntimeDebug = (message: string) => {
+      if (debugRuntimeHooks) api.logger.info(`[graph-memory] runtime debug: ${message}`);
+    };
 
     // ── Belief 追踪状态 ────────────────────────────────────────
     // 追踪每个 session 中本轮 recall 的节点
@@ -390,6 +398,95 @@ const graphMemoryPlugin = {
 
     // ── 提取串行化（同 session Promise chain，不同 session 并行）────
     const extractChain = new Map<string, Promise<void>>();
+
+    function rememberAliases(value: { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }, ...keys: Array<unknown>): void {
+      for (const key of keys) {
+        if (typeof key === "string" && key.trim()) recalled.set(key, value);
+      }
+    }
+
+    function deleteSessionScopedState(...keys: Array<unknown>): void {
+      for (const key of keys) {
+        if (typeof key !== "string" || !key.trim()) continue;
+        const prefixedRunKeys = Array.from(runStartMessageCount.keys()).filter(runKey => runKey.startsWith(`${key}:`));
+        const hadState = [
+          recalled, msgSeq, turnCounter, compactedActiveNodeIds,
+          previousStableLayerBySession, previousBeforePromptBuildReturnBySession,
+          pendingRecallIndexBySession, lastRuntimeMessageCount,
+          recentRuntimeMessageFingerprints, extractChain, runStartMessageCount,
+        ].some(map => map.has(key)) || prefixedRunKeys.length > 0;
+        recalled.delete(key);
+        msgSeq.delete(key);
+        turnCounter.delete(key);
+        compactedActiveNodeIds.delete(key);
+        previousStableLayerBySession.delete(key);
+        previousBeforePromptBuildReturnBySession.delete(key);
+        pendingRecallIndexBySession.delete(key);
+        lastRuntimeMessageCount.delete(key);
+        recentRuntimeMessageFingerprints.delete(key);
+        extractChain.delete(key);
+        runStartMessageCount.delete(key);
+        for (const runKey of prefixedRunKeys) runStartMessageCount.delete(runKey);
+        logRuntimeDebug(`state cleanup key=${debugId(key)} hadState=${hadState} prefixedRunKeys=${prefixedRunKeys.length}`);
+      }
+    }
+
+    function messageFingerprint(message: any): string {
+      const normalized = {
+        role: message?.role ?? "unknown",
+        content: stripContentBlocks(message?.content),
+        toolCallId: message?.toolCallId ?? message?.tool_call_id ?? null,
+        name: message?.name ?? null,
+      };
+      return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+    }
+
+    function loadRecentDbMessageFingerprints(sessionId: string): Set<string> {
+      const rows = db.prepare(
+        "SELECT content FROM gm_messages WHERE session_id=? ORDER BY turn_index DESC LIMIT 128",
+      ).all(sessionId) as any[];
+      const seen = new Set<string>();
+      for (const row of rows) {
+        try {
+          seen.add(messageFingerprint(JSON.parse(row.content)));
+        } catch {}
+      }
+      return seen;
+    }
+
+    function chooseAgentEndNewMessages(sessionId: string, messages: any[], prePromptMessageCount?: number): any[] {
+      if (!messages.length) return [];
+
+      const previousRuntimeCount = lastRuntimeMessageCount.get(sessionId);
+      const explicitStart = Number.isFinite(prePromptMessageCount)
+        ? Math.max(0, Math.min(messages.length, Number(prePromptMessageCount)))
+        : undefined;
+      const rememberedStart = previousRuntimeCount !== undefined && messages.length >= previousRuntimeCount
+        ? Math.max(0, Math.min(messages.length, previousRuntimeCount))
+        : undefined;
+
+      const startSource = explicitStart !== undefined ? "explicit" : rememberedStart !== undefined ? "remembered" : "tail8";
+      const start = explicitStart ?? rememberedStart ?? Math.max(0, messages.length - 8);
+      const rawCandidates = messages.slice(start);
+      let candidates = rawCandidates;
+      const seenSource = recentRuntimeMessageFingerprints.has(sessionId) ? "memory" : "db";
+      const seen = recentRuntimeMessageFingerprints.get(sessionId) ?? loadRecentDbMessageFingerprints(sessionId);
+      if (seen.size > 0) {
+        candidates = candidates.filter((msg: any) => !seen.has(messageFingerprint(msg)));
+      }
+      logRuntimeDebug(
+        `agent_end choose sid=${debugId(sessionId)} messages=${messages.length} previous=${previousRuntimeCount ?? "-"} ` +
+        `explicit=${explicitStart ?? "-"} remembered=${rememberedStart ?? "-"} start=${start}/${startSource} ` +
+        `raw=${rawCandidates.length} deduped=${candidates.length} seen=${seen.size}/${seenSource}`,
+      );
+
+      const nextSeen = new Set<string>();
+      for (const msg of messages.slice(-128)) nextSeen.add(messageFingerprint(msg));
+      recentRuntimeMessageFingerprints.set(sessionId, nextSeen);
+      lastRuntimeMessageCount.set(sessionId, messages.length);
+
+      return candidates;
+    }
 
     /** 存一条消息到 gm_messages（同步，零 LLM） */
     function ingestMessage(sessionId: string, message: any): void {
@@ -413,7 +510,11 @@ const graphMemoryPlugin = {
 
     /** 每轮结束后直接提取当前轮的消息（同 session 串行，不丢消息） */
     async function runTurnExtract(sessionId: string, sessionKey: string, newMessages: any[]): Promise<void> {
-      if (!newMessages.length) return;
+      if (!newMessages.length) {
+        logRuntimeDebug(`extract skipped sid=${debugId(sessionId)} reason=no-new-messages`);
+        return;
+      }
+      logRuntimeDebug(`extract queued sid=${debugId(sessionId)} sessionKey=${debugId(sessionKey)} newMessages=${newMessages.length}`);
 
       // Promise chain：上一次提取完了才跑下一次，不会跳过
       const prev = extractChain.get(sessionId) ?? Promise.resolve();
@@ -423,6 +524,7 @@ const graphMemoryPlugin = {
 
           // ── Input-layer noise filter ───────────────────────
           const filteredMsgs = filterNoiseMessages(msgs, extractUserText);
+          logRuntimeDebug(`extract batch sid=${debugId(sessionId)} unextracted=${msgs.length} filtered=${filteredMsgs.length}`);
           if (!filteredMsgs.length) return;
 
           // 获取最近 N 轮已提取消息作为上下文参考
@@ -667,21 +769,38 @@ ${suggestionsText}
 
         const candidateKeys = [event?.sessionKey, ctx?.sessionKey, (event as any)?.sessionId, (ctx as any)?.sessionId].filter(Boolean);
         const sid = candidateKeys.find((key: string) => pendingRecallIndexBySession.has(key));
-        if (!sid) return;
+        if (!sid) {
+          logRuntimeDebug(`before_message_write index miss keys=${candidateKeys.map(debugId).join(",")}`);
+          return;
+        }
         const pending = pendingRecallIndexBySession.get(sid);
-        if (!pending || pending.consumed) return;
+        if (!pending || pending.consumed) {
+          logRuntimeDebug(`before_message_write index skip sid=${debugId(sid)} reason=${pending ? "consumed" : "missing"}`);
+          return;
+        }
         if (Date.now() - pending.createdAt > 30_000) {
           pendingRecallIndexBySession.delete(sid);
+          logRuntimeDebug(`before_message_write index expired sid=${debugId(sid)}`);
           return;
         }
 
         const userText = cleanPrompt(extractUserText(message));
-        if (simpleHashText(userText) !== pending.promptHash) return;
-        if (typeof message.content === "string" && message.content.includes("<gm_memory>")) return;
-        if (Array.isArray(message.content) && message.content.some((b: any) => b?.type === "text" && typeof b.text === "string" && b.text.includes("<gm_memory>"))) return;
+        if (simpleHashText(userText) !== pending.promptHash) {
+          logRuntimeDebug(`before_message_write index hash-mismatch sid=${debugId(sid)}`);
+          return;
+        }
+        if (typeof message.content === "string" && message.content.includes("<gm_memory>")) {
+          logRuntimeDebug(`before_message_write index skip sid=${debugId(sid)} reason=already-prefixed`);
+          return;
+        }
+        if (Array.isArray(message.content) && message.content.some((b: any) => b?.type === "text" && typeof b.text === "string" && b.text.includes("<gm_memory>"))) {
+          logRuntimeDebug(`before_message_write index skip sid=${debugId(sid)} reason=already-prefixed-block`);
+          return;
+        }
 
         pending.consumed = true;
         pendingRecallIndexBySession.delete(sid);
+        logRuntimeDebug(`before_message_write index applied sid=${debugId(sid)} chars=${pending.context.length}`);
         return {
           message: {
             ...message,
@@ -693,6 +812,17 @@ ${suggestionsText}
       }
     });
 
+    api.on("before_agent_start", (event: any, ctx: any) => {
+      try {
+        const sid = resolveHookSessionId(event, ctx);
+        if (!sid || !event?.runId || !Array.isArray(event?.messages)) return;
+        runStartMessageCount.set(`${sid}:${event.runId}`, event.messages.length);
+        logRuntimeDebug(`before_agent_start tracked sid=${debugId(sid)} run=${debugId(event.runId)} messages=${event.messages.length}`);
+      } catch (err) {
+        api.logger.warn(`[graph-memory] before_agent_start tracking failed: ${err}`);
+      }
+    });
+
     api.on("before_prompt_build", async (event: any, ctx: any) => {
       try {
         const rawPrompt = typeof event?.prompt === "string" ? event.prompt : "";
@@ -701,6 +831,10 @@ ${suggestionsText}
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
 
         const sid = ctx?.sessionId ?? ctx?.sessionKey;
+        if (sid && ctx?.runId && Array.isArray(event?.messages)) {
+          runStartMessageCount.set(`${sid}:${ctx.runId}`, event.messages.length);
+          logRuntimeDebug(`before_prompt_build tracked sid=${debugId(sid)} run=${debugId(ctx.runId)} messages=${event.messages.length}`);
+        }
         const autoRecallMode = cfg.autoRecallMode === "index" ? "index" : "full";
 
         // ── 构造两次独立 recall query ──────────────────────────────
@@ -717,7 +851,7 @@ ${suggestionsText}
             return `[${m.role}] ${stripGmMemoryFromText(cleaned)}`;
           })
           .join("\n")
-          .replace(/^\[[\w\s\-:]\s*/, "")
+          .replace(/^\[[^\]]+\]\s*/, "")
           .trim();
         // promptQuery：清理后的当前用户 prompt
         const promptQuery = prompt;
@@ -733,10 +867,7 @@ ${suggestionsText}
 
         if (res.nodes.length) {
           const stored = { nodes: res.nodes, edges: res.edges, pprScores: res.pprScores };
-          if (ctx?.sessionId) recalled.set(ctx.sessionId, stored);
-          if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) {
-            recalled.set(ctx.sessionKey, stored);
-          }
+          rememberAliases(stored, sid, ctx?.sessionId, ctx?.sessionKey, event?.sessionId, event?.sessionKey);
 
           const tierCounts: Record<string, number> = {};
           for (const n of res.nodes) {
@@ -761,7 +892,7 @@ ${suggestionsText}
         }
 
         // ── 组装 KG：稳定层 → appendSystemContext，动态层 → prependContext ──
-        const rec = recalled.get(sid) ?? { nodes: [], edges: [], pprScores: {} };
+        const rec = recalled.get(sid) ?? recalled.get(ctx?.sessionKey) ?? recalled.get(event?.sessionKey) ?? { nodes: [], edges: [], pprScores: {} };
         const hotNodes = getHotNodes(db);
         const hotEdges = hotNodes.length > 0 ? getEdgesForNodes(db, hotNodes.map(n => n.id)) : [];
         const sessionScopes = getScopesForSession(db, ctx?.sessionKey ?? ctx?.sessionId);
@@ -832,10 +963,12 @@ ${suggestionsText}
             createdAt: Date.now(),
             consumed: false,
           };
-          if (ctx?.sessionId) pendingRecallIndexBySession.set(ctx.sessionId, pending);
-          if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) pendingRecallIndexBySession.set(ctx.sessionKey, pending);
-          if (!ctx?.sessionId && !ctx?.sessionKey) pendingRecallIndexBySession.set(sid, pending);
+          const pendingKeys: string[] = [];
+          if (ctx?.sessionId) { pendingRecallIndexBySession.set(ctx.sessionId, pending); pendingKeys.push(ctx.sessionId); }
+          if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) { pendingRecallIndexBySession.set(ctx.sessionKey, pending); pendingKeys.push(ctx.sessionKey); }
+          if (!ctx?.sessionId && !ctx?.sessionKey) { pendingRecallIndexBySession.set(sid, pending); pendingKeys.push(sid); }
           api.logger.info(`[graph-memory] recall index pending: ~${recallIndex.tokens} tok sid=${String(sid).slice(0, 8)}`);
+          logRuntimeDebug(`recall index pending keys=${pendingKeys.map(debugId).join(",")} chars=${recallIndex.context.length}`);
         }
 
         if (cfg.debugContextPreview || process.env.GM_DEBUG_CONTEXT_PREVIEW === "1") {
@@ -926,307 +1059,304 @@ ${suggestionsText}
       }
     });
 
-    // ── ContextEngine ────────────────────────────────────────
+    // ── Hook-only lifecycle handlers ───────────────────────────
 
-    const engine = {
-      info: {
-        id: "graph-memory",
-        name: "Graph Memory",
-        ownsCompaction: false,
-      },
+    function resolveHookSessionId(event: any, ctx: any): string | undefined {
+      return ctx?.sessionId ?? event?.sessionId ?? ctx?.sessionKey ?? event?.sessionKey;
+    }
 
-      async bootstrap({ sessionId }: { sessionId: string }) {
-        return { bootstrapped: true };
-      },
+    function resolvePrePromptMessageCount(event: any, ctx: any, sessionId: string): number | undefined {
+      const direct = event?.prePromptMessageCount ?? ctx?.prePromptMessageCount;
+      if (Number.isFinite(direct)) return Number(direct);
+      const start = event?.runId ? runStartMessageCount.get(`${sessionId}:${event.runId}`) : undefined;
+      if (Number.isFinite(start)) return Number(start);
+      return undefined;
+    }
 
-      async ingest({
-        sessionId,
-        message,
-        isHeartbeat,
-      }: {
-        sessionId: string;
-        message: any;
-        isHeartbeat?: boolean;
-      }) {
-        if (isHeartbeat) return { ingested: false };
-        ingestMessage(sessionId, message);
-        return { ingested: true };
-      },
+    function resolveHookSessionKey(event: any, ctx: any, sessionId: string): string {
+      return ctx?.sessionKey ?? event?.sessionKey ?? sessionId;
+    }
 
-      async assemble({
-        sessionId,
-        messages,
-        tokenBudget,
-      }: {
-        sessionId: string;
-        messages: any[];
-        tokenBudget?: number;
-      }) {
-        // KG 渲染已移至 before_prompt_build / before_message_write。
-        // assemble 采用 legacy context engine 同款 passthrough：不改变 message content 形态，
-        // 避免 string ↔ text-block array 的中间转换干扰 prefix cache 分析。
-        // <gm_memory> 的清理只发生在 GM 自身入库/提取路径，不改模型侧 transcript view。
-        return {
-          messages,
-          estimatedTokens: 0,
-        };
-      },
+    function isHeartbeatHookRun(_event: any, ctx: any): boolean {
+      return ctx?.trigger === "heartbeat";
+    }
 
-      async compact(params: {
-        sessionId: string;
-        sessionKey?: string;
-        sessionFile: string;
-        tokenBudget?: number;
-        force?: boolean;
-        currentTokenCount?: number;
-        customInstructions?: string;
-        compactionTarget?: "budget" | "threshold";
-        runtimeContext?: Record<string, unknown>;
-      }) {
-        // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
-        // 知识提取使用 fire-and-forget，不阻塞 compaction 返回
-        const { sessionId, sessionKey, sessionFile, force, currentTokenCount } = params;
 
-        // Session transcripts are owned by the OpenClaw runtime.  Do not
-        // rewrite `sessionFile` from compact hooks.  Transient `<gm_memory>`
-        // cleanup is an assemble-time in-memory transform, not a file rewrite.
+    function markCompactedActiveNodes(sessionId: string, sessionKey?: string): void {
+      if (!cfg.compactActiveNodesEnabled) {
+        compactedActiveNodeIds.delete(sessionId);
+        api.logger.info(`[graph-memory] compact active nodes disabled`);
+        return;
+      }
 
-        const markCompactedActiveNodes = () => {
-          if (!cfg.compactActiveNodesEnabled) {
-            compactedActiveNodeIds.delete(sessionId);
-            api.logger.info(`[graph-memory] compact active nodes disabled`);
-            return;
-          }
+      const stableIds = new Set<string>([
+        ...getHotNodes(db).map(n => n.id),
+        ...getScopeHotNodes(db, getScopesForSession(db, sessionKey ?? sessionId)).map(n => n.id),
+      ]);
+      let sessionNodes = getBySession(db, sessionId).filter(n => !stableIds.has(n.id));
+      const maxCompactActiveNodes = Math.max(0, cfg.compactActiveNodesMax ?? DEFAULT_CONFIG.compactActiveNodesMax ?? 100);
 
-          const stableIds = new Set<string>([
-            ...getHotNodes(db).map(n => n.id),
-            ...getScopeHotNodes(db, getScopesForSession(db, sessionKey ?? sessionId)).map(n => n.id),
-          ]);
-          let sessionNodes = getBySession(db, sessionId).filter(n => !stableIds.has(n.id));
-          const maxCompactActiveNodes = Math.max(0, cfg.compactActiveNodesMax ?? DEFAULT_CONFIG.compactActiveNodesMax ?? 100);
-
-          // ── Active nodes 数量裁剪：compact 时一次性确定，避免 before_prompt_build 每轮裁剪造成缓存不稳定 ────────
-          if (sessionNodes.length > maxCompactActiveNodes) {
-            sessionNodes.sort((a, b) => a.updatedAt - b.updatedAt);
-            let taskCount = sessionNodes.filter(n => n.type === "TASK").length;
-            let eventCount = sessionNodes.filter(n => n.type === "EVENT").length;
-            let knowledgeCount = sessionNodes.filter(n => n.type === "KNOWLEDGE").length;
-            const toRemove = new Set<string>();
-            for (const node of sessionNodes) {
-              const curTotal = sessionNodes.length - toRemove.size;
-              if (curTotal <= maxCompactActiveNodes) break;
-              if (node.type === "SKILL") continue;
-              if (node.type === "TASK" && taskCount > 5) { toRemove.add(node.id); taskCount--; }
-              else if (node.type === "EVENT" && eventCount > 10) { toRemove.add(node.id); eventCount--; }
-              else if (node.type === "KNOWLEDGE" && knowledgeCount > 10) { toRemove.add(node.id); knowledgeCount--; }
-              else if (!["SKILL", "TASK", "EVENT", "KNOWLEDGE"].includes(node.type)) { toRemove.add(node.id); }
-            }
-            sessionNodes = sessionNodes.filter(n => !toRemove.has(n.id));
-          }
-
-          compactedActiveNodeIds.set(sessionId, new Set(sessionNodes.map(n => n.id)));
-          api.logger.info(`[graph-memory] compact active nodes marked: ${sessionNodes.length}`);
-        };
-
-        const msgs = getUnextracted(db, sessionId, 50);
-
-        // ── Input-layer noise filter ───────────────────────
-        const filteredMsgs = filterNoiseMessages(msgs, extractUserText);
-        if (!filteredMsgs.length) {
-          markCompactedActiveNodes();
-          return await delegateCompactionToRuntime(params);
-          // return {
-          //   ok: true, compacted: false,
-          //   result: {
-          //     summary: `no messages after noise filter`,
-          //     tokensBefore: currentTokenCount ?? 0,
-          //   },
-          // };
+      // ── Active nodes 数量裁剪：compact 时一次性确定，避免 before_prompt_build 每轮裁剪造成缓存不稳定 ────────
+      if (sessionNodes.length > maxCompactActiveNodes) {
+        sessionNodes.sort((a, b) => a.updatedAt - b.updatedAt);
+        let taskCount = sessionNodes.filter(n => n.type === "TASK").length;
+        let eventCount = sessionNodes.filter(n => n.type === "EVENT").length;
+        let knowledgeCount = sessionNodes.filter(n => n.type === "KNOWLEDGE").length;
+        const toRemove = new Set<string>();
+        for (const node of sessionNodes) {
+          const curTotal = sessionNodes.length - toRemove.size;
+          if (curTotal <= maxCompactActiveNodes) break;
+          if (node.type === "SKILL") continue;
+          if (node.type === "TASK" && taskCount > 5) { toRemove.add(node.id); taskCount--; }
+          else if (node.type === "EVENT" && eventCount > 10) { toRemove.add(node.id); eventCount--; }
+          else if (node.type === "KNOWLEDGE" && knowledgeCount > 10) { toRemove.add(node.id); knowledgeCount--; }
+          else if (!["SKILL", "TASK", "EVENT", "KNOWLEDGE"].includes(node.type)) { toRemove.add(node.id); }
         }
+        sessionNodes = sessionNodes.filter(n => !toRemove.has(n.id));
+      }
 
-        // fire-and-forget：提取异步进行，不阻塞 compaction 返回
-        await runTurnExtract(sessionId, sessionKey ?? sessionId, filteredMsgs).catch((err) => {
-          api.logger.error(`[graph-memory] compact extract failed: ${err}`);
-        });
+      compactedActiveNodeIds.set(sessionId, new Set(sessionNodes.map(n => n.id)));
+      api.logger.info(`[graph-memory] compact active nodes marked: ${sessionNodes.length}`);
+    }
 
-        // ★ Session 归纳：compaction 后更新 session 节点摘要（fire-and-forget）
-        {
-          const sk = sessionKey ?? sessionId;
-          const sid = sessionId;
-          const dbRef = db;
-          const llmRef = llm;
-          const recallerRef = recaller;
-          const sessionNodesRef = getBySession(db, sessionId);
-          if (sessionNodesRef.length > 0) {
-            induceSession({
-              db: dbRef,
-              sessionId: sid,
-              sessionKey: sk,
-              sessionNodes: sessionNodesRef,
-              llm: llmRef,
-              recaller: recallerRef,
+    async function handleTurnEnd(params: {
+      sessionId: string;
+      sessionKey?: string;
+      messages: any[];
+      prePromptMessageCount?: number;
+      isHeartbeat?: boolean;
+    }): Promise<void> {
+      const { sessionId, sessionKey, messages, prePromptMessageCount, isHeartbeat } = params;
+      if (isHeartbeat) {
+        logRuntimeDebug(`agent_end skipped sid=${debugId(sessionId)} reason=heartbeat messages=${messages.length}`);
+        return;
+      }
+
+      const row = db.prepare(
+        "SELECT MAX(turn_index) as maxTurn FROM gm_messages WHERE session_id=?"
+      ).get(sessionId) as any;
+      const fallbackStart = Number(row?.maxTurn) || 0;
+      const newMessages = chooseAgentEndNewMessages(sessionId, messages, prePromptMessageCount);
+
+      // 在最开头统一去掉所有消息中的 gm_memory 标签
+      const strippedNewMessages = newMessages.map((msg: any) => ({
+        ...msg,
+        content: stripContentBlocks(msg.content),
+      }));
+      for (const message of strippedNewMessages) {
+        ingestMessage(sessionId, message);
+      }
+
+      const totalMsgs = msgSeq.get(sessionId) ?? fallbackStart;
+      api.logger.info(
+        `[graph-memory] agent_end sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
+      );
+
+      // ★ 每轮直接提取（使用已剥离 gm_memory 的消息）
+      runTurnExtract(sessionId, sessionKey ?? sessionId, strippedNewMessages).catch((err) => {
+        api.logger.error(`[graph-memory] turn extract failed: ${err}`);
+      });
+
+      // ★ 社区维护：每 N 轮触发一次（纯计算，<5ms）
+      const turns = (turnCounter.get(sessionId) ?? 0) + 1;
+      turnCounter.set(sessionId, turns);
+      const maintainInterval = cfg.compactTurnCount ?? 7;
+
+      if (turns % maintainInterval === 0) {
+        try {
+          // ★ 主题归纳：先对当前 session 的语义节点归纳主题
+          const sessionNodes = getBySession(db, sessionId);
+          const sessionSemanticNodes = sessionNodes.filter(n =>
+            ["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"].includes(n.type)
+          );
+          if (sessionSemanticNodes.length > 0) {
+            // ★ 主题归纳：fire-and-forget，不阻塞 agent_end
+            induceTopics({
+              db,
+              sessionNodes: sessionSemanticNodes,
+              llm,
+              recaller,
             }).then((induction) => {
-              api.logger.info(`[graph-memory] compact session induction: ${induction.description}`);
+              const total =
+                induction.createdTopics.length +
+                induction.updatedTopics.length +
+                induction.semanticToTopicEdges.length +
+                induction.topicToTopicEdges.length;
+              if (total > 0) {
+                invalidateGraphCache();
+              }
+              api.logger.info(
+                `[graph-memory] periodic topic induction (turn ${turns}): ` +
+                `created=${induction.createdTopics.length}, updated=${induction.updatedTopics.length}, ` +
+                `sem→topic=${induction.semanticToTopicEdges.length}, topic↔topic=${induction.topicToTopicEdges.length}`,
+              );
             }).catch((err) => {
-              api.logger.warn(`[graph-memory] compact session induction failed: ${err}`);
+              const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
+              api.logger.error(`[graph-memory] periodic topic induction failed: ${msg}`);
             });
           }
-        }
 
-        markCompactedActiveNodes();
-        return await delegateCompactionToRuntime(params);
-        // return {
-        //   ok: true, compacted: false,
-        //   result: {
-        //     summary: `extraction queued (fire-and-forget)`,
-        //     tokensBefore: currentTokenCount ?? 0,
-        //   },
-        // };
-      },
-
-      async afterTurn({
-        sessionId,
-        sessionKey,
-        sessionFile,
-        messages,
-        prePromptMessageCount,
-        isHeartbeat,
-      }: {
-        sessionId: string;
-        sessionKey?: string;
-        sessionFile?: string;
-        messages: any[];
-        prePromptMessageCount: number;
-        autoCompactionSummary?: string;
-        isHeartbeat?: boolean;
-        tokenBudget?: number;
-      }) {
-        if (isHeartbeat) return;
-
-        // Session transcripts are owned by the OpenClaw runtime.  Do not
-        // rewrite `sessionFile` from afterTurn.  The sliced messages below are
-        // sanitized before GM storage/extraction; prompt-history cleanup happens
-        // in assemble as an in-memory transform.
-
-        // 消息入库（同步，零 LLM）
-        const newMessages = messages.slice(prePromptMessageCount ?? 0);
-        // 在最开头统一去掉所有消息中的 gm_memory 标签
-        const strippedNewMessages = newMessages.map((msg: any) => ({
-          ...msg,
-          content: stripContentBlocks(msg.content),
-        }));
-        for (const message of strippedNewMessages) {
-          ingestMessage(sessionId, message);
-        }
-
-        const totalMsgs = msgSeq.get(sessionId) ?? 0;
-        api.logger.info(
-          `[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
-        );
-
-        // ★ 每轮直接提取（使用已剥离 gm_memory 的消息）
-        runTurnExtract(sessionId, sessionKey ?? sessionId, strippedNewMessages).catch((err) => {
-          api.logger.error(`[graph-memory] turn extract failed: ${err}`);
-        });
-
-        // ★ 社区维护：每 N 轮触发一次（纯计算，<5ms）
-        const turns = (turnCounter.get(sessionId) ?? 0) + 1;
-        turnCounter.set(sessionId, turns);
-        const maintainInterval = cfg.compactTurnCount ?? 7;
-
-        if (turns % maintainInterval === 0) {
+          // ★ Session 归纳：更新 session 节点摘要
           try {
-            // ★ 主题归纳：先对当前 session 的语义节点归纳主题
-            const sessionNodes = getBySession(db, sessionId);
-            const sessionSemanticNodes = sessionNodes.filter(n =>
-              ["TASK", "SKILL", "EVENT", "KNOWLEDGE", "STATUS"].includes(n.type)
-            );
-            if (sessionSemanticNodes.length > 0) {
-              // ★ 主题归纳：fire-and-forget，不阻塞 afterTurn
-              induceTopics({
+            const currentSessionNodes = getBySession(db, sessionId);
+            if (currentSessionNodes.length > 0) {
+              const induction = await induceSession({
                 db,
-                sessionNodes: sessionSemanticNodes,
+                sessionId,
+                sessionKey: sessionKey ?? sessionId,
+                sessionNodes: currentSessionNodes,
                 llm,
                 recaller,
-              }).then((induction) => {
-                const total =
-                  induction.createdTopics.length +
-                  induction.updatedTopics.length +
-                  induction.semanticToTopicEdges.length +
-                  induction.topicToTopicEdges.length;
-                if (total > 0) {
-                  invalidateGraphCache();
-                }
-                api.logger.info(
-                  `[graph-memory] periodic topic induction (turn ${turns}): ` +
-                  `created=${induction.createdTopics.length}, updated=${induction.updatedTopics.length}, ` +
-                  `sem→topic=${induction.semanticToTopicEdges.length}, topic↔topic=${induction.topicToTopicEdges.length}`,
-                );
-              }).catch((err) => {
-                const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
-                api.logger.error(`[graph-memory] periodic topic induction failed: ${msg}`);
               });
+              api.logger.info(
+                `[graph-memory] periodic session induction (turn ${turns}): ` +
+                `${induction.description}`,
+              );
             }
-
-            // ★ Session 归纳：更新 session 节点摘要
-            try {
-              const currentSessionNodes = getBySession(db, sessionId);
-              if (currentSessionNodes.length > 0) {
-                const induction = await induceSession({
-                  db,
-                  sessionId,
-                  sessionKey: sessionKey ?? sessionId,
-                  sessionNodes: currentSessionNodes,
-                  llm,
-                  recaller,
-                });
-                api.logger.info(
-                  `[graph-memory] periodic session induction (turn ${turns}): ` +
-                  `${induction.description}`,
-                );
-              }
-            } catch (err) {
-              api.logger.warn(`[graph-memory] periodic session induction failed: ${err}`);
-            }
-
-            // ★ 轻量图维护
-            invalidateGraphCache();
-            const pr = computeGlobalPageRank(db, cfg);
-            api.logger.info(
-              `[graph-memory] periodic maintenance (turn ${turns}): ` +
-              `pagerank top=${pr.topK.slice(0, 3).map(n => n.name).join(",")}`,
-            );
           } catch (err) {
-            api.logger.error(`[graph-memory] periodic maintenance failed: ${err}`);
+            api.logger.warn(`[graph-memory] periodic session induction failed: ${err}`);
           }
+
+          // ★ 轻量图维护
+          invalidateGraphCache();
+          const pr = computeGlobalPageRank(db, cfg);
+          api.logger.info(
+            `[graph-memory] periodic maintenance (turn ${turns}): ` +
+            `pagerank top=${pr.topK.slice(0, 3).map(n => n.name).join(",")}`,
+          );
+        } catch (err) {
+          api.logger.error(`[graph-memory] periodic maintenance failed: ${err}`);
         }
-      },
+      }
+    }
 
-      async prepareSubagentSpawn({
-        parentSessionKey,
-        childSessionKey,
-      }: {
-        parentSessionKey: string;
-        childSessionKey: string;
-      }) {
-        const rec = recalled.get(parentSessionKey);
-        if (rec) recalled.set(childSessionKey, rec);
-        return { rollback: () => { recalled.delete(childSessionKey); } };
-      },
+    api.on("agent_end", async (event: any, ctx: any) => {
+      try {
+        const sid = resolveHookSessionId(event, ctx);
+        if (!sid) return;
+        const sk = resolveHookSessionKey(event, ctx, sid);
+        const messages = Array.isArray(event?.messages) ? event.messages : [];
+        logRuntimeDebug(`agent_end hook sid=${debugId(sid)} sk=${debugId(sk)} run=${debugId(event?.runId)} trigger=${ctx?.trigger ?? "-"} messages=${messages.length}`);
+        await handleTurnEnd({
+          sessionId: sid,
+          sessionKey: sk,
+          messages,
+          prePromptMessageCount: resolvePrePromptMessageCount(event, ctx, sid),
+          isHeartbeat: isHeartbeatHookRun(event, ctx),
+        });
+        if (event?.runId) {
+          const runKey = `${sid}:${event.runId}`;
+          const hadRunStart = runStartMessageCount.delete(runKey);
+          logRuntimeDebug(`agent_end run-start cleanup sid=${debugId(sid)} run=${debugId(event.runId)} had=${hadRunStart}`);
+        }
+      } catch (err) {
+        api.logger.warn(`[graph-memory] agent_end failed: ${err}`);
+      }
+    });
 
-      async onSubagentEnded({ childSessionKey }: { childSessionKey: string }) {
-        recalled.delete(childSessionKey);
-        msgSeq.delete(childSessionKey);
-      },
+    api.on("before_compaction", async (event: any, ctx: any) => {
+      try {
+        const sid = resolveHookSessionId(event, ctx);
+        if (!sid) return;
+        const sk = resolveHookSessionKey(event, ctx, sid);
 
-      async dispose() {
+        const hadChain = extractChain.has(sid);
+        logRuntimeDebug(`before_compaction start sid=${debugId(sid)} sk=${debugId(sk)} waitChain=${hadChain}`);
+        await (extractChain.get(sid) ?? Promise.resolve());
+        const msgs = getUnextracted(db, sid, 50);
+        const filteredMsgs = filterNoiseMessages(msgs, extractUserText);
+        logRuntimeDebug(`before_compaction fallback sid=${debugId(sid)} unextracted=${msgs.length} filtered=${filteredMsgs.length}`);
+        if (filteredMsgs.length) {
+          await runTurnExtract(sid, sk, filteredMsgs).catch((err) => {
+            api.logger.error(`[graph-memory] compaction extract failed: ${err}`);
+          });
+        }
+      } catch (err) {
+        api.logger.warn(`[graph-memory] before_compaction failed: ${err}`);
+      }
+    });
+
+    api.on("after_compaction", async (event: any, ctx: any) => {
+      try {
+        const sid = resolveHookSessionId(event, ctx);
+        if (!sid) return;
+        const sk = resolveHookSessionKey(event, ctx, sid);
+
+        logRuntimeDebug(`after_compaction start sid=${debugId(sid)} sk=${debugId(sk)}`);
+        markCompactedActiveNodes(sid, sk);
+
+        // ★ Session 归纳：compaction 后更新 session 节点摘要（fire-and-forget）
+        const sessionNodesRef = getBySession(db, sid);
+        logRuntimeDebug(`after_compaction session_nodes sid=${debugId(sid)} count=${sessionNodesRef.length}`);
+        if (sessionNodesRef.length > 0) {
+          induceSession({
+            db,
+            sessionId: sid,
+            sessionKey: sk,
+            sessionNodes: sessionNodesRef,
+            llm,
+            recaller,
+          }).then((induction) => {
+            api.logger.info(`[graph-memory] compaction session induction: ${induction.description}`);
+          }).catch((err) => {
+            api.logger.warn(`[graph-memory] compaction session induction failed: ${err}`);
+          });
+        }
+      } catch (err) {
+        api.logger.warn(`[graph-memory] after_compaction failed: ${err}`);
+      }
+    });
+
+    api.on("subagent_spawned", async (event: any, ctx: any) => {
+      try {
+        const rec = recalled.get(ctx?.requesterSessionKey);
+        if (rec) rememberAliases(rec, event?.childSessionKey, ctx?.childSessionKey);
+        logRuntimeDebug(
+          `subagent_spawned requester=${debugId(ctx?.requesterSessionKey)} child=${debugId(event?.childSessionKey ?? ctx?.childSessionKey)} ` +
+          `copied=${Boolean(rec)} nodes=${rec?.nodes?.length ?? 0} edges=${rec?.edges?.length ?? 0}`,
+        );
+      } catch (err) {
+        api.logger.warn(`[graph-memory] subagent_spawned failed: ${err}`);
+      }
+    });
+
+    api.on("subagent_ended", async (event: any) => {
+      try {
+        if (event?.targetKind && event.targetKind !== "subagent") {
+          logRuntimeDebug(`subagent_ended skip target=${debugId(event?.targetSessionKey)} kind=${event.targetKind}`);
+          return;
+        }
+        logRuntimeDebug(`subagent_ended cleanup target=${debugId(event?.targetSessionKey)} kind=${event?.targetKind ?? "-"}`);
+        deleteSessionScopedState(event?.targetSessionKey);
+      } catch (err) {
+        api.logger.warn(`[graph-memory] subagent_ended failed: ${err}`);
+      }
+    });
+
+    const registerRuntimeLifecycle = api.lifecycle?.registerRuntimeLifecycle?.bind(api.lifecycle)
+      ?? api.registerRuntimeLifecycle?.bind(api);
+    registerRuntimeLifecycle?.({
+      id: "graph-memory-runtime-state",
+      description: "Clear graph-memory in-memory session state on plugin cleanup",
+      cleanup: async () => {
+        logRuntimeDebug(
+          `runtime cleanup maps extract=${extractChain.size} msgSeq=${msgSeq.size} recalled=${recalled.size} ` +
+          `turnCounter=${turnCounter.size} compacted=${compactedActiveNodeIds.size} pendingIndex=${pendingRecallIndexBySession.size} ` +
+          `runStart=${runStartMessageCount.size} lastRuntime=${lastRuntimeMessageCount.size} fingerprints=${recentRuntimeMessageFingerprints.size}`,
+        );
         extractChain.clear();
         msgSeq.clear();
         recalled.clear();
+        turnCounter.clear();
+        compactedActiveNodeIds.clear();
+        previousStableLayerBySession.clear();
+        previousBeforePromptBuildReturnBySession.clear();
+        pendingRecallIndexBySession.clear();
+        runStartMessageCount.clear();
+        lastRuntimeMessageCount.clear();
+        recentRuntimeMessageFingerprints.clear();
       },
-    };
-
-    api.registerContextEngine("graph-memory", () => engine);
+    });
 
     // ── session_end：finalize + 图维护 ──────────────────────
 

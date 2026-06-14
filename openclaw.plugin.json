@@ -49,7 +49,7 @@
       "compactTurnCount": {
         "type": "integer",
         "default": 6,
-        "description": "每隔多少 afterTurn 轮执行周期性 topic/session 归纳和轻量 PageRank；compact 时也会标记 active nodes 供压缩后补回"
+        "description": "每隔多少 agent_end 轮执行周期性 topic/session 归纳和轻量 PageRank；compaction hooks 也会标记 active nodes 供压缩后补回"
       },
       "recallMaxNodes": {
         "type": "integer",

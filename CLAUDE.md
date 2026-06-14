@@ -4,7 +4,7 @@ This file provides guidance to Claude Code / coding agents when working in this 
 
 ## Project overview
 
-graph-memory is an OpenClaw ContextEngine plugin. It extracts knowledge graph nodes/edges from conversations, stores them in SQLite, recalls relevant graph context across sessions, and injects stable/dynamic KG XML before model calls.
+graph-memory is an OpenClaw hook-only knowledge graph memory plugin. It extracts knowledge graph nodes/edges from conversations, stores them in SQLite, recalls relevant graph context across sessions, and injects stable/dynamic KG XML before model calls.
 
 Current runtime features:
 
@@ -35,7 +35,7 @@ RUN_GM_REAL_DB_TESTS=1 npm test
 
 ## Core files
 
-- `index.ts` — plugin entry; ContextEngine implementation; hooks; all `gm_*` tools.
+- `index.ts` — plugin entry; hook lifecycle handlers; all `gm_*` tools.
 - `src/types.ts` — `GmNode`, `GmEdge`, config, extraction/finalize/recall result types.
 - `src/store/db.ts` — SQLite singleton and idempotent migrations.
 - `src/store/store.ts` — node/edge/message/vector/search/scope/retention helpers.
@@ -55,29 +55,28 @@ RUN_GM_REAL_DB_TESTS=1 npm test
 Runtime registration happens in `index.ts`:
 
 ```ts
-api.registerContextEngine("graph-memory", () => engine)
+api.on("before_prompt_build", ...); api.on("agent_end", ...); api.on("session_end", ...)
 api.on("before_prompt_build", ...)
 api.on("session_end", ...)
 api.registerTool(...)
 ```
 
-The important design point: KG rendering is primarily done from the `before_prompt_build` hook, not from `engine.assemble`. `assemble` now mostly normalizes message content.
+The important design point: KG rendering is done from the `before_prompt_build` hook. The plugin no longer registers a ContextEngine and does not occupy `plugins.slots.contextEngine`.
 
 ### Entry-point responsibilities
 
-- `ingest`: synchronous raw message storage into `gm_messages`; skip heartbeats; no LLM.
 - `before_prompt_build`: clean prompt, build `historyQuery` from the last 2 user-bounded turns plus `promptQuery` from the current prompt, run `parallelRecall`, persist merged recall results to `gm_recalled`, load hot/scope_hot/compacted active nodes, render stable+dynamic KG, record L1 access only.
-- `afterTurn`: save newly generated messages, fire `runTurnExtract`, run periodic topic/session induction and lightweight PageRank every `compactTurnCount` turns.
-- `compact`: strip old `<gm_memory>`, fallback extract unextracted messages, mark compacted active nodes, delegate real compaction to runtime.
-- `prepareSubagentSpawn`: copy parent recalled graph context into the child session.
-- `onSubagentEnded`: clear child recalled context/counters.
+- `agent_end`: save newly generated messages, fire `runTurnExtract`, run periodic topic/session induction and lightweight PageRank every `compactTurnCount` turns.
+- `before_compaction` / `after_compaction`: fallback extract unextracted messages, mark compacted active nodes; real compaction belongs to OpenClaw runtime/current ContextEngine.
+- `subagent_spawned`: best-effort copy of parent recalled graph context into the child session.
+- `subagent_ended`: clear child recalled context/counters.
 - `session_end`: fire-and-forget finalize, topic/session induction, retention+dedup+PageRank maintenance, task_completed belief signals.
 
 ### In-memory runtime state
 
 - `recalled`: session key/id → latest recall result used by prompt injection and subagent sharing.
 - `msgSeq`: session id → monotonically increasing message/turn count.
-- `turnCounter`: session id → afterTurn periodic maintenance counter.
+- `turnCounter`: session id → agent_end periodic maintenance counter.
 - `compactedActiveNodeIds`: session id → active node ids that should be re-injected after compaction.
 - `extractChain`: session id → promise chain that serializes LLM extraction writes.
 
@@ -105,8 +104,9 @@ Semantic deletion is soft deletion only: tools mark nodes `deprecated`; normal r
 ## Runtime data flow
 
 ```text
-incoming message
-  → ingest(): save gm_messages
+agent_end
+  → save new messages into gm_messages
+  → runTurnExtract
 
 before_prompt_build
   → recaller.recallV2
@@ -114,7 +114,7 @@ before_prompt_build
   → assembleStableContext + assembleDynamicContext
   → appendSystemContext + prependContext
 
-afterTurn
+agent_end
   → save new messages
   → runTurnExtract
   → upsertNode/upsertEdge

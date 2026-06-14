@@ -1,9 +1,9 @@
 # graph-memory
 
-> **Forked from** [adoresever/graph-memory](https://github.com/adoresever/graph-memory) · custom OpenClaw knowledge-graph context engine
+> **Forked from** [adoresever/graph-memory](https://github.com/adoresever/graph-memory) · custom OpenClaw knowledge-graph memory plugin
 
 <p align="center">
-  <strong>Knowledge Graph Context Engine for OpenClaw</strong>
+  <strong>Knowledge Graph Memory Plugin for OpenClaw</strong>
 </p>
 
 ---
@@ -21,8 +21,8 @@ It solves three practical problems:
 ## Current architecture
 
 ```text
-Message in
-  └─ ContextEngine.ingest(): save raw message to gm_messages synchronously
+Message in / model turn completes
+  └─ agent_end hook: save new messages to gm_messages and trigger extraction
 
 before_prompt_build hook
   ├─ Recaller.recallV2(): precise recall only
@@ -30,13 +30,16 @@ before_prompt_build hook
   ├─ assembleStableContext(): scope_hot + hot + compacted active nodes → appendSystemContext
   └─ assembleDynamicContext(): recalled L1/L2/L3 nodes → prependContext
 
-afterTurn hook (async, non-blocking)
-  ├─ save new messages
-  ├─ runTurnExtract(): LLM extraction → gm_nodes + gm_edges
-  ├─ beliefUpdates → gm_belief_signals + node belief score updates
-  ├─ syncEmbed(): async embedding writes; queues nodes until embedding is ready
-  ├─ advisorySuggestions → optional background memory-advisor subagent
-  └─ every compactTurnCount turns: topic induction + session induction + lightweight global PageRank
+before_message_write hook
+  └─ index mode only: prepend a short recall index to the matching user message
+
+compaction hooks
+  ├─ before_compaction: fallback extraction for unextracted messages
+  └─ after_compaction: mark compacted active nodes and refresh session induction
+
+subagent hooks
+  ├─ subagent_spawned: best-effort copy of recalled graph context to child session
+  └─ subagent_ended: cleanup child in-memory state
 
 session_end hook
   ├─ finalize(): promote EVENT→SKILL, add missed edges, invalidate obsolete nodes
@@ -46,54 +49,36 @@ session_end hook
   └─ task_completed belief signals for session nodes
 ```
 
-### ContextEngine surface
-
-| Method | Current behavior |
-|--------|------------------|
-| `bootstrap` | Lightweight no-op init |
-| `ingest` | Store messages in `gm_messages`; no LLM call |
-| `assemble` | Pass-through; KG injection is handled by `before_prompt_build` |
-| `compact` | Fallback extraction path; normal extraction is in `afterTurn` |
-| `afterTurn` | Main async extraction + periodic topic/session/lightweight maintenance |
-| `prepareSubagentSpawn` | Share current recalled graph context with subagents |
-| `onSubagentEnded` | Cleanup subagent session state |
-| `dispose` | Clear in-memory session state |
-
+Graph Memory is now a hook-only OpenClaw plugin. It does **not** register a ContextEngine and does not occupy `plugins.slots.contextEngine`; OpenClaw's selected context engine/runtime (usually `legacy`) continues to own message assembly and runtime compaction. Graph Memory provides memory side effects: recall, extraction, graph maintenance, and `gm_*` tools.
 
 ## Runtime entry points
 
-graph-memory enters OpenClaw through two integration surfaces:
+graph-memory enters OpenClaw through runtime hooks and tools:
 
-1. **ContextEngine registration**
+- `api.on("before_prompt_build", ...)` performs recall and KG context injection.
+- `api.on("before_message_write", ...)` supports `autoRecallMode=index` by prepending a short recall index to matching user messages; it intentionally does not strip transient `<gm_memory>` blocks from the transcript.
+- `api.on("agent_end", ...)` stores completed-turn messages, triggers extraction, and runs periodic topic/session/lightweight maintenance.
+- `api.on("before_compaction", ...)` performs best-effort fallback extraction before runtime compaction.
+- `api.on("after_compaction", ...)` marks compacted active nodes for stable reinjection and refreshes session induction.
+- `api.on("subagent_spawned", ...)` / `api.on("subagent_ended", ...)` maintain in-memory recalled context for child sessions on a best-effort basis.
+- `api.on("session_end", ...)` performs finalization and background maintenance.
+- `api.registerTool(...)` exposes the `gm_*` tools.
 
-   ```ts
-   api.registerContextEngine("graph-memory", () => engine)
-   ```
-
-   The engine implements `bootstrap`, `ingest`, `assemble`, `compact`, `afterTurn`, `prepareSubagentSpawn`, `onSubagentEnded`, and `dispose`.
-
-2. **Runtime hooks and tools**
-
-   - `api.on("before_prompt_build", ...)` performs recall and KG context injection.
-   - `api.on("session_end", ...)` performs finalization and background maintenance.
-   - `api.registerTool(...)` exposes the 22 `gm_*` tools.
-
-This means graph-memory is not called from a CLI loop. It runs inside the OpenClaw Gateway lifecycle and is invoked automatically as sessions progress.
+This means graph-memory is not called from a CLI loop and is no longer part of the ContextEngine lifecycle. It runs inside the OpenClaw Gateway hook lifecycle and is invoked automatically as sessions progress.
 
 ### Lifecycle details
 
 | Entry point | Trigger | Main work | Blocking behavior |
 |-------------|---------|-----------|-------------------|
-| `bootstrap` | Context engine session init | Lightweight acknowledgement | awaited by runtime |
-| `ingest` | Message ingestion | Store non-heartbeat message in `gm_messages` | synchronous DB write; no LLM |
 | `before_prompt_build` hook | Before model prompt construction | Parallel recall from recent history + current prompt; assemble stable/dynamic KG XML | awaited; returns `appendSystemContext` / `prependContext` |
-| `assemble` | ContextEngine assemble phase | Normalizes message content only; KG rendering has moved to `before_prompt_build` | awaited |
-| `compact` | Runtime compaction | Strip stale `<gm_memory>` blocks, run fallback extraction, mark compacted active nodes, delegate real compaction back to runtime | awaited, with extraction/induction treated as background where possible |
-| `afterTurn` | After each assistant turn | Save new messages, trigger extraction, periodic topic/session induction, lightweight PageRank | extraction/topic induction are fire-and-forget; session induction is awaited in the periodic block |
-| `prepareSubagentSpawn` | Before subagent creation | Copy current recalled graph context to child session | awaited |
-| `onSubagentEnded` | Child session end | Remove child recalled context and counters | awaited |
+| `before_message_write` hook | Before user message persistence | In index mode, prepend short recall index; transcript stripping is intentionally not done here | awaited |
+| `agent_end` hook | After each assistant turn | Save new messages, trigger extraction, periodic topic/session induction, lightweight PageRank | hook is observational; extraction/topic induction are fire-and-forget; periodic session induction is awaited inside the hook |
+| `before_compaction` hook | Before runtime compaction | Fallback extraction for unextracted GM messages | awaited by hook runner; does not own compaction |
+| `after_compaction` hook | After runtime compaction | Mark compacted active nodes and run session induction | awaited by hook runner; induction is fire-and-forget |
+| `subagent_spawned` hook | After subagent creation | Best-effort copy of current recalled graph context to child session | awaited by hook runner |
+| `subagent_ended` hook | Child session end | Remove child recalled context and counters | awaited by hook runner |
 | `session_end` hook | Session close | finalize, topic/session induction, retention+dedup+PageRank maintenance, belief signals | handler starts fire-and-forget tasks and returns quickly |
-| `dispose` | Plugin unload | Clear in-memory maps | awaited |
+| runtime lifecycle cleanup | Plugin unload/reset/delete/disable/restart | Clear in-memory maps | awaited by host when supported |
 
 ### before_prompt_build in detail
 
@@ -113,19 +98,28 @@ This means graph-memory is not called from a CLI loop. It runs inside the OpenCl
 7. Record access for L1 nodes (`access_count`, `last_accessed_at`) for the forgetting/decay mechanism.
 8. Return `appendSystemContext` for stable KG and `prependContext` for dynamic KG.
 
-### afterTurn in detail
+### agent_end in detail
 
-`afterTurn` is the main extraction entry point:
+`agent_end` is the main extraction entry point:
 
-1. Strip old `<gm_memory>` blocks from the session file.
-2. Save new messages into `gm_messages` without calling the LLM.
-3. Trigger `runTurnExtract` on new messages. Extraction is serialized per session with `extractChain` so overlapping turns do not corrupt writes.
-4. Every `compactTurnCount` turns:
+1. Determine the session from hook context (`ctx.sessionId` / `ctx.sessionKey`).
+2. Prefer the runtime pre-prompt message count when available; otherwise use the last observed runtime length and recent-message fingerprints so compaction does not confuse DB `turn_index` with runtime array indexes.
+3. Strip transient `<gm_memory>` blocks before saving messages into `gm_messages`.
+4. Trigger `runTurnExtract` on new messages. Extraction is serialized per session with `extractChain` so overlapping turns do not corrupt writes.
+5. Every `compactTurnCount` turns:
    - run topic induction in the background,
    - run session induction for the current session,
    - recompute lightweight global PageRank.
 
 `runTurnExtract` handles node/edge extraction, belief updates, embeddings, and optional memory-advisor suggestions.
+
+### Compaction hooks in detail
+
+Graph Memory does not own runtime compaction. OpenClaw's active context engine/runtime performs the actual transcript compaction. Graph Memory only performs memory-side work around that lifecycle:
+
+1. `before_compaction` runs fallback extraction for unextracted `gm_messages` rows.
+2. `after_compaction` marks current-session active nodes that should remain visible in the stable KG layer.
+3. Those marked active nodes are rendered by future `before_prompt_build` calls when `compactActiveNodesEnabled=true`.
 
 ### session_end in detail
 
@@ -253,7 +247,7 @@ graph-memory has two different "forgetting" layers. They intentionally solve dif
 
 #### 1. Context forgetting: compaction + active-node carry-over
 
-Raw chat context is still compacted by the normal OpenClaw runtime. graph-memory does not own full compaction (`ownsCompaction=false`). During `compact`, it:
+Raw chat context is still compacted by the normal OpenClaw runtime. graph-memory does not own full compaction. Around compaction, it:
 
 - removes stale `<gm_memory>` blocks from the session file,
 - runs fallback extraction for any unextracted messages,
@@ -379,7 +373,7 @@ Community detection/runtime code has been removed. The legacy `gm_nodes.communit
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `dbPath` | `~/.openclaw/graph-memory.db` | SQLite database path |
-| `compactTurnCount` | `6` | Periodic afterTurn induction/lightweight maintenance interval |
+| `compactTurnCount` | `6` | Periodic agent_end induction/lightweight maintenance interval |
 | `recallMaxNodes` | `15` | Tiering cutoff: roughly 1/3 L1, 1/3 L2, 1/3 L3 |
 | `recallMaxDepth` | `2` | Graph walk hops from seed/expansion nodes |
 | `freshTailCount` | `10` | Deprecated/unused compatibility field |
