@@ -2378,22 +2378,36 @@ ${suggestionsText}
               details: { count: 0 },
             };
           }
+          const missingVectorNodes: any[] = [];
+          const hashChangedNodes: any[] = [];
+          for (const row of allNodes) {
+            const hash = createHash("md5").update(row.content ?? "").digest("hex");
+            if (!row.vectorHash) missingVectorNodes.push(row);
+            else if (row.vectorHash !== hash) hashChangedNodes.push(row);
+          }
           const nodesToEmbed = force
             ? allNodes
-            : allNodes.filter(row => {
-                const hash = createHash("md5").update(row.content ?? "").digest("hex");
-                return row.vectorHash !== hash;
-              });
-          const skipped = allNodes.length - nodesToEmbed.length;
+            : [...missingVectorNodes, ...hashChangedNodes];
+          const missingVectors = missingVectorNodes.length;
+          const hashChanged = hashChangedNodes.length;
+          const candidatesTotal = nodesToEmbed.length;
+          const skipped = allNodes.length - candidatesTotal;
           if (!confirm) {
             return {
               content: [{
                 type: "text",
                 text: force
-                  ? `图谱中共有 ${allNodes.length} 个 active 节点待强制重新嵌入。\n传入 confirm: true 确认执行。`
-                  : `图谱中共有 ${allNodes.length} 个 active 节点，其中 ${nodesToEmbed.length} 个缺失向量或 content hash 已变化，${skipped} 个可跳过。\n传入 confirm: true 确认执行。`,
+                  ? `图谱中共有 ${allNodes.length} 个 active 节点待强制重新嵌入。
+增量预检：缺失向量 ${missingVectors} 个，content hash 变化 ${hashChanged} 个，增量需嵌入 ${missingVectors + hashChanged} 个。
+传入 confirm: true 确认执行。`
+                  : `图谱中共有 ${allNodes.length} 个 active 节点。
+缺失向量：${missingVectors} 个
+content hash 变化：${hashChanged} 个
+需要嵌入总数：${candidatesTotal} 个
+可跳过：${skipped} 个
+传入 confirm: true 确认执行。`,
               }],
-              details: { count: allNodes.length, candidates: nodesToEmbed.length, skipped, force, confirmRequired: true },
+              details: { count: allNodes.length, candidates: candidatesTotal, missingVectors, hashChanged, skipped, force, confirmRequired: true },
             };
           }
           if (!recaller.isEmbedReady()) {
@@ -2413,11 +2427,13 @@ ${suggestionsText}
               failed++;
             }
           }
-          const text = `全量重新嵌入完成：成功 ${updated} 个，失败 ${failed} 个，跳过 ${skipped} 个（共 ${allNodes.length} 个 active 节点，force=${force}）。`;
-          api.logger.info(`[graph-memory] reembedding_all: ${updated} ok, ${failed} failed, ${skipped} skipped`);
+          const text = force
+            ? `全量重新嵌入完成：成功 ${updated} 个，失败 ${failed} 个，跳过 ${skipped} 个（共 ${allNodes.length} 个 active 节点，force=${force}；增量预检：缺失向量 ${missingVectors} 个，content hash 变化 ${hashChanged} 个）。`
+            : `增量重新嵌入完成：成功 ${updated} 个，失败 ${failed} 个，跳过 ${skipped} 个（共 ${allNodes.length} 个 active 节点；缺失向量 ${missingVectors} 个，content hash 变化 ${hashChanged} 个，需要嵌入总数 ${candidatesTotal} 个）。`;
+          api.logger.info(`[graph-memory] reembedding_all: ${updated} ok, ${failed} failed, ${skipped} skipped, missing=${missingVectors}, hashChanged=${hashChanged}, candidates=${candidatesTotal}`);
           return {
             content: [{ type: "text", text }],
-            details: { success: true, total: allNodes.length, candidates: nodesToEmbed.length, updated, failed, skipped, force },
+            details: { success: true, total: allNodes.length, candidates: candidatesTotal, missingVectors, hashChanged, updated, failed, skipped, force },
           };
         },
       }),
