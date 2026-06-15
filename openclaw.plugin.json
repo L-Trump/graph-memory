@@ -32,6 +32,87 @@
   "configSchema": {
     "type": "object",
     "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "全局启用 Graph Memory 自动 hooks；false 时保留工具/命令但跳过自动 recall/extract"
+      },
+      "recallEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否在 before_prompt_build 自动召回并注入 Graph Memory 上下文"
+      },
+      "extractionEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否在 agent_end/compaction 自动保存消息并提取图谱记忆"
+      },
+      "allowedChatTypes": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": [
+            "direct",
+            "group",
+            "channel",
+            "explicit"
+          ]
+        },
+        "default": [
+          "direct",
+          "explicit"
+        ],
+        "description": "允许自动 recall/extract 的会话类型"
+      },
+      "allowedChatIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "允许自动 recall/extract 的 conversation/chat id allowlist；非空时只允许这些 id"
+      },
+      "deniedChatIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "拒绝自动 recall/extract 的 conversation/chat id denylist，优先级高于 allowedChatIds"
+      },
+      "recallTimeoutMs": {
+        "type": "integer",
+        "minimum": 50,
+        "maximum": 120000,
+        "default": 1500,
+        "description": "before_prompt_build recall 总预算；超时后降级为仅 stable context"
+      },
+      "recallCacheTtlMs": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 120000,
+        "default": 15000,
+        "description": "recall 结果缓存 TTL；0 表示关闭缓存"
+      },
+      "recallCircuitBreakerMaxTimeouts": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 3,
+        "description": "同一 session 连续 recall 超时多少次后临时跳过动态召回"
+      },
+      "recallCircuitBreakerCooldownMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 600000,
+        "default": 60000,
+        "description": "recall circuit breaker 冷却时间"
+      },
+      "statusDebugEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否将本轮 Graph Memory 状态写入 session pluginDebugEntries，供 /status verbose/trace 显示"
+      },
       "dbPath": {
         "type": "string",
         "default": "~/.openclaw/graph-memory.db",
@@ -322,6 +403,43 @@
     "embedding.apiKey": {
       "label": "Embedding API Key",
       "sensitive": true
+    },
+    "enabled": {
+      "label": "Graph Memory Automation",
+      "help": "Globally enable or pause automatic Graph Memory hooks while keeping tools available."
+    },
+    "recallEnabled": {
+      "label": "Automatic Recall",
+      "help": "Inject recalled graph context before eligible replies."
+    },
+    "extractionEnabled": {
+      "label": "Automatic Extraction",
+      "help": "Persist conversation turns and extract graph memory after replies."
+    },
+    "allowedChatTypes": {
+      "label": "Allowed Chat Types"
+    },
+    "allowedChatIds": {
+      "label": "Allowed Chat IDs"
+    },
+    "deniedChatIds": {
+      "label": "Denied Chat IDs"
+    },
+    "recallTimeoutMs": {
+      "label": "Recall Timeout (ms)"
+    },
+    "recallCacheTtlMs": {
+      "label": "Recall Cache TTL (ms)"
+    },
+    "recallCircuitBreakerMaxTimeouts": {
+      "label": "Recall Circuit Breaker Max Timeouts"
+    },
+    "recallCircuitBreakerCooldownMs": {
+      "label": "Recall Circuit Breaker Cooldown (ms)"
+    },
+    "statusDebugEnabled": {
+      "label": "Status Debug Lines",
+      "help": "Show Graph Memory status lines in /status when verbose/trace is enabled."
     }
   },
   "configContracts": {

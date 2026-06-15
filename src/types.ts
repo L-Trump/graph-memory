@@ -175,6 +175,28 @@ export interface EmbeddingConfig {
 // ─── 插件配置 ─────────────────────────────────────────────────
 
 export interface GmConfig {
+  /** 全局开关：false 时保留工具/命令注册，但跳过自动 recall/extract hooks */
+  enabled?: boolean;
+  /** 自动召回开关：false 时不在 before_prompt_build 注入 dynamic/stable GM 上下文 */
+  recallEnabled?: boolean;
+  /** 自动提取开关：false 时不在 agent_end/compaction 自动写入和提取消息 */
+  extractionEnabled?: boolean;
+  /** 哪些会话类型允许运行自动 recall/extract；默认 direct + explicit */
+  allowedChatTypes?: Array<"direct" | "group" | "channel" | "explicit">;
+  /** 允许的 conversation/chat id；非空时仅这些 id 自动运行 */
+  allowedChatIds?: string[];
+  /** 拒绝的 conversation/chat id；优先级高于 allowedChatIds */
+  deniedChatIds?: string[];
+  /** before_prompt_build recall 总预算，超时后降级为仅 stable context；默认 1500ms */
+  recallTimeoutMs?: number;
+  /** recall 结果缓存 TTL，缓存按 session + prompt/history query hash；默认 15000ms */
+  recallCacheTtlMs?: number;
+  /** 同一 session 连续 recall 超时多少次后打开 circuit breaker；默认 3 */
+  recallCircuitBreakerMaxTimeouts?: number;
+  /** circuit breaker 冷却时间；默认 60000ms */
+  recallCircuitBreakerCooldownMs?: number;
+  /** 是否把 Graph Memory 本轮状态写入 session pluginDebugEntries，供 /status verbose/trace 显示 */
+  statusDebugEnabled?: boolean;
   dbPath: string;
   /** 自动召回注入模式：full=完整动态记忆经 before_prompt_build 注入；index=短索引写入 user message 以改善前缀缓存 */
   autoRecallMode?: "full" | "index";
@@ -219,6 +241,17 @@ export interface GmConfig {
 }
 
 export const DEFAULT_CONFIG: GmConfig = {
+  enabled: true,
+  recallEnabled: true,
+  extractionEnabled: true,
+  allowedChatTypes: ["direct", "explicit"],
+  allowedChatIds: [],
+  deniedChatIds: [],
+  recallTimeoutMs: 1500,
+  recallCacheTtlMs: 15000,
+  recallCircuitBreakerMaxTimeouts: 3,
+  recallCircuitBreakerCooldownMs: 60000,
+  statusDebugEnabled: true,
   dbPath: "~/.openclaw/graph-memory.db",
   autoRecallMode: "full",
   compactTurnCount: 6,

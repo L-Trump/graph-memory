@@ -277,6 +277,264 @@ function normalizeSecretInputStringForRuntime(
   return undefined;
 }
 
+
+type GmChatType = "direct" | "group" | "channel" | "explicit";
+type GmSessionToggleEntry = {
+  sessionKey: string;
+  recallDisabled?: boolean;
+  extractionDisabled?: boolean;
+  disabled?: boolean;
+  updatedAt: number;
+};
+type GmRecallCacheEntry = {
+  expiresAt: number;
+  result: { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> };
+};
+type GmCircuitBreakerEntry = { consecutiveTimeouts: number; lastTimeoutAt: number };
+type GmPluginDebugEntry = { pluginId: string; lines: string[] };
+
+const GM_PLUGIN_STATUS_PREFIX = "🧠 Graph Memory:";
+const GM_PLUGIN_DEBUG_PREFIX = "🔎 Graph Memory Debug:";
+const GM_MAX_RECALL_CACHE_ENTRIES = 1000;
+const GM_MAX_CIRCUIT_BREAKER_ENTRIES = 1000;
+const gmRecallCache = new Map<string, GmRecallCacheEntry>();
+const gmRecallCircuitBreaker = new Map<string, GmCircuitBreakerEntry>();
+const gmToggleWriteChains = new Map<string, Promise<void>>();
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim().toLowerCase();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function normalizeAllowedChatTypes(value: unknown): GmChatType[] {
+  const raw = Array.isArray(value) ? value : DEFAULT_CONFIG.allowedChatTypes;
+  const out = (raw ?? []).filter((item): item is GmChatType =>
+    item === "direct" || item === "group" || item === "channel" || item === "explicit",
+  );
+  return out.length ? [...new Set(out)] : ["direct", "explicit"];
+}
+
+function normalizeRuntimeConfig(raw: Record<string, any>): GmConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    ...raw,
+    enabled: raw.enabled !== false,
+    recallEnabled: raw.recallEnabled !== false,
+    extractionEnabled: raw.extractionEnabled !== false,
+    allowedChatTypes: normalizeAllowedChatTypes(raw.allowedChatTypes),
+    allowedChatIds: normalizeStringList(raw.allowedChatIds),
+    deniedChatIds: normalizeStringList(raw.deniedChatIds),
+    recallTimeoutMs: clampNumber(raw.recallTimeoutMs, DEFAULT_CONFIG.recallTimeoutMs ?? 1500, 50, 120_000),
+    recallCacheTtlMs: clampNumber(raw.recallCacheTtlMs, DEFAULT_CONFIG.recallCacheTtlMs ?? 15_000, 0, 120_000),
+    recallCircuitBreakerMaxTimeouts: clampNumber(raw.recallCircuitBreakerMaxTimeouts, DEFAULT_CONFIG.recallCircuitBreakerMaxTimeouts ?? 3, 1, 20),
+    recallCircuitBreakerCooldownMs: clampNumber(raw.recallCircuitBreakerCooldownMs, DEFAULT_CONFIG.recallCircuitBreakerCooldownMs ?? 60_000, 1_000, 600_000),
+    statusDebugEnabled: raw.statusDebugEnabled !== false,
+  };
+}
+
+function resolveChatTypeFromSessionKey(sessionKey?: string, provider?: string): GmChatType | undefined {
+  const key = sessionKey?.trim().toLowerCase() ?? "";
+  if (key.includes(":group:")) return "group";
+  if (key.includes(":channel:")) return "channel";
+  if (key.includes(":direct:") || key.includes(":dm:")) return "direct";
+  if (key.startsWith("agent:") && key.split(":")[2] === "explicit") return "explicit";
+  if ((provider ?? "").trim().toLowerCase() === "webchat") return "direct";
+  return key ? "explicit" : undefined;
+}
+
+function resolveConversationIdFromSessionKey(sessionKey?: string): string | undefined {
+  const key = sessionKey?.trim();
+  if (!key) return undefined;
+  const base = key.replace(/:thread:[^:]+$/i, "");
+  const parts = base.split(":");
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i]?.toLowerCase();
+    if (part === "direct" || part === "dm" || part === "group" || part === "channel") {
+      return parts.slice(i + 1).join(":").trim().toLowerCase() || undefined;
+    }
+  }
+  return base.toLowerCase();
+}
+
+function resolveAgentIdFromSessionKey(sessionKey?: string): string {
+  const parts = sessionKey?.split(":") ?? [];
+  return parts[0] === "agent" && parts[1] ? parts[1] : "main";
+}
+
+function isEligibleForGmAutomation(cfg: GmConfig, ctx: any, sessionKey?: string): boolean {
+  if (cfg.enabled === false) return false;
+  const chatType = resolveChatTypeFromSessionKey(sessionKey ?? ctx?.sessionKey ?? ctx?.sessionId, ctx?.messageProvider);
+  if (!chatType || !(cfg.allowedChatTypes ?? []).includes(chatType)) return false;
+  const conversationId = resolveConversationIdFromSessionKey(sessionKey ?? ctx?.sessionKey ?? ctx?.sessionId);
+  const denied = cfg.deniedChatIds ?? [];
+  if (conversationId && denied.includes(conversationId)) return false;
+  const allowed = cfg.allowedChatIds ?? [];
+  if (allowed.length > 0 && (!conversationId || !allowed.includes(conversationId))) return false;
+  return true;
+}
+
+function gmToggleKey(sessionKey: string): string {
+  return createHash("sha256").update(sessionKey, "utf8").digest("hex");
+}
+
+function openGmToggleStore(api: OpenClawPluginApi): any | undefined {
+  const openKeyedStore = api.runtime?.state?.openKeyedStore;
+  if (typeof openKeyedStore !== "function") return undefined;
+  try {
+    return openKeyedStore({ namespace: "graph-memory-session-toggles", maxEntries: 10_000 });
+  } catch {
+    return undefined;
+  }
+}
+
+async function readGmSessionToggle(api: OpenClawPluginApi, sessionKey?: string): Promise<GmSessionToggleEntry | undefined> {
+  if (!sessionKey?.trim()) return undefined;
+  const store = openGmToggleStore(api);
+  if (!store?.lookup) return undefined;
+  try {
+    const entry = await store.lookup(gmToggleKey(sessionKey));
+    return entry?.value ?? entry;
+  } catch (err) {
+    api.logger.warn(`[graph-memory] failed to read session toggle: ${err}`);
+    return undefined;
+  }
+}
+
+async function setGmSessionToggle(api: OpenClawPluginApi, sessionKey: string, patch: Partial<GmSessionToggleEntry>): Promise<void> {
+  const key = gmToggleKey(sessionKey);
+  const previous = gmToggleWriteChains.get(key) ?? Promise.resolve();
+  const write = previous.catch(() => undefined).then(async () => {
+    const store = openGmToggleStore(api);
+    if (!store) return;
+    const prev = await readGmSessionToggle(api, sessionKey) ?? { sessionKey, updatedAt: Date.now() };
+    const next: GmSessionToggleEntry = { ...prev, ...patch, sessionKey, updatedAt: Date.now() };
+    if (!next.disabled && !next.recallDisabled && !next.extractionDisabled) {
+      if (store.delete) await store.delete(key);
+      return;
+    }
+    if (store.register) await store.register(key, next);
+  });
+  gmToggleWriteChains.set(key, write);
+  try {
+    await write;
+  } finally {
+    if (gmToggleWriteChains.get(key) === write) gmToggleWriteChains.delete(key);
+  }
+}
+
+function buildGmRecallCacheKey(sessionKey: string, historyQuery: string, promptQuery: string): string {
+  const hash = createHash("sha1").update(`${historyQuery}\n---\n${promptQuery}`).digest("hex");
+  return `${sessionKey}:${hash}`;
+}
+
+function getGmCachedRecall(key: string): { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> } | undefined {
+  const cached = gmRecallCache.get(key);
+  if (!cached) return undefined;
+  if (cached.expiresAt <= Date.now()) {
+    gmRecallCache.delete(key);
+    return undefined;
+  }
+  return cached.result;
+}
+
+function setGmCachedRecall(key: string, result: { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }, ttlMs: number): void {
+  if (ttlMs <= 0) return;
+  gmRecallCache.set(key, { result, expiresAt: Date.now() + ttlMs });
+  while (gmRecallCache.size > GM_MAX_RECALL_CACHE_ENTRIES) {
+    const oldest = gmRecallCache.keys().next().value;
+    if (!oldest) break;
+    gmRecallCache.delete(oldest);
+  }
+}
+
+function pruneGmCircuitBreaker(now = Date.now(), cooldownMs = 60_000): void {
+  for (const [key, entry] of gmRecallCircuitBreaker) {
+    if (now - entry.lastTimeoutAt >= cooldownMs) gmRecallCircuitBreaker.delete(key);
+  }
+  while (gmRecallCircuitBreaker.size > GM_MAX_CIRCUIT_BREAKER_ENTRIES) {
+    const oldest = gmRecallCircuitBreaker.keys().next().value;
+    if (!oldest) break;
+    gmRecallCircuitBreaker.delete(oldest);
+  }
+}
+
+function isGmCircuitOpen(sessionKey: string, cfg: GmConfig): boolean {
+  const cooldownMs = cfg.recallCircuitBreakerCooldownMs ?? 60_000;
+  pruneGmCircuitBreaker(Date.now(), cooldownMs);
+  const entry = gmRecallCircuitBreaker.get(sessionKey);
+  if (!entry || entry.consecutiveTimeouts < (cfg.recallCircuitBreakerMaxTimeouts ?? 3)) return false;
+  return true;
+}
+
+function recordGmRecallTimeout(sessionKey: string): void {
+  const entry = gmRecallCircuitBreaker.get(sessionKey);
+  gmRecallCircuitBreaker.set(sessionKey, {
+    consecutiveTimeouts: (entry?.consecutiveTimeouts ?? 0) + 1,
+    lastTimeoutAt: Date.now(),
+  });
+  pruneGmCircuitBreaker();
+}
+
+function resetGmRecallCircuit(sessionKey: string): void {
+  gmRecallCircuitBreaker.delete(sessionKey);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  // This bounds the hook latency; the underlying synchronous/DB recall cannot be cancelled.
+  if (timeoutMs <= 0) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`graph-memory recall timeout after ${timeoutMs}ms`)), timeoutMs);
+    timeout.unref?.();
+    promise.then(resolve, reject).finally(() => clearTimeout(timeout));
+  });
+}
+
+async function persistGmPluginStatusLines(params: {
+  api: OpenClawPluginApi;
+  sessionKey?: string;
+  statusLine?: string;
+  debugLine?: string;
+}): Promise<void> {
+  const sessionKey = params.sessionKey?.trim();
+  if (!sessionKey) return;
+  const sessionRuntime = params.api.runtime?.agent?.session;
+  if (!sessionRuntime?.patchSessionEntry) return;
+  const agentId = resolveAgentIdFromSessionKey(sessionKey);
+  try {
+    await sessionRuntime.patchSessionEntry({
+      agentId,
+      sessionKey,
+      preserveActivity: true,
+      update: (existing: any) => {
+        const previousEntries = Array.isArray(existing.pluginDebugEntries) ? existing.pluginDebugEntries : [];
+        const otherEntries = previousEntries.filter((entry: any) => entry?.pluginId !== "graph-memory");
+        const lines = [params.statusLine, params.debugLine].filter((line): line is string => Boolean(line));
+        const nextEntries: GmPluginDebugEntry[] = lines.length
+          ? [...otherEntries, { pluginId: "graph-memory", lines }]
+          : otherEntries;
+        return { pluginDebugEntries: nextEntries.length ? nextEntries : undefined };
+      },
+    });
+  } catch (err) {
+    params.api.logger.warn(`[graph-memory] failed to persist plugin status: ${err}`);
+  }
+}
+
 function sanitizeSecretConfig(raw: Record<string, any>, logger: OpenClawPluginApi["logger"]): Record<string, any> {
   const sanitized: Record<string, any> = { ...raw };
 
@@ -322,7 +580,7 @@ const graphMemoryPlugin = {
         ? (api.pluginConfig as any)
         : {};
     const sanitizedRaw = sanitizeSecretConfig(raw, api.logger);
-    const cfg: GmConfig = { ...DEFAULT_CONFIG, ...sanitizedRaw };
+    const cfg: GmConfig = normalizeRuntimeConfig(sanitizedRaw);
     const retentionCfg = {
       ...DEFAULT_CONFIG.retention,
       ...(sanitizedRaw.retention && typeof sanitizedRaw.retention === "object" ? sanitizedRaw.retention : {}),
@@ -391,6 +649,75 @@ const graphMemoryPlugin = {
     const logRuntimeDebug = (message: string) => {
       if (debugRuntimeHooks) api.logger.info(`[graph-memory] runtime debug: ${message}`);
     };
+    const resolveStatusSessionKey = (event: any, ctx: any, fallback?: string): string | undefined =>
+      ctx?.sessionKey ?? event?.sessionKey ?? fallback;
+    const persistStatus = (sessionKey: string | undefined, status: string, debug?: string) => {
+      if (!cfg.statusDebugEnabled) return;
+      persistGmPluginStatusLines({
+        api,
+        sessionKey,
+        statusLine: `${GM_PLUGIN_STATUS_PREFIX} ${status}`,
+        debugLine: debug ? `${GM_PLUGIN_DEBUG_PREFIX} ${debug}` : undefined,
+      }).catch((err) => api.logger.warn(`[graph-memory] status persist failed: ${err}`));
+    };
+
+
+    api.registerCommand?.({
+      name: "gm",
+      description: "Enable, disable, or inspect Graph Memory automation for this session.",
+      acceptsArgs: true,
+      handler: async (ctx: any) => {
+        const tokens = ctx.args?.trim().split(/\s+/).filter(Boolean) ?? [];
+        const action = (tokens[0] ?? "status").toLowerCase();
+        const target = (tokens[1] ?? "all").toLowerCase();
+        const sessionKey = ctx.sessionKey ?? ctx.sessionId;
+        if (!sessionKey) return { text: "Graph Memory: session toggle unavailable because this command has no session context." };
+        if (action === "help") {
+          return { text: [
+            "Graph Memory session commands:",
+            "/gm status",
+            "/gm on [all|recall|extract]",
+            "/gm off [all|recall|extract]",
+          ].join("\n") };
+        }
+        const toggle = await readGmSessionToggle(api, sessionKey);
+        if (action === "status") {
+          const global = cfg.enabled === false ? "off" : "on";
+          const recall = cfg.recallEnabled === false || toggle?.disabled || toggle?.recallDisabled ? "off" : "on";
+          const extract = cfg.extractionEnabled === false || toggle?.disabled || toggle?.extractionDisabled ? "off" : "on";
+          return { text: `Graph Memory: global=${global}, recall=${recall}, extract=${extract} for this session.` };
+        }
+        if (action !== "on" && action !== "off") {
+          return { text: `Unknown Graph Memory action: ${action}. Try /gm help` };
+        }
+        const off = action === "off";
+        const patch: Partial<GmSessionToggleEntry> = {};
+        if (target === "recall") {
+          patch.recallDisabled = off;
+          if (!off) {
+            patch.disabled = false;
+            // If all was disabled, enabling only recall should keep extraction disabled.
+            if (toggle?.disabled && toggle.extractionDisabled !== true) patch.extractionDisabled = true;
+          }
+        } else if (target === "extract" || target === "extraction") {
+          patch.extractionDisabled = off;
+          if (!off) {
+            patch.disabled = false;
+            // If all was disabled, enabling only extraction should keep recall disabled.
+            if (toggle?.disabled && toggle.recallDisabled !== true) patch.recallDisabled = true;
+          }
+        } else {
+          patch.disabled = off;
+          if (!off) {
+            patch.recallDisabled = false;
+            patch.extractionDisabled = false;
+          }
+        }
+        await setGmSessionToggle(api, sessionKey, patch);
+        persistStatus(sessionKey, `session ${target}=${off ? "off" : "on"}`);
+        return { text: `Graph Memory: ${target} ${off ? "off" : "on"} for this session.` };
+      },
+    });
 
     // ── Belief 追踪状态 ────────────────────────────────────────
     // 追踪每个 session 中本轮 recall 的节点
@@ -831,10 +1158,19 @@ ${suggestionsText}
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
 
         const sid = ctx?.sessionId ?? ctx?.sessionKey;
+        if (!sid) return;
         if (sid && ctx?.runId && Array.isArray(event?.messages)) {
           runStartMessageCount.set(`${sid}:${ctx.runId}`, event.messages.length);
           logRuntimeDebug(`before_prompt_build tracked sid=${debugId(sid)} run=${debugId(ctx.runId)} messages=${event.messages.length}`);
         }
+        const statusSessionKey = resolveStatusSessionKey(event, ctx, sid);
+        const toggle = await readGmSessionToggle(api, statusSessionKey);
+        const recallAllowed = cfg.enabled !== false && cfg.recallEnabled !== false && !toggle?.disabled && !toggle?.recallDisabled && isEligibleForGmAutomation(cfg, ctx, statusSessionKey);
+        if (!recallAllowed) {
+          persistStatus(statusSessionKey, "recall=skipped reason=disabled-or-ineligible");
+          return;
+        }
+
         const autoRecallMode = cfg.autoRecallMode === "index" ? "index" : "full";
 
         // ── 构造两次独立 recall query ──────────────────────────────
@@ -863,7 +1199,33 @@ ${suggestionsText}
 
         api.logger.info(`[graph-memory] parallel recall: history(${historyQuery.slice(0, 60)}...) + prompt("${promptQuery.slice(0, 60)}")`);
 
-        const res = await parallelRecall(recaller, historyQuery, promptQuery);
+        let res: { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> } = { nodes: [], edges: [], pprScores: {} };
+        let recallStatus = "empty";
+        let recallDebug = `mode=${autoRecallMode} cache=miss`;
+        const recallStartedAt = Date.now();
+        const cacheKey = buildGmRecallCacheKey(statusSessionKey ?? sid, cfg.autoRecallMode ?? "full", historyQuery, promptQuery);
+        const cachedRecall = getGmCachedRecall(cacheKey);
+        if (cachedRecall) {
+          res = cachedRecall;
+          recallStatus = "ok";
+          recallDebug = `mode=${autoRecallMode} cache=hit`;
+        } else if (isGmCircuitOpen(statusSessionKey ?? sid, cfg)) {
+          recallStatus = "circuit-open";
+          recallDebug = `mode=${autoRecallMode} cache=miss circuit=open`;
+        } else {
+          try {
+            res = await withTimeout(parallelRecall(recaller, historyQuery, promptQuery), cfg.recallTimeoutMs ?? 1500);
+            recallStatus = res.nodes.length ? "ok" : "empty";
+            recallDebug = `mode=${autoRecallMode} cache=miss elapsed=${Date.now() - recallStartedAt}ms`;
+            resetGmRecallCircuit(statusSessionKey ?? sid);
+            if (res.nodes.length) setGmCachedRecall(cacheKey, res, cfg.recallCacheTtlMs ?? 15000);
+          } catch (err) {
+            recallStatus = "timeout";
+            recallDebug = `mode=${autoRecallMode} cache=miss error=${String(err).replace(/\s+/g, " ").slice(0, 160)}`;
+            recordGmRecallTimeout(statusSessionKey ?? sid);
+            api.logger.warn(`[graph-memory] recall degraded: ${err}`);
+          }
+        }
 
         if (res.nodes.length) {
           const stored = { nodes: res.nodes, edges: res.edges, pprScores: res.pprScores };
@@ -892,7 +1254,9 @@ ${suggestionsText}
         }
 
         // ── 组装 KG：稳定层 → appendSystemContext，动态层 → prependContext ──
-        const rec = recalled.get(sid) ?? recalled.get(ctx?.sessionKey) ?? recalled.get(event?.sessionKey) ?? { nodes: [], edges: [], pprScores: {} };
+        const rec = res.nodes.length > 0
+          ? { nodes: res.nodes, edges: res.edges, pprScores: res.pprScores }
+          : { nodes: [], edges: [], pprScores: {} };
         const hotNodes = getHotNodes(db);
         const hotEdges = hotNodes.length > 0 ? getEdgesForNodes(db, hotNodes.map(n => n.id)) : [];
         const sessionScopes = getScopesForSession(db, ctx?.sessionKey ?? ctx?.sessionId);
@@ -912,6 +1276,11 @@ ${suggestionsText}
         ]);
 
         if (activeNodes.length === 0 && rec.nodes.length === 0 && hotNodes.length === 0 && scopeHotNodes.length === 0) {
+          persistStatus(
+            statusSessionKey,
+            `recall=${recallStatus} stable=0tok dynamic=0tok nodes=0 edges=0`,
+            `${recallDebug} scope_hot=0 hot=0 compact_active=0`,
+          );
           return;
         }
 
@@ -939,6 +1308,11 @@ ${suggestionsText}
             (activeNodes.length > 0 ? `, compact_active=${activeNodes.length}` : ""),
           );
         }
+        persistStatus(
+          statusSessionKey,
+          `recall=${recallStatus} stable=${stable.tokens}tok dynamic=${dynamic.tokens}tok nodes=${rec.nodes.length} edges=${rec.edges.length}`,
+          `${recallDebug} scope_hot=${scopeHotNodes.length} hot=${hotNodes.length} compact_active=${activeNodes.length}`,
+        );
 
         // 记录已组装节点的访问（用于衰减引擎）- 仅 L1 节点
         const l1NodeIds = rec.nodes.filter(n => n.tier === "L1").map(n => n.id);
@@ -1235,6 +1609,12 @@ ${suggestionsText}
         const sid = resolveHookSessionId(event, ctx);
         if (!sid) return;
         const sk = resolveHookSessionKey(event, ctx, sid);
+        const toggle = await readGmSessionToggle(api, sk);
+        const extractionAllowed = cfg.enabled !== false && cfg.extractionEnabled !== false && !toggle?.disabled && !toggle?.extractionDisabled && isEligibleForGmAutomation(cfg, ctx, sk);
+        if (!extractionAllowed) {
+          persistStatus(sk, "extract=skipped reason=disabled-or-ineligible");
+          return;
+        }
         const messages = Array.isArray(event?.messages) ? event.messages : [];
         logRuntimeDebug(`agent_end hook sid=${debugId(sid)} sk=${debugId(sk)} run=${debugId(event?.runId)} trigger=${ctx?.trigger ?? "-"} messages=${messages.length}`);
         await handleTurnEnd({
@@ -1259,6 +1639,12 @@ ${suggestionsText}
         const sid = resolveHookSessionId(event, ctx);
         if (!sid) return;
         const sk = resolveHookSessionKey(event, ctx, sid);
+        const toggle = await readGmSessionToggle(api, sk);
+        const extractionAllowed = cfg.enabled !== false && cfg.extractionEnabled !== false && !toggle?.disabled && !toggle?.extractionDisabled && isEligibleForGmAutomation(cfg, ctx, sk);
+        if (!extractionAllowed) {
+          persistStatus(sk, "compaction-extract=skipped reason=disabled-or-ineligible");
+          return;
+        }
 
         const hadChain = extractChain.has(sid);
         logRuntimeDebug(`before_compaction start sid=${debugId(sid)} sk=${debugId(sk)} waitChain=${hadChain}`);

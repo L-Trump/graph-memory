@@ -81,8 +81,7 @@ beforeAll(() => {
 afterAll(() => {
   testDb.close();
   try {
-    fs.unlinkSync(testDbPath);
-    fs.rmdirSync(path.dirname(testDbPath));
+    fs.rmSync(path.dirname(testDbPath), { recursive: true, force: true });
   } catch {}
 });
 
@@ -209,7 +208,9 @@ const EXPLICIT_NODE_CONTRADICTION_SCENARIO = {
 // Tests
 // ═══════════════════════════════════════════════════════════════
 
-describe("E2E: Extract + Belief Updates (真实 API)", () => {
+const describeRealApi = process.env.RUN_GM_REAL_LLM_TESTS === "1" ? describe : describe.skip;
+
+describeRealApi("E2E: Extract + Belief Updates (真实 API)", () => {
   let extractor: Extractor;
   let recaller: Recaller;
 

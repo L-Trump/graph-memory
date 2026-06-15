@@ -22,6 +22,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
+const describeRealApi = process.env.RUN_GM_REAL_LLM_TESTS === "1" ? describe : describe.skip;
+
 // ─── Test Database Setup ────────────────────────────────────────────
 
 let testDb: DatabaseSyncInstance;
@@ -80,8 +82,7 @@ beforeAll(() => {
 afterAll(() => {
   testDb.close();
   try {
-    fs.unlinkSync(testDbPath);
-    fs.rmdirSync(path.dirname(testDbPath));
+    fs.rmSync(path.dirname(testDbPath), { recursive: true, force: true });
   } catch (e) {
     console.warn("Failed to cleanup test database:", e);
   }
@@ -166,7 +167,7 @@ function createFailureTurn(): any[] {
 // Test Cases
 // ═══════════════════════════════════════════════════════════════
 
-describe("Belief System E2E (verdict-based)", () => {
+describeRealApi("Belief System E2E (verdict-based)", () => {
   it("LLM extracts beliefUpdates for supported nodes (tool success)", async () => {
     const extractor = createRealExtractor();
     const testNodeName = "workspace-internal-free-operation-rule";
