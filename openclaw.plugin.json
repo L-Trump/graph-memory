@@ -344,7 +344,7 @@
           },
           "betaTask": {
             "type": "number",
-            "default": 1.0
+            "default": 1
           },
           "betaEvent": {
             "type": "number",
@@ -392,6 +392,26 @@
             "type": "number",
             "default": 0.1,
             "description": "SESSION decay composite floor"
+          }
+        }
+      },
+      "independentLogFile": {
+        "type": "object",
+        "description": "独立 Graph Memory 插件日志配置；routine info/debug/timing/context preview 写入插件日志，warn/error 仍进入主 Gateway 日志",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否启用独立插件日志文件"
+          },
+          "file": {
+            "type": "string",
+            "description": "可选日志文件路径；为空时使用 /tmp/openclaw/graph-memory-YYYY-MM-DD.log"
+          },
+          "maxFileBytes": {
+            "type": "integer",
+            "default": 104857600,
+            "description": "日志文件大小轮转阈值；超过后轮转 .1.log ~ .5.log"
           }
         }
       }
@@ -442,6 +462,18 @@
     "statusDebugEnabled": {
       "label": "Status Debug Lines",
       "help": "Show Graph Memory status lines in /status when verbose/trace is enabled."
+    },
+    "independentLogFile.enabled": {
+      "label": "Independent Log File",
+      "help": "Write routine Graph Memory info/debug logs to a plugin-owned file."
+    },
+    "independentLogFile.file": {
+      "label": "Independent Log Path",
+      "help": "Optional path; defaults to /tmp/openclaw/graph-memory-YYYY-MM-DD.log"
+    },
+    "independentLogFile.maxFileBytes": {
+      "label": "Independent Log Max Bytes",
+      "help": "Size threshold for log rotation."
     }
   },
   "configContracts": {

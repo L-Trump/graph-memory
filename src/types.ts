@@ -197,6 +197,14 @@ export interface GmConfig {
   recallCircuitBreakerCooldownMs?: number;
   /** 是否把 Graph Memory 本轮状态写入 session pluginDebugEntries，供 /status verbose/trace 显示 */
   statusDebugEnabled?: boolean;
+  /** 独立插件日志：routine info/debug 可写入 /tmp/openclaw/graph-memory-YYYY-MM-DD.log，减少主 Gateway 日志噪声 */
+  independentLogFile?: {
+    enabled?: boolean;
+    /** 可选日志文件路径；为空时使用 /tmp/openclaw/graph-memory-YYYY-MM-DD.log */
+    file?: string;
+    /** 单文件大小上限，超过后轮转 .1.log ~ .5.log；默认 104857600 */
+    maxFileBytes?: number;
+  };
   dbPath: string;
   /** 自动召回注入模式：full=完整动态记忆经 before_prompt_build 注入；index=短索引写入 user message 以改善前缀缓存 */
   autoRecallMode?: "full" | "index";
@@ -252,6 +260,10 @@ export const DEFAULT_CONFIG: GmConfig = {
   recallCircuitBreakerMaxTimeouts: 3,
   recallCircuitBreakerCooldownMs: 60000,
   statusDebugEnabled: true,
+  independentLogFile: {
+    enabled: true,
+    maxFileBytes: 104_857_600,
+  },
   dbPath: "~/.openclaw/graph-memory.db",
   autoRecallMode: "full",
   compactTurnCount: 6,
