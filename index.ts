@@ -39,6 +39,7 @@ import { filterNoiseMessages } from "./src/extractor/noise-filter.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
 import { induceTopics, induceSession } from "./src/engine/induction.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
+import { createGraphMemoryLogger } from "./src/logger.ts";
 
 // ─── 从 OpenClaw config 读 provider/model ────────────────────
 
@@ -326,7 +327,7 @@ function normalizeAllowedChatTypes(value: unknown): GmChatType[] {
   const out = (raw ?? []).filter((item): item is GmChatType =>
     item === "direct" || item === "group" || item === "channel" || item === "explicit",
   );
-  return out.length ? [...new Set(out)] : ["direct", "explicit"];
+  return out.length ? [...new Set(out)] : [...(DEFAULT_CONFIG.allowedChatTypes ?? ["direct", "group", "channel", "explicit"])];
 }
 
 function normalizeRuntimeConfig(raw: Record<string, any>): GmConfig {
@@ -437,8 +438,8 @@ async function setGmSessionToggle(api: OpenClawPluginApi, sessionKey: string, pa
   }
 }
 
-function buildGmRecallCacheKey(sessionKey: string, historyQuery: string, promptQuery: string): string {
-  const hash = createHash("sha1").update(`${historyQuery}\n---\n${promptQuery}`).digest("hex");
+function buildGmRecallCacheKey(sessionKey: string, autoRecallMode: string, historyQuery: string, promptQuery: string): string {
+  const hash = createHash("sha1").update(`${autoRecallMode}\n---\n${historyQuery}\n---\n${promptQuery}`).digest("hex");
   return `${sessionKey}:${hash}`;
 }
 
@@ -586,6 +587,7 @@ const graphMemoryPlugin = {
       ...(sanitizedRaw.retention && typeof sanitizedRaw.retention === "object" ? sanitizedRaw.retention : {}),
     };
     cfg.retention = retentionCfg;
+    const gmLog = createGraphMemoryLogger(api.logger, cfg.independentLogFile);
     const { provider, model } = readProviderModel(api.config);
 
     // ── 初始化核心模块（幂等，仅首次执行）──────────────────────
@@ -610,16 +612,16 @@ const graphMemoryPlugin = {
         .then((fn) => {
           if (fn) {
             _gmRecaller!.setEmbedFn(fn);
-            api.logger.info("[graph-memory] vector search ready");
+            gmLog.info("[graph-memory] vector search ready");
           } else {
-            api.logger.info("[graph-memory] FTS5 search mode (配置 embedding 可启用语义搜索)");
+            gmLog.info("[graph-memory] FTS5 search mode (配置 embedding 可启用语义搜索)");
           }
         })
         .catch(() => {
-          api.logger.info("[graph-memory] FTS5 search mode");
+          gmLog.info("[graph-memory] FTS5 search mode");
         });
 
-      api.logger.info(
+      gmLog.hostInfo(
         `[graph-memory] ready | db=${cfg.dbPath} | provider=${provider} | model=${model}`,
       );
 
@@ -643,22 +645,26 @@ const graphMemoryPlugin = {
     const runStartMessageCount = new Map<string, number>();
     const lastRuntimeMessageCount = new Map<string, number>();
     const recentRuntimeMessageFingerprints = new Map<string, Set<string>>();
+    const lastGmStatusBySession = new Map<string, { status: string; debug?: string; updatedAt: number }>();
 
     const debugRuntimeHooks = cfg.debugContextPreview || process.env.GM_DEBUG_CONTEXT_PREVIEW === "1" || process.env.GM_DEBUG_RUNTIME_HOOKS === "1";
     const debugId = (value: unknown) => typeof value === "string" && value.length > 8 ? value.slice(0, 8) : String(value ?? "-");
     const logRuntimeDebug = (message: string) => {
-      if (debugRuntimeHooks) api.logger.info(`[graph-memory] runtime debug: ${message}`);
+      if (debugRuntimeHooks) gmLog.info(`[graph-memory] runtime debug: ${message}`);
     };
     const resolveStatusSessionKey = (event: any, ctx: any, fallback?: string): string | undefined =>
       ctx?.sessionKey ?? event?.sessionKey ?? fallback;
     const persistStatus = (sessionKey: string | undefined, status: string, debug?: string) => {
+      if (sessionKey?.trim()) {
+        lastGmStatusBySession.set(sessionKey.trim(), { status, debug, updatedAt: Date.now() });
+      }
       if (!cfg.statusDebugEnabled) return;
       persistGmPluginStatusLines({
         api,
         sessionKey,
         statusLine: `${GM_PLUGIN_STATUS_PREFIX} ${status}`,
         debugLine: debug ? `${GM_PLUGIN_DEBUG_PREFIX} ${debug}` : undefined,
-      }).catch((err) => api.logger.warn(`[graph-memory] status persist failed: ${err}`));
+      }).catch((err) => gmLog.warn(`[graph-memory] status persist failed: ${err}`));
     };
 
 
@@ -685,7 +691,22 @@ const graphMemoryPlugin = {
           const global = cfg.enabled === false ? "off" : "on";
           const recall = cfg.recallEnabled === false || toggle?.disabled || toggle?.recallDisabled ? "off" : "on";
           const extract = cfg.extractionEnabled === false || toggle?.disabled || toggle?.extractionDisabled ? "off" : "on";
-          return { text: `Graph Memory: global=${global}, recall=${recall}, extract=${extract} for this session.` };
+          const chatType = resolveChatTypeFromSessionKey(sessionKey, ctx.messageProvider);
+          const conversationId = resolveConversationIdFromSessionKey(sessionKey);
+          const eligible = isEligibleForGmAutomation(cfg, ctx, sessionKey);
+          const circuit = isGmCircuitOpen(sessionKey, cfg) ? "open" : "closed";
+          const last = lastGmStatusBySession.get(sessionKey);
+          const lastLine = last
+            ? `${last.status}${last.debug ? ` | ${last.debug}` : ""} (${new Date(last.updatedAt).toISOString()})`
+            : "none";
+          return { text: [
+            `Graph Memory: global=${global}, recall=${recall}, extract=${extract} for this session.`,
+            `Eligibility: ${eligible ? "yes" : "no"}, chatType=${chatType ?? "unknown"}, conversationId=${conversationId ?? "unknown"}`,
+            `Resolved config: autoRecallMode=${cfg.autoRecallMode ?? "full"}, allowedChatTypes=${(cfg.allowedChatTypes ?? []).join(",")}, recallTimeoutMs=${cfg.recallTimeoutMs}, recallCacheTtlMs=${cfg.recallCacheTtlMs}`,
+            `Runtime: cacheEntries=${gmRecallCache.size}, circuit=${circuit}, circuitEntries=${gmRecallCircuitBreaker.size}`,
+            `Last recall/status: ${lastLine}`,
+            `Independent log: ${cfg.independentLogFile?.enabled === false ? "off" : "on"}`,
+          ].join("\n") };
         }
         if (action !== "on" && action !== "off") {
           return { text: `Unknown Graph Memory action: ${action}. Try /gm help` };
@@ -923,11 +944,11 @@ const graphMemoryPlugin = {
                 recaller,
               });
               sessionNode = findByName(db, sessionNodeName);
-              api.logger.info(
+              gmLog.info(
                 `[graph-memory] session node created: ${sessionNodeName} (${induction.description})`,
               );
             } catch (err) {
-              api.logger.warn(`[graph-memory] induceSession failed for ${sessionNodeName}: ${err}`);
+              gmLog.warn(`[graph-memory] induceSession failed for ${sessionNodeName}: ${err}`);
             }
           }
 
@@ -963,13 +984,13 @@ const graphMemoryPlugin = {
                 // updateNodeBelief 直接用 verdict 判断正负，用 LLM 给出的 weight 累加
                 const updateResult = updateNodeBelief(db, node.id, update.verdict, update.weight);
                 if (updateResult && Math.abs(updateResult.delta) > 0.001) {
-                  api.logger.info(
+                  gmLog.info(
                     `[graph-memory] belief ${node.name}: ${updateResult.beliefBefore.toFixed(3)} → ${updateResult.beliefAfter.toFixed(3)} (Δ=${updateResult.delta >= 0 ? "+" : ""}${updateResult.delta.toFixed(3)}) [${update.verdict} weight=${update.weight.toFixed(1)}]`,
                   );
                   invalidateGraphCache();
                 }
               } catch (err) {
-                api.logger.warn(`[graph-memory] record belief for ${node.name} failed: ${err}`);
+                gmLog.warn(`[graph-memory] record belief for ${node.name} failed: ${err}`);
               }
             }
           }
@@ -981,7 +1002,7 @@ const graphMemoryPlugin = {
             const signalDetails = result.beliefUpdates?.length
               ? `, ${result.beliefUpdates.length} belief updates [${result.beliefUpdates.map(u => `${u.nodeName}:${u.verdict}`).join(", ")}]`
               : "";
-            api.logger.info(
+            gmLog.info(
               `[graph-memory] extracted ${result.nodes.length} nodes [${nodeDetails}], ${result.edges.length} edges [${edgeDetails}]${signalDetails}`,
             );
           }
@@ -1044,7 +1065,7 @@ ${suggestionsText}
             (async () => {
               try {
                 if (!(api.runtime as any)?.subagent) {
-                  api.logger.warn("[graph-memory] advisor: api.runtime.subagent not available");
+                  gmLog.warn("[graph-memory] advisor: api.runtime.subagent not available");
                   return;
                 }
 
@@ -1063,16 +1084,16 @@ ${suggestionsText}
                   deliver: false,
                 });
 
-                api.logger.info(
+                gmLog.info(
                   `[graph-memory] advisor launched: runId=${runId}, parentSession=${advisorParentKey}, advisorSession=${advisorSessionKey}, suggestions=${validSuggestions.length} [${validSuggestions.map(s => s.nodeName).join(", ")}]`,
                 );
               } catch (err) {
-                api.logger.warn(`[graph-memory] advisor launch failed: ${err}`);
+                gmLog.warn(`[graph-memory] advisor launch failed: ${err}`);
               }
             })();
           }
         } catch (err) {
-          api.logger.error(`[graph-memory] turn extract failed: ${err}`);
+          gmLog.error(`[graph-memory] turn extract failed: ${err}`);
           // 不 throw — 失败不阻塞 chain 中下一次提取
         }
       });
@@ -1135,7 +1156,7 @@ ${suggestionsText}
           },
         };
       } catch (err) {
-        api.logger.warn(`[graph-memory] before_message_write recall-index failed: ${err}`);
+        gmLog.warn(`[graph-memory] before_message_write recall-index failed: ${err}`);
       }
     });
 
@@ -1146,7 +1167,7 @@ ${suggestionsText}
         runStartMessageCount.set(`${sid}:${event.runId}`, event.messages.length);
         logRuntimeDebug(`before_agent_start tracked sid=${debugId(sid)} run=${debugId(event.runId)} messages=${event.messages.length}`);
       } catch (err) {
-        api.logger.warn(`[graph-memory] before_agent_start tracking failed: ${err}`);
+        gmLog.warn(`[graph-memory] before_agent_start tracking failed: ${err}`);
       }
     });
 
@@ -1208,12 +1229,12 @@ ${suggestionsText}
         bpbTiming("build-queries", `historyChars=${historyQuery.length} promptChars=${promptQuery.length}`);
 
         if (!historyQuery && !promptQuery) {
-          api.logger.info(`[graph-memory] recall: both queries empty, skip`);
+          gmLog.info(`[graph-memory] recall: both queries empty, skip`);
           bpbTiming("return-empty-queries");
           return;
         }
 
-        api.logger.info(`[graph-memory] parallel recall: history(${historyQuery.slice(0, 60)}...) + prompt("${promptQuery.slice(0, 60)}")`);
+        gmLog.info(`[graph-memory] parallel recall: history(${historyQuery.slice(0, 60)}...) + prompt("${promptQuery.slice(0, 60)}")`);
 
         let res: { nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> } = { nodes: [], edges: [], pprScores: {} };
         let recallStatus = "empty";
@@ -1239,7 +1260,7 @@ ${suggestionsText}
             recallStatus = "timeout";
             recallDebug = `mode=${autoRecallMode} cache=miss error=${String(err).replace(/\s+/g, " ").slice(0, 160)}`;
             recordGmRecallTimeout(statusSessionKey ?? sid);
-            api.logger.warn(`[graph-memory] recall degraded: ${err}`);
+            gmLog.warn(`[graph-memory] recall degraded: ${err}`);
           }
         }
         bpbTiming("recall-finished", `status=${recallStatus} nodes=${res.nodes.length} edges=${res.edges.length}`);
@@ -1253,7 +1274,7 @@ ${suggestionsText}
             tierCounts[n.tier ?? "?"] = (tierCounts[n.tier ?? "?"] ?? 0) + 1;
           }
           const tierStr = ["scope_hot", "hot", "active", "L1", "L2", "L3"].map(t => `${t}=${tierCounts[t] ?? 0}`).join(" ");
-          api.logger.info(
+          gmLog.info(
             `[graph-memory] parallel recall merged: ${res.nodes.length} nodes [${tierStr}], ${res.edges.length} edges`,
           );
 
@@ -1326,7 +1347,7 @@ ${suggestionsText}
         bpbTiming("assemble-context", `stableTok=${stable.tokens} dynamicTok=${dynamic.tokens}`);
 
         if (stable.tokens > 0 || dynamic.tokens > 0) {
-          api.logger.info(
+          gmLog.info(
             `[graph-memory] bpb inject split: stable ~${stable.tokens} tok, dynamic ~${dynamic.tokens} tok` +
             (scopeHotNodes.length > 0 ? `, scope_hot=${scopeHotNodes.length}` : "") +
             (activeNodes.length > 0 ? `, compact_active=${activeNodes.length}` : ""),
@@ -1367,7 +1388,7 @@ ${suggestionsText}
           if (ctx?.sessionId) { pendingRecallIndexBySession.set(ctx.sessionId, pending); pendingKeys.push(ctx.sessionId); }
           if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) { pendingRecallIndexBySession.set(ctx.sessionKey, pending); pendingKeys.push(ctx.sessionKey); }
           if (!ctx?.sessionId && !ctx?.sessionKey) { pendingRecallIndexBySession.set(sid, pending); pendingKeys.push(sid); }
-          api.logger.info(`[graph-memory] recall index pending: ~${recallIndex.tokens} tok sid=${String(sid).slice(0, 8)}`);
+          gmLog.info(`[graph-memory] recall index pending: ~${recallIndex.tokens} tok sid=${String(sid).slice(0, 8)}`);
           logRuntimeDebug(`recall index pending keys=${pendingKeys.map(debugId).join(",")} chars=${recallIndex.context.length}`);
         }
 
@@ -1383,16 +1404,16 @@ ${suggestionsText}
           });
           const prevStable = previousStableLayerBySession.get(sid);
           if (!prevStable) {
-            api.logger.info(
+            gmLog.info(
               `[graph-memory] stable diff: first snapshot digest=${stableDigest} items=${stableItems.length} len=${append.length}`,
             );
           } else if (prevStable.digest === stableDigest) {
-            api.logger.info(
+            gmLog.info(
               `[graph-memory] stable diff: unchanged digest=${stableDigest} items=${stableItems.length} len=${append.length}`,
             );
           } else {
             const diff = diffSortedStrings(prevStable.items, stableItems);
-            api.logger.info(
+            gmLog.info(
               `[graph-memory] stable diff: changed ${prevStable.digest}->${stableDigest} ` +
               `items ${prevStable.items.length}->${stableItems.length} len ${prevStable.contextLength}->${append.length} ` +
               `added=${diff.added.length}[${previewListForLog(diff.added)}] ` +
@@ -1401,10 +1422,10 @@ ${suggestionsText}
           }
           previousStableLayerBySession.set(sid, { digest: stableDigest, items: stableItems, contextLength: append.length });
 
-          api.logger.info(`[graph-memory] context preview ${summarizeContextForLog("stable", append)}`);
-          api.logger.info(`[graph-memory] context preview ${summarizeContextForLog("dynamic", prepend)}`);
+          gmLog.info(`[graph-memory] context preview ${summarizeContextForLog("stable", append)}`);
+          gmLog.info(`[graph-memory] context preview ${summarizeContextForLog("dynamic", prepend)}`);
           if (autoRecallMode === "index") {
-            api.logger.info(`[graph-memory] context preview ${summarizeContextForLog("recallIndex", recallIndex.context)}`);
+            gmLog.info(`[graph-memory] context preview ${summarizeContextForLog("recallIndex", recallIndex.context)}`);
           }
         }
 
@@ -1423,17 +1444,17 @@ ${suggestionsText}
             const recallIndexDigest = digestContext(recallIndex.context);
             const prevReturn = previousBeforePromptBuildReturnBySession.get(sid);
             if (!prevReturn) {
-              api.logger.info(
+              gmLog.info(
                 `[graph-memory] bpb return diff: first snapshot digest=${returnDigest} len=${returnLen} ` +
                 `append=${appendDigest}/${append.length} prepend=${prependDigest}/${prepend.length} recallIndex=${recallIndexDigest}/${recallIndex.context.length}`,
               );
             } else if (prevReturn.digest === returnDigest) {
-              api.logger.info(
+              gmLog.info(
                 `[graph-memory] bpb return diff: unchanged digest=${returnDigest} len=${returnLen} ` +
                 `append=${appendDigest}/${append.length} prepend=${prependDigest}/${prepend.length} recallIndex=${recallIndexDigest}/${recallIndex.context.length}`,
               );
             } else {
-              api.logger.info(
+              gmLog.info(
                 `[graph-memory] bpb return diff: changed ${prevReturn.digest}->${returnDigest} len ${prevReturn.contextLength}->${returnLen} ` +
                 `append ${prevReturn.appendDigest}->${appendDigest}/${append.length} ` +
                 `prepend ${prevReturn.prependDigest}->${prependDigest}/${prepend.length} ` +
@@ -1447,7 +1468,7 @@ ${suggestionsText}
               recallIndexDigest,
               contextLength: returnLen,
             });
-            api.logger.info(`[graph-memory] bpb return preview ${summarizeContextForLog("return", returnedJson)}`);
+            gmLog.info(`[graph-memory] bpb return preview ${summarizeContextForLog("return", returnedJson)}`);
           }
           bpbTiming("return-context", `append=${append.length} prepend=${prepend.length}`);
           return {
@@ -1458,7 +1479,7 @@ ${suggestionsText}
         bpbTiming("return-empty-context");
       } catch (err) {
         bpbTiming("failed", `error=${String(err).replace(/\s+/g, " ").slice(0, 160)}`);
-        api.logger.warn(`[graph-memory] before_prompt_build failed: ${err}`);
+        gmLog.warn(`[graph-memory] before_prompt_build failed: ${err}`);
       }
     });
 
@@ -1488,7 +1509,7 @@ ${suggestionsText}
     function markCompactedActiveNodes(sessionId: string, sessionKey?: string): void {
       if (!cfg.compactActiveNodesEnabled) {
         compactedActiveNodeIds.delete(sessionId);
-        api.logger.info(`[graph-memory] compact active nodes disabled`);
+        gmLog.info(`[graph-memory] compact active nodes disabled`);
         return;
       }
 
@@ -1519,7 +1540,7 @@ ${suggestionsText}
       }
 
       compactedActiveNodeIds.set(sessionId, new Set(sessionNodes.map(n => n.id)));
-      api.logger.info(`[graph-memory] compact active nodes marked: ${sessionNodes.length}`);
+      gmLog.info(`[graph-memory] compact active nodes marked: ${sessionNodes.length}`);
     }
 
     async function handleTurnEnd(params: {
@@ -1551,13 +1572,13 @@ ${suggestionsText}
       }
 
       const totalMsgs = msgSeq.get(sessionId) ?? fallbackStart;
-      api.logger.info(
+      gmLog.info(
         `[graph-memory] agent_end sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
       );
 
       // ★ 每轮直接提取（使用已剥离 gm_memory 的消息）
       runTurnExtract(sessionId, sessionKey ?? sessionId, strippedNewMessages).catch((err) => {
-        api.logger.error(`[graph-memory] turn extract failed: ${err}`);
+        gmLog.error(`[graph-memory] turn extract failed: ${err}`);
       });
 
       // ★ 社区维护：每 N 轮触发一次（纯计算，<5ms）
@@ -1588,14 +1609,14 @@ ${suggestionsText}
               if (total > 0) {
                 invalidateGraphCache();
               }
-              api.logger.info(
+              gmLog.info(
                 `[graph-memory] periodic topic induction (turn ${turns}): ` +
                 `created=${induction.createdTopics.length}, updated=${induction.updatedTopics.length}, ` +
                 `sem→topic=${induction.semanticToTopicEdges.length}, topic↔topic=${induction.topicToTopicEdges.length}`,
               );
             }).catch((err) => {
               const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
-              api.logger.error(`[graph-memory] periodic topic induction failed: ${msg}`);
+              gmLog.error(`[graph-memory] periodic topic induction failed: ${msg}`);
             });
           }
 
@@ -1611,24 +1632,24 @@ ${suggestionsText}
                 llm,
                 recaller,
               });
-              api.logger.info(
+              gmLog.info(
                 `[graph-memory] periodic session induction (turn ${turns}): ` +
                 `${induction.description}`,
               );
             }
           } catch (err) {
-            api.logger.warn(`[graph-memory] periodic session induction failed: ${err}`);
+            gmLog.warn(`[graph-memory] periodic session induction failed: ${err}`);
           }
 
           // ★ 轻量图维护
           invalidateGraphCache();
           const pr = computeGlobalPageRank(db, cfg);
-          api.logger.info(
+          gmLog.info(
             `[graph-memory] periodic maintenance (turn ${turns}): ` +
             `pagerank top=${pr.topK.slice(0, 3).map(n => n.name).join(",")}`,
           );
         } catch (err) {
-          api.logger.error(`[graph-memory] periodic maintenance failed: ${err}`);
+          gmLog.error(`[graph-memory] periodic maintenance failed: ${err}`);
         }
       }
     }
@@ -1659,7 +1680,7 @@ ${suggestionsText}
           logRuntimeDebug(`agent_end run-start cleanup sid=${debugId(sid)} run=${debugId(event.runId)} had=${hadRunStart}`);
         }
       } catch (err) {
-        api.logger.warn(`[graph-memory] agent_end failed: ${err}`);
+        gmLog.warn(`[graph-memory] agent_end failed: ${err}`);
       }
     });
 
@@ -1683,11 +1704,11 @@ ${suggestionsText}
         logRuntimeDebug(`before_compaction fallback sid=${debugId(sid)} unextracted=${msgs.length} filtered=${filteredMsgs.length}`);
         if (filteredMsgs.length) {
           await runTurnExtract(sid, sk, filteredMsgs).catch((err) => {
-            api.logger.error(`[graph-memory] compaction extract failed: ${err}`);
+            gmLog.error(`[graph-memory] compaction extract failed: ${err}`);
           });
         }
       } catch (err) {
-        api.logger.warn(`[graph-memory] before_compaction failed: ${err}`);
+        gmLog.warn(`[graph-memory] before_compaction failed: ${err}`);
       }
     });
 
@@ -1712,13 +1733,13 @@ ${suggestionsText}
             llm,
             recaller,
           }).then((induction) => {
-            api.logger.info(`[graph-memory] compaction session induction: ${induction.description}`);
+            gmLog.info(`[graph-memory] compaction session induction: ${induction.description}`);
           }).catch((err) => {
-            api.logger.warn(`[graph-memory] compaction session induction failed: ${err}`);
+            gmLog.warn(`[graph-memory] compaction session induction failed: ${err}`);
           });
         }
       } catch (err) {
-        api.logger.warn(`[graph-memory] after_compaction failed: ${err}`);
+        gmLog.warn(`[graph-memory] after_compaction failed: ${err}`);
       }
     });
 
@@ -1731,7 +1752,7 @@ ${suggestionsText}
           `copied=${Boolean(rec)} nodes=${rec?.nodes?.length ?? 0} edges=${rec?.edges?.length ?? 0}`,
         );
       } catch (err) {
-        api.logger.warn(`[graph-memory] subagent_spawned failed: ${err}`);
+        gmLog.warn(`[graph-memory] subagent_spawned failed: ${err}`);
       }
     });
 
@@ -1744,7 +1765,7 @@ ${suggestionsText}
         logRuntimeDebug(`subagent_ended cleanup target=${debugId(event?.targetSessionKey)} kind=${event?.targetKind ?? "-"}`);
         deleteSessionScopedState(event?.targetSessionKey);
       } catch (err) {
-        api.logger.warn(`[graph-memory] subagent_ended failed: ${err}`);
+        gmLog.warn(`[graph-memory] subagent_ended failed: ${err}`);
       }
     });
 
@@ -1819,7 +1840,7 @@ ${suggestionsText}
           }
           for (const id of fin.invalidations) deprecate(db, id);
         } catch (err) {
-          api.logger.error(`[graph-memory] session_end finalize error: ${err}`);
+          gmLog.error(`[graph-memory] session_end finalize error: ${err}`);
         }
       })();
 
@@ -1839,7 +1860,7 @@ ${suggestionsText}
                 induction.semanticToTopicEdges.length +
                 induction.topicToTopicEdges.length;
               if (total > 0) invalidateGraphCache();
-              api.logger.info(
+              gmLog.info(
                 `[graph-memory] session_end topic induction: ` +
                 `created=${induction.createdTopics.length}, updated=${induction.updatedTopics.length}, ` +
                 `sem→topic=${induction.semanticToTopicEdges.length}, topic↔topic=${induction.topicToTopicEdges.length}`,
@@ -1847,7 +1868,7 @@ ${suggestionsText}
             })
             .catch((err) => {
               const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
-              api.logger.error(`[graph-memory] session_end topic induction failed: ${msg}`);
+              gmLog.error(`[graph-memory] session_end topic induction failed: ${msg}`);
             });
         }
       }
@@ -1865,11 +1886,11 @@ ${suggestionsText}
               llm,
               recaller,
             });
-            api.logger.info(
+            gmLog.info(
               `[graph-memory] session_end session induction: ${induction.description}`,
             );
           } catch (err) {
-            api.logger.warn(`[graph-memory] session_end session induction failed: ${err}`);
+            gmLog.warn(`[graph-memory] session_end session induction failed: ${err}`);
           }
         }
       }
@@ -1888,14 +1909,14 @@ ${suggestionsText}
           const retentionText = result.retention
             ? `retention_messages=${result.retention.messagesDeleted}, retention_recalled=${result.retention.recalledDeleted}, `
             : "";
-          api.logger.info(
+          gmLog.info(
             `[graph-memory] maintenance: ${result.durationMs}ms, ` +
             retentionText +
             `dedup=${result.dedup.merged}, ` +
             `top_pr=${result.pagerank.topK.slice(0, 3).map((n: any) => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
           );
         } catch (err) {
-          api.logger.error(`[graph-memory] session_end maintenance error: ${err}`);
+          gmLog.error(`[graph-memory] session_end maintenance error: ${err}`);
         }
       })();
 
@@ -1912,12 +1933,12 @@ ${suggestionsText}
             } catch { /* belief may not be migrated */ }
           }
           if (sessionBeliefNodes.length > 0) {
-            api.logger.info(
+            gmLog.info(
               `[graph-memory] session_end belief: emitted task_completed for ${sessionBeliefNodes.length} session nodes`,
             );
           }
         } catch (err) {
-          api.logger.warn(`[graph-memory] session_end belief update failed: ${err}`);
+          gmLog.warn(`[graph-memory] session_end belief update failed: ${err}`);
         }
       })();
 
@@ -2662,7 +2683,7 @@ ${suggestionsText}
           deprecate(db, node.id);
           // 顺手清理该节点的出边和入边（避免孤立边残留）
           db.prepare("DELETE FROM gm_edges WHERE from_id = ? OR to_id = ?").run(node.id, node.id);
-          api.logger.info(`[graph-memory] removed node "${name}" (id=${node.id})${reason ? ` reason: ${reason}` : ""}`);
+          gmLog.info(`[graph-memory] removed node "${name}" (id=${node.id})${reason ? ` reason: ${reason}` : ""}`);
           return {
             content: [{
               type: "text",
@@ -2712,7 +2733,7 @@ ${suggestionsText}
           // 允许跨类型合并（用户手动指定，不受类型约束）
           mergeNodes(db, keepNode.id, mergeNode.id);
           invalidateGraphCache();
-          api.logger.info(`[graph-memory] gm_merge: "${keepName}" kept, "${mergeName}" merged`);
+          gmLog.info(`[graph-memory] gm_merge: "${keepName}" kept, "${mergeName}" merged`);
           return {
             content: [{
               type: "text",
@@ -2845,7 +2866,7 @@ content hash 变化：${hashChanged} 个
           const text = force
             ? `全量重新嵌入完成：成功 ${updated} 个，失败 ${failed} 个，跳过 ${skipped} 个（共 ${allNodes.length} 个 active 节点，force=${force}；增量预检：缺失向量 ${missingVectors} 个，content hash 变化 ${hashChanged} 个）。`
             : `增量重新嵌入完成：成功 ${updated} 个，失败 ${failed} 个，跳过 ${skipped} 个（共 ${allNodes.length} 个 active 节点；缺失向量 ${missingVectors} 个，content hash 变化 ${hashChanged} 个，需要嵌入总数 ${candidatesTotal} 个）。`;
-          api.logger.info(`[graph-memory] reembedding_all: ${updated} ok, ${failed} failed, ${skipped} skipped, missing=${missingVectors}, hashChanged=${hashChanged}, candidates=${candidatesTotal}`);
+          gmLog.info(`[graph-memory] reembedding_all: ${updated} ok, ${failed} failed, ${skipped} skipped, missing=${missingVectors}, hashChanged=${hashChanged}, candidates=${candidatesTotal}`);
           return {
             content: [{ type: "text", text }],
             details: { success: true, total: allNodes.length, candidates: candidatesTotal, missingVectors, hashChanged, updated, failed, skipped, force },
@@ -2935,7 +2956,7 @@ content hash 变化：${hashChanged} 个
               },
             };
           } catch (err) {
-            api.logger.error(`[graph-memory] gm_induce_topics failed: ${err}`);
+            gmLog.error(`[graph-memory] gm_induce_topics failed: ${err}`);
             return {
               content: [{ type: "text", text: `主题归纳失败: ${String(err)}` }],
               details: { success: false, error: String(err) },
@@ -3097,7 +3118,7 @@ content hash 变化：${hashChanged} 个
             };
 
           } catch (err) {
-            api.logger.error(`[graph-memory] gm_explore failed: ${err}`);
+            gmLog.error(`[graph-memory] gm_explore failed: ${err}`);
             return {
               content: [{ type: "text", text: `gm_explore 失败: ${String(err)}` }],
               details: { success: false, error: String(err) },
@@ -3276,7 +3297,7 @@ content hash 变化：${hashChanged} 个
               details: { success: true, seeds: allSeeds, subgraphs },
             };
           } catch (err) {
-            api.logger.error(`[graph-memory] gm_dream failed: ${err}`);
+            gmLog.error(`[graph-memory] gm_dream failed: ${err}`);
             return {
               content: [{ type: "text", text: `gm_dream 失败: ${String(err)}` }],
               details: { success: false, error: String(err) },
