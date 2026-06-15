@@ -60,9 +60,11 @@
         },
         "default": [
           "direct",
+          "group",
+          "channel",
           "explicit"
         ],
-        "description": "允许自动 recall/extract 的会话类型"
+        "description": "允许自动 recall/extract 的会话类型；默认包含 direct/group/channel/explicit 以保持历史行为"
       },
       "allowedChatIds": {
         "type": "array",
@@ -84,8 +86,8 @@
         "type": "integer",
         "minimum": 50,
         "maximum": 120000,
-        "default": 1500,
-        "description": "before_prompt_build recall 总预算；超时后降级为仅 stable context"
+        "default": 20000,
+        "description": "before_prompt_build recall timeout in milliseconds; default 20s for graph-memory KG recall."
       },
       "recallCacheTtlMs": {
         "type": "integer",

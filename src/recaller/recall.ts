@@ -187,6 +187,31 @@ export class Recaller {
     this.decayEngine = createDecayEngine(cfg.decay);
   }
 
+  private isRecallTimingDebugEnabled(): boolean {
+    return Boolean(
+      process.env.GM_DEBUG ||
+      process.env.GM_DEBUG_RECALL_TIMING === "1" ||
+      process.env.GM_DEBUG_RUNTIME_HOOKS === "1" ||
+      process.env.GM_DEBUG_CONTEXT_PREVIEW === "1" ||
+      this.cfg.debugContextPreview,
+    );
+  }
+
+  private createRecallTimingLogger(label: string, query: string): (step: string, extra?: string) => void {
+    const enabled = this.isRecallTimingDebugEnabled();
+    const startedAt = Date.now();
+    let lastMarkAt = startedAt;
+    return (step: string, extra = "") => {
+      if (!enabled) return;
+      const now = Date.now();
+      const safeExtra = extra ? ` ${extra.replace(/\s+/g, " ").slice(0, 500)}` : "";
+      console.log(
+        `[graph-memory] recall timing ${label} step=${step} delta=${now - lastMarkAt}ms total=${now - startedAt}ms queryChars=${query.length}${safeExtra}`,
+      );
+      lastMarkAt = now;
+    };
+  }
+
   setEmbedFn(fn: EmbedFn): void {
     this.embed = fn;
     this.embedReady = true;
@@ -221,14 +246,18 @@ export class Recaller {
    * 召回入口：当前只运行 precise-only 路径，然后应用组合评分、PPR、分层和衰减。
    */
   async recallV2(query: string): Promise<RecallResultV2> {
+    const timing = this.createRecallTimingLogger("recallV2", query);
     const limit = this.cfg.recallMaxNodes;
+    timing("start", `limit=${limit} embedReady=${this.embedReady}`);
 
     const precise = await this.recallPreciseV2(query, limit);
+    timing("precise-complete", `nodes=${precise.nodes.length} edges=${precise.edges.length} tokens=${precise.tokenEstimate}`);
     const merged = precise;
 
     if (process.env.GM_DEBUG) {
       console.log(`  [DEBUG] recallV2 merged: precise=${precise.nodes.length} → final=${merged.nodes.length} nodes, ${merged.edges.length} edges`);
     }
+    timing("return", `nodes=${merged.nodes.length} edges=${merged.edges.length}`);
 
     return merged;
   }
@@ -237,16 +266,20 @@ export class Recaller {
    * 精确召回（V2）：向量/FTS5 找种子 → 组合评分 → 三级分级
    */
   private async recallPreciseV2(query: string, limit: number): Promise<RecallResultV2> {
+    const timing = this.createRecallTimingLogger("preciseV2", query);
     let seeds: GmNode[] = [];
     const semanticScores = new Map<string, number>(); // nodeId → 原始向量相似度
     let pagerankCandidateIds = new Set<string>(); // pagerank top k/5：仅作图扩展候选，不作 PPR 种子
     const k = this.cfg.recallMaxNodes;
+    timing("start", `limit=${limit} k=${k} embed=${this.embed ? "yes" : "no"}`);
 
     if (this.embed) {
       try {
         const vec = await this.embed(query);
+        timing("embed-query", `dims=${vec.length}`);
         // 语义种子：top k/3
         const scored = vectorSearchWithScore(this.db, vec, Math.ceil(k / 3));
+        timing("vector-search", `top=${Math.ceil(k / 3)} results=${scored.length} best=${scored[0]?.score?.toFixed?.(3) ?? "-"}`);
         seeds = scored.map(s => s.node);
         for (const s of scored) semanticScores.set(s.node.id, s.score);
 
@@ -257,7 +290,9 @@ export class Recaller {
         // 全局 PageRank 候选：仅作图扩展候选节点，不作为 PPR 种子。
         // 先取更大的高 PR 池，再用 query relevance gate 过滤，避免无关 hub 污染 graphWalk。
         const { topNodes } = await import("../store/store.ts");
+        timing("load-topnodes-module");
         const rawPagerankCandidates = topNodes(this.db, Math.max(20, k));
+        timing("pagerank-topnodes", `raw=${rawPagerankCandidates.length}`);
         const pagerankCandidateLimit = Math.ceil(k / 5);
         const pagerankSemanticThreshold = 0.2;
         const pagerankKeywordThreshold = 0.25;
@@ -270,6 +305,7 @@ export class Recaller {
           const vectorRows = this.db.prepare(
             `SELECT node_id, embedding FROM gm_vectors WHERE node_id IN (${placeholders})`
           ).all(...rawPagerankCandidates.map(n => n.id)) as any[];
+          timing("pagerank-candidate-vector-load", `rows=${vectorRows.length}`);
           for (const row of vectorRows) {
             const raw = row.embedding as Uint8Array;
             const nodeVec = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
@@ -286,6 +322,7 @@ export class Recaller {
           })
           .slice(0, pagerankCandidateLimit);
 
+        timing("pagerank-candidate-gate", `kept=${pagerankCandidates.length}/${rawPagerankCandidates.length}`);
         pagerankCandidateIds = new Set(pagerankCandidates.map(n => n.id));
         for (const n of pagerankCandidates) {
           const semanticScore = candidateVectorScores.get(n.id);
@@ -299,17 +336,25 @@ export class Recaller {
         // 向量结果不足时补 FTS5（limit/3 ≈ 15，与向量搜索种子数一致）
         if (seeds.length < 2) {
           const fts = searchNodes(this.db, query, Math.ceil(limit / 3));
+          timing("fts-fallback", `results=${fts.length} reason=low-vector-seeds`);
           const seen2 = new Set(seeds.map(n => n.id));
           seeds.push(...fts.filter(n => !seen2.has(n.id)));
         }
-      } catch {
+      } catch (err) {
+        timing("embed-path-failed", `error=${String(err).replace(/\s+/g, " ").slice(0, 160)}`);
         seeds = searchNodes(this.db, query, Math.ceil(limit / 3));
+        timing("fts-fallback", `results=${seeds.length} reason=embed-path-error`);
       }
     } else {
       seeds = searchNodes(this.db, query, Math.ceil(limit / 3));
+      timing("fts-search", `results=${seeds.length} reason=no-embed`);
     }
 
-    if (!seeds.length) return { nodes: [], edges: [], pprScores: {}, tokenEstimate: 0 };
+    timing("seed-selection", `seeds=${seeds.length} pagerankAnchors=${pagerankCandidateIds.size} semanticScores=${semanticScores.size}`);
+    if (!seeds.length) {
+      timing("return-no-seeds");
+      return { nodes: [], edges: [], pprScores: {}, tokenEstimate: 0 };
+    }
 
     const seedIds = seeds.map(n => n.id);
 
@@ -323,8 +368,12 @@ export class Recaller {
       Array.from(expandedIds),
       this.cfg.recallMaxDepth,
     );
+    timing("graph-walk", `anchors=${expandedIds.size} depth=${this.cfg.recallMaxDepth} nodes=${nodes.length} edges=${edges.length}`);
 
-    if (!nodes.length) return { nodes: [], edges: [], pprScores: {}, tokenEstimate: 0 };
+    if (!nodes.length) {
+      timing("return-no-graph-nodes");
+      return { nodes: [], edges: [], pprScores: {}, tokenEstimate: 0 };
+    }
 
     const candidateIds = nodes.map(n => n.id);
 
@@ -332,6 +381,7 @@ export class Recaller {
     const { scores: pprScores } = personalizedPageRank(
       this.db, seedIds, candidateIds, this.cfg,
     );
+    timing("personalized-pagerank", `seeds=${seedIds.length} candidates=${candidateIds.length} scores=${pprScores.size}`);
 
     // 组合评分：语义（向量×关键词混合）+ PPR + PageRank
     const hybridSemantic = makeHybridSemanticFn(semanticScores, query);
@@ -343,13 +393,18 @@ export class Recaller {
       SEMANTIC_WEIGHT,
       PAGERANK_WEIGHT,
     );
+    timing("combined-score", `scored=${scoredNodes.length}`);
 
     // 三级分级
     let tiered = this.assignTiers(scoredNodes);
+    timing("assign-tiers", `tiered=${tiered.length}`);
 
     // 应用衰减评分（access-based decay，调整 combined score）
     if (this.cfg.decayEnabled !== false) {
       tiered = this.applyDecayScoring(tiered);
+      timing("decay-scoring", `tiered=${tiered.length}`);
+    } else {
+      timing("decay-skipped");
     }
 
     if (process.env.GM_DEBUG) {
@@ -360,12 +415,16 @@ export class Recaller {
 
     const pprScoresFinal: Record<string, number> = {};
     for (const n of tiered) pprScoresFinal[n.id] = n.pprScore;
+    const tieredIdSet = new Set(tiered.map(n => n.id));
+    const finalEdges = edges.filter(e => tieredIdSet.has(e.fromId) && tieredIdSet.has(e.toId));
+    const tokenEstimate = this.estimateTokens(tiered);
+    timing("finalize", `nodes=${tiered.length} edges=${finalEdges.length} tokens=${tokenEstimate}`);
 
     return {
       nodes: tiered,
-      edges: edges.filter(e => new Set(tiered.map(n => n.id)).has(e.fromId) && new Set(tiered.map(n => n.id)).has(e.toId)),
+      edges: finalEdges,
       pprScores: pprScoresFinal,
-      tokenEstimate: this.estimateTokens(tiered),
+      tokenEstimate,
     };
   }
 

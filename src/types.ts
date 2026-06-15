@@ -181,7 +181,7 @@ export interface GmConfig {
   recallEnabled?: boolean;
   /** 自动提取开关：false 时不在 agent_end/compaction 自动写入和提取消息 */
   extractionEnabled?: boolean;
-  /** 哪些会话类型允许运行自动 recall/extract；默认 direct + explicit */
+  /** 哪些会话类型允许运行自动 recall/extract；默认 direct/group/channel/explicit（保持历史行为） */
   allowedChatTypes?: Array<"direct" | "group" | "channel" | "explicit">;
   /** 允许的 conversation/chat id；非空时仅这些 id 自动运行 */
   allowedChatIds?: string[];
@@ -244,10 +244,10 @@ export const DEFAULT_CONFIG: GmConfig = {
   enabled: true,
   recallEnabled: true,
   extractionEnabled: true,
-  allowedChatTypes: ["direct", "explicit"],
+  allowedChatTypes: ["direct", "group", "channel", "explicit"],
   allowedChatIds: [],
   deniedChatIds: [],
-  recallTimeoutMs: 1500,
+  recallTimeoutMs: 20000,
   recallCacheTtlMs: 15000,
   recallCircuitBreakerMaxTimeouts: 3,
   recallCircuitBreakerCooldownMs: 60000,

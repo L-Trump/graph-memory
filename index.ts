@@ -1151,23 +1151,37 @@ ${suggestionsText}
     });
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {
+      const bpbStartedAt = Date.now();
+      let bpbLastMarkAt = bpbStartedAt;
+      const bpbTiming = (step: string, extra = "") => {
+        if (!debugRuntimeHooks) return;
+        const now = Date.now();
+        logRuntimeDebug(
+          `before_prompt_build timing step=${step} delta=${now - bpbLastMarkAt}ms total=${now - bpbStartedAt}ms${extra ? ` ${extra}` : ""}`,
+        );
+        bpbLastMarkAt = now;
+      };
       try {
         const rawPrompt = typeof event?.prompt === "string" ? event.prompt : "";
         const prompt = cleanPrompt(rawPrompt);
-        if (!prompt) return;
-        if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
+        bpbTiming("clean-prompt", `rawChars=${rawPrompt.length} cleanChars=${prompt.length}`);
+        if (!prompt) { bpbTiming("return-empty-prompt"); return; }
+        if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) { bpbTiming("return-session-reset-prompt"); return; }
 
         const sid = ctx?.sessionId ?? ctx?.sessionKey;
-        if (!sid) return;
+        if (!sid) { bpbTiming("return-no-session"); return; }
         if (sid && ctx?.runId && Array.isArray(event?.messages)) {
           runStartMessageCount.set(`${sid}:${ctx.runId}`, event.messages.length);
           logRuntimeDebug(`before_prompt_build tracked sid=${debugId(sid)} run=${debugId(ctx.runId)} messages=${event.messages.length}`);
         }
+        bpbTiming("session-tracked", `sid=${debugId(sid)} messages=${Array.isArray(event?.messages) ? event.messages.length : 0}`);
         const statusSessionKey = resolveStatusSessionKey(event, ctx, sid);
         const toggle = await readGmSessionToggle(api, statusSessionKey);
+        bpbTiming("read-toggle", `statusSid=${debugId(statusSessionKey)} toggle=${toggle ? "yes" : "no"}`);
         const recallAllowed = cfg.enabled !== false && cfg.recallEnabled !== false && !toggle?.disabled && !toggle?.recallDisabled && isEligibleForGmAutomation(cfg, ctx, statusSessionKey);
         if (!recallAllowed) {
           persistStatus(statusSessionKey, "recall=skipped reason=disabled-or-ineligible");
+          bpbTiming("return-disabled-or-ineligible");
           return;
         }
 
@@ -1191,9 +1205,11 @@ ${suggestionsText}
           .trim();
         // promptQuery：清理后的当前用户 prompt
         const promptQuery = prompt;
+        bpbTiming("build-queries", `historyChars=${historyQuery.length} promptChars=${promptQuery.length}`);
 
         if (!historyQuery && !promptQuery) {
           api.logger.info(`[graph-memory] recall: both queries empty, skip`);
+          bpbTiming("return-empty-queries");
           return;
         }
 
@@ -1226,6 +1242,7 @@ ${suggestionsText}
             api.logger.warn(`[graph-memory] recall degraded: ${err}`);
           }
         }
+        bpbTiming("recall-finished", `status=${recallStatus} nodes=${res.nodes.length} edges=${res.edges.length}`);
 
         if (res.nodes.length) {
           const stored = { nodes: res.nodes, edges: res.edges, pprScores: res.pprScores };
@@ -1252,6 +1269,7 @@ ${suggestionsText}
             combinedScore: n.combinedScore ?? undefined,
           })));
         }
+        bpbTiming("store-recall-state", `storedNodes=${res.nodes.length}`);
 
         // ── 组装 KG：稳定层 → appendSystemContext，动态层 → prependContext ──
         const rec = res.nodes.length > 0
@@ -1274,6 +1292,10 @@ ${suggestionsText}
           ...edgesFrom(db, n.id),
           ...edgesTo(db, n.id),
         ]);
+        bpbTiming(
+          "load-stable-inputs",
+          `hot=${hotNodes.length}/${hotEdges.length} scopeHot=${scopeHotNodes.length}/${scopeHotEdges.length} active=${activeNodes.length}/${activeEdges.length}`,
+        );
 
         if (activeNodes.length === 0 && rec.nodes.length === 0 && hotNodes.length === 0 && scopeHotNodes.length === 0) {
           persistStatus(
@@ -1281,6 +1303,7 @@ ${suggestionsText}
             `recall=${recallStatus} stable=0tok dynamic=0tok nodes=0 edges=0`,
             `${recallDebug} scope_hot=0 hot=0 compact_active=0`,
           );
+          bpbTiming("return-no-context");
           return;
         }
 
@@ -1300,6 +1323,7 @@ ${suggestionsText}
           pprScores: rec.pprScores,
           graphWalkDepth: cfg.recallMaxDepth,
         });
+        bpbTiming("assemble-context", `stableTok=${stable.tokens} dynamicTok=${dynamic.tokens}`);
 
         if (stable.tokens > 0 || dynamic.tokens > 0) {
           api.logger.info(
@@ -1319,6 +1343,7 @@ ${suggestionsText}
         if (l1NodeIds.length > 0) {
           recordNodeAccessBatch(db, l1NodeIds);
         }
+        bpbTiming("record-access", `l1=${l1NodeIds.length}`);
 
         const append = stable.context;
         const prepend = autoRecallMode === "full" ? dynamic.context : "";
@@ -1329,6 +1354,7 @@ ${suggestionsText}
             logLabel: "recall-index",
           })
           : { context: "", tokens: 0 };
+        bpbTiming("prepare-output-mode", `mode=${autoRecallMode} appendChars=${append.length} prependChars=${prepend.length} indexTok=${recallIndex.tokens}`);
 
         if (autoRecallMode === "index" && recallIndex.context) {
           const pending = {
@@ -1423,12 +1449,15 @@ ${suggestionsText}
             });
             api.logger.info(`[graph-memory] bpb return preview ${summarizeContextForLog("return", returnedJson)}`);
           }
+          bpbTiming("return-context", `append=${append.length} prepend=${prepend.length}`);
           return {
             ...(prepend ? { prependContext: prepend } : {}),
             ...(append ? { appendSystemContext: append } : {}),
           };
         }
+        bpbTiming("return-empty-context");
       } catch (err) {
+        bpbTiming("failed", `error=${String(err).replace(/\s+/g, " ").slice(0, 160)}`);
         api.logger.warn(`[graph-memory] before_prompt_build failed: ${err}`);
       }
     });
