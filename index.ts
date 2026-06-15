@@ -762,6 +762,7 @@ const graphMemoryPlugin = {
           previousStableLayerBySession, previousBeforePromptBuildReturnBySession,
           pendingRecallIndexBySession, lastRuntimeMessageCount,
           recentRuntimeMessageFingerprints, extractChain, runStartMessageCount,
+          lastGmStatusBySession,
         ].some(map => map.has(key)) || prefixedRunKeys.length > 0;
         recalled.delete(key);
         msgSeq.delete(key);
@@ -772,6 +773,7 @@ const graphMemoryPlugin = {
         pendingRecallIndexBySession.delete(key);
         lastRuntimeMessageCount.delete(key);
         recentRuntimeMessageFingerprints.delete(key);
+        lastGmStatusBySession.delete(key);
         extractChain.delete(key);
         runStartMessageCount.delete(key);
         for (const runKey of prefixedRunKeys) runStartMessageCount.delete(runKey);
@@ -3519,6 +3521,10 @@ function sliceLastTurn(
   for (const msg of kept) tokens += estimateMsgTokens(msg);
 
   return { messages: kept, tokens, dropped };
+}
+
+export function __testBuildGmRecallCacheKey(sessionKey: string, autoRecallMode: string, historyQuery: string, promptQuery: string): string {
+  return buildGmRecallCacheKey(sessionKey, autoRecallMode, historyQuery, promptQuery);
 }
 
 export default graphMemoryPlugin;

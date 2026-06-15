@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import plugin from "../index.ts";
+import plugin, { __testBuildGmRecallCacheKey } from "../index.ts";
 
 function makeApi(config: Record<string, unknown> = {}) {
   const handlers = new Map<string, Function[]>();
@@ -53,7 +53,16 @@ describe("graph-memory runtime controls", () => {
     expect(gm).toBeDefined();
 
     const sessionKey = "agent:main:direct:user1";
-    expect((await gm.handler({ args: "status", sessionKey })).text).toContain("recall=on");
+    const status = (await gm.handler({ args: "status", sessionKey })).text;
+    expect(status).toContain("Graph Memory: global=on, recall=on, extract=on for this session.");
+    expect(status).toContain("Eligibility: yes");
+    expect(status).toContain("chatType=direct");
+    expect(status).toContain("conversationId=user1");
+    expect(status).toContain("Resolved config: autoRecallMode=full");
+    expect(status).toContain("allowedChatTypes=direct,group,channel,explicit");
+    expect(status).toContain("Runtime: cacheEntries=");
+    expect(status).toContain("Last recall/status: none");
+    expect(status).toContain("Independent log: on");
 
     expect((await gm.handler({ args: "off recall", sessionKey })).text).toContain("recall off");
     expect((await gm.handler({ args: "status", sessionKey })).text).toContain("recall=off");
@@ -70,6 +79,13 @@ describe("graph-memory runtime controls", () => {
     expect((await gm.handler({ args: "on", sessionKey })).text).toContain("all on");
     expect((await gm.handler({ args: "status", sessionKey })).text).toContain("recall=on");
     expect((await gm.handler({ args: "status", sessionKey })).text).toContain("extract=on");
+  });
+
+  it("keeps recall cache keys separated by autoRecallMode", () => {
+    const full = __testBuildGmRecallCacheKey("session-a", "full", "history", "prompt");
+    const index = __testBuildGmRecallCacheKey("session-a", "index", "history", "prompt");
+    expect(full).not.toEqual(index);
+    expect(full).toEqual(__testBuildGmRecallCacheKey("session-a", "full", "history", "prompt"));
   });
 
   it("writes graph-memory pluginDebugEntries via session patch", async () => {
