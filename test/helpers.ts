@@ -43,6 +43,8 @@ export function createTestDb(): DatabaseSyncInstance {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_nodes_name ON gm_nodes(name);
     CREATE INDEX IF NOT EXISTS ix_gm_nodes_type_status ON gm_nodes(type, status);
+    CREATE INDEX IF NOT EXISTS ix_gm_nodes_status_rank ON gm_nodes(status, pagerank DESC, validated_count DESC, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS ix_gm_nodes_status_type ON gm_nodes(status, type);
     CREATE INDEX IF NOT EXISTS ix_gm_nodes_community ON gm_nodes(community_id);
 
     CREATE TABLE IF NOT EXISTS gm_edges (
@@ -56,6 +58,8 @@ export function createTestDb(): DatabaseSyncInstance {
     );
     CREATE INDEX IF NOT EXISTS ix_gm_edges_from ON gm_edges(from_id);
     CREATE INDEX IF NOT EXISTS ix_gm_edges_to   ON gm_edges(to_id);
+    CREATE INDEX IF NOT EXISTS ix_gm_edges_from_to_name ON gm_edges(from_id, to_id, name);
+    CREATE INDEX IF NOT EXISTS ix_gm_edges_to_from_name ON gm_edges(to_id, from_id, name);
   `);
 
   // m2: 消息
@@ -116,7 +120,14 @@ export function createTestDb(): DatabaseSyncInstance {
     CREATE TABLE IF NOT EXISTS gm_vectors (
       node_id      TEXT PRIMARY KEY REFERENCES gm_nodes(id),
       content_hash TEXT NOT NULL,
-      embedding    BLOB NOT NULL
+      embedding    BLOB NOT NULL,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      dedup_checked_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_vectors_dedup_pending ON gm_vectors(dedup_checked_at, updated_at, node_id);
+    CREATE TABLE IF NOT EXISTS gm_dedup_state (
+      key        TEXT PRIMARY KEY,
+      value      INTEGER NOT NULL
     );
   `);
 
