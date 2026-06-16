@@ -1,126 +1,264 @@
 # Graph Memory Architecture
 
-Graph Memory is a hook-only OpenClaw plugin. It runs beside the selected ContextEngine and contributes semantic memory through hooks and tools; it does not own transcript assembly or compaction.
+Graph Memory is a hook-only OpenClaw plugin. It contributes durable semantic memory through lifecycle hooks and `gm_*` tools while leaving the selected ContextEngine responsible for transcript assembly, compaction, and exact history recall.
 
-## Boundary
+## Design Goals
+
+1. **Semantic memory, not transcript replay** — store durable knowledge as nodes and relationships.
+2. **Graph-aware recall** — retrieve not only matching text but also related concepts, causes, fixes, dependencies, and conflicts.
+3. **Prompt discipline** — separate prefix-stable memories from per-turn dynamic recall.
+4. **Operational safety** — keep recall bounded by cache/timeout/circuit breaker and keep maintenance budgeted.
+5. **Correctability** — support explicit record/edit/remove/merge flows and belief/confidence updates.
+6. **Context-engine compatibility** — run beside lossless context systems instead of replacing them.
+
+## System Boundary
 
 Graph Memory is responsible for:
 
-- extracting durable knowledge graph nodes and edges from eligible conversations;
-- recalling relevant graph context before a reply;
+- extracting durable nodes/edges from eligible conversations;
+- recalling graph context before replies;
 - injecting stable and dynamic memory context;
-- exposing tools for graph search, inspection, editing, maintenance, embeddings, and topic induction.
+- exposing tools for graph search, inspection, editing, maintenance, embeddings, and topic induction;
+- maintaining graph metadata such as PageRank, access counters, belief signals, and dedup state.
 
 Graph Memory is not responsible for:
 
-- lossless transcript storage;
-- provider prompt-cache management;
-- replacing OpenClaw's context engine;
-- preserving exact historical commands or raw tool outputs.
+- lossless transcript preservation;
+- source-message proof or raw tool-output recovery;
+- provider prompt-cache ownership;
+- replacing OpenClaw's ContextEngine;
+- deciding whether live files/services/config are current — those must be verified directly.
 
-## Data model
+## High-Level Flow
 
-The graph stores nodes and edges in SQLite.
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│                          OpenClaw runtime                            │
+└───────────────────────┬───────────────────────┬──────────────────────┘
+                        │                       │
+              before_prompt_build             agent_end/session_end
+                        │                       │
+┌───────────────────────▼─────────────┐ ┌──────▼──────────────────────┐
+│ Recall path                          │ │ Extraction path             │
+│ - resolve eligibility                │ │ - choose new messages       │
+│ - build history/prompt query         │ │ - strip injected GM context │
+│ - cache/circuit/timeout guard        │ │ - save raw bookkeeping rows │
+│ - seed search + graph walk + PPR     │ │ - LLM extract nodes/edges   │
+│ - assemble stable/dynamic context    │ │ - apply belief updates      │
+└───────────────────────┬─────────────┘ └──────┬──────────────────────┘
+                        │                       │
+                        └───────────┬───────────┘
+                                    │
+                         ┌──────────▼───────────┐
+                         │ SQLite graph store   │
+                         │ nodes/edges/vectors  │
+                         │ messages/recalled    │
+                         │ belief/dedup/access  │
+                         └──────────┬───────────┘
+                                    │
+                         ┌──────────▼───────────┐
+                         │ Maintenance          │
+                         │ retention/dedup/PR   │
+                         └──────────────────────┘
+```
 
-Node types:
+## Data Model
 
-- `TASK`
-- `SKILL`
-- `EVENT`
-- `KNOWLEDGE`
-- `STATUS`
-- `TOPIC`
-- `SESSION`
+### Node Types
 
-Edges have free-form names and descriptions. This lets the extractor represent relations in natural terms such as `使用`, `依赖`, `修复`, `冲突`, or `扩展`.
+| Type | Typical content |
+|---|---|
+| `TASK` | Work items, implementation goals, ongoing operational tasks. |
+| `SKILL` | Reusable procedures, debugging playbooks, workflows, conventions. |
+| `EVENT` | Incidents, fixes, historical observations, reported bugs. |
+| `KNOWLEDGE` | Durable facts, architectural principles, decisions, constraints. |
+| `STATUS` | Time-sensitive snapshots, current operating state, allowlists. |
+| `TOPIC` | Induced high-level themes across nodes or sessions. |
+| `SESSION` | Session-level summaries/anchors for graph continuity. |
 
-Important node metadata includes:
+### Edge Model
 
-- `belief` and signal counts for confidence tracking;
-- `flags` for `hot` and `scope_hot:<scope>` visibility;
-- `sourceSessions` for extraction provenance;
-- access counters and timestamps for decay-aware recall;
-- PageRank score for global graph importance.
+Edges use free-form names/descriptions so the extractor can represent natural relations:
 
-## Hook lifecycle
+- `使用` / uses
+- `依赖` / depends on
+- `修复` / fixes
+- `导致` / causes
+- `冲突` / conflicts with
+- `扩展` / extends
+- `验证` / verifies
+- `触发` / triggers
+
+Edges are used for graph walk, Personalized PageRank, local context construction, and human inspection.
+
+### Important Metadata
+
+| Field family | Purpose |
+|---|---|
+| `flags` | `hot` and `scope_hot:<scope>` visibility. |
+| `belief`, `successCount`, `failureCount` | Confidence and supported/contradicted evidence tracking. |
+| `sourceSessions` | Provenance of extraction. |
+| `accessCount`, `lastAccessedAt` | Decay-aware ranking and usage diagnostics. |
+| `pagerank` | Global graph importance used during recall ranking. |
+| vectors | Semantic similarity for recall and dedup. |
+| dedup tracking | Incremental maintenance state for new/changed vectors. |
+
+## Recall Pipeline
+
+Graph Memory currently uses precise recall.
+
+```text
+history + prompt query
+  → embedding query if available
+  → vector search and/or FTS5 fallback
+  → PageRank candidate expansion
+  → graph walk from seed nodes
+  → Personalized PageRank on local subgraph
+  → combined semantic/PPR/global-PR/keyword score
+  → access decay modulation
+  → tier assignment
+  → stable/dynamic context assembly
+```
+
+### Scoring Signals
+
+| Signal | Role |
+|---|---|
+| Semantic similarity | Primary match between query and node content. |
+| FTS5/keyword overlap | Exact token match fallback or boost. |
+| Personalized PageRank | Local graph relevance around seed nodes. |
+| Global PageRank | General graph importance. |
+| Access decay | Recency/frequency/intrinsic adjustment. |
+| Belief/confidence | Reliability awareness and future ranking input. |
+
+### Tiers
+
+| Tier | Rendering |
+|---|---|
+| `scope_hot` | Full content in stable layer for matching scope. |
+| `hot` | Full content in stable layer globally. |
+| `active` | Current-session compact-active stable context. |
+| `L1` | Full content in dynamic recall layer. |
+| `L2` | Description only. |
+| `L3` | Name only. |
+| `filtered` | Not rendered. |
+
+## Context Injection
+
+### Stable Layer
+
+Stable context is appended as system context and should remain relatively prefix-stable:
+
+- global hot nodes;
+- scope-hot nodes for current session scopes;
+- compact-active nodes when enabled.
+
+Stable layer intentionally avoids rendering too many dynamic edges to preserve prefix-cache stability.
+
+### Dynamic Layer
+
+Dynamic context changes per turn and contains recall results:
+
+- `autoRecallMode="full"`: dynamic XML is returned as `prependContext`.
+- `autoRecallMode="index"`: a compact recall index is staged and written into the user message by `before_message_write`.
+
+## Hook Lifecycle
 
 ### `before_prompt_build`
 
-1. Resolve and normalize runtime config.
-2. Resolve a stable session key and session toggle.
-3. Check automation eligibility (`enabled`, recall toggle, chat type/id allow/deny lists).
+1. Normalize runtime config.
+2. Resolve session key and session toggles.
+3. Check eligibility (`enabled`, recall toggles, chat type/id filters).
 4. Build history and prompt queries.
-5. Run cache/circuit-breaker protected recall.
-6. Load stable inputs: global hot, scope hot, and optional compact-active nodes.
-7. Assemble stable and dynamic context.
-8. Persist lightweight status lines for `/status` when enabled.
-9. Return `appendSystemContext` and/or `prependContext`, or stage recall-index content for `before_message_write`.
+5. Check recall cache.
+6. Check circuit breaker.
+7. Run recall under timeout guard.
+8. Load hot/scope-hot/compact-active stable inputs.
+9. Assemble context.
+10. Record access metadata.
+11. Persist status/debug lines.
+12. Return prompt context or stage recall index.
 
 ### `before_message_write`
 
-In `autoRecallMode="index"`, this hook prepends a short recall index to the user message when the prompt hash matches the staged recall result. This mode is intended to improve provider prompt-cache stability by avoiding a large dynamic prepend.
+Applies staged recall-index content only when the prompt hash matches. This prevents stale recall indexes from being written to unrelated messages.
 
 ### `agent_end`
 
-1. Select new messages for the run.
-2. Strip transient GM context from persisted text.
-3. Save messages and extract graph nodes/edges when extraction is enabled and eligible.
-4. Apply belief updates for recalled nodes.
-5. Periodically induce topics/session summaries and run maintenance.
+1. Select new messages since the run started.
+2. Strip transient injected GM context.
+3. Persist raw bookkeeping rows.
+4. Run extraction when enabled and eligible.
+5. Persist nodes/edges/vectors.
+6. Apply belief updates for recalled nodes.
+7. Periodically induce topics/session nodes and run maintenance.
 
-### Compaction and session hooks
+### Compaction Hooks
 
-- `before_compaction` can preserve/extract relevant active session material before context is compacted.
-- `after_compaction` marks compacted active nodes and may induce a session node.
-- `subagent_spawned` / `subagent_ended` preserve parent-child memory continuity.
-- `session_end` finalizes extraction, topic/session induction, maintenance, and task-completed belief signals.
+- `before_compaction`: preserve/extract relevant active session material before loss of prompt detail.
+- `after_compaction`: mark compacted active nodes and optionally induce session-level graph anchors.
 
-## Recall pipeline
+### Subagent and Session End Hooks
 
-The current recall path is precise recall only:
+Subagent hooks preserve continuity between parent/child sessions. `session_end` performs final extraction, topic/session induction, maintenance, and task-completed belief signals.
 
-1. embed or FTS query;
-2. vector/FTS seed search;
-3. PageRank candidate expansion;
-4. graph walk from seeds;
-5. personalized PageRank;
-6. combined scoring with semantic, PPR, and global PageRank components;
-7. access decay modulation;
-8. tier assignment.
+## Maintenance Architecture
 
-Tiers:
+```text
+gm_maintain / periodic maintenance
+  → retention cleanup for inactive raw rows
+  → incremental vector dedup
+  → global PageRank recompute
+  → metrics/logging
+```
 
-- `L1`: complete content;
-- `L2`: description only;
-- `L3`: name only;
-- `filtered`: internal only, not injected.
+### Incremental Dedup
 
-## Context layers
+`gm_vectors` tracks `updated_at` and `dedup_checked_at`.
 
-### Stable layer
+- New/updated vectors become pending.
+- Each run checks up to `dedupMaxPendingVectorsPerRun` pending vectors.
+- Pending vectors are compared against same-type pending vectors and already-checked same-type active vectors.
+- Pair and merge budgets bound work.
+- Setting `dedupMaxPendingVectorsPerRun=0` falls back to full scan.
 
-Stable context is appended as system context and is intended to be prefix-stable:
+### Retention
 
-- global `hot` nodes;
-- current-session `scope_hot` nodes;
-- compact-active nodes when `compactActiveNodesEnabled=true`.
+Retention removes old raw `gm_messages` and `gm_recalled` rows for inactive sessions. It does not delete semantic nodes or edges.
 
-### Dynamic layer
+## Resilience
 
-Dynamic context contains the current turn's recalled L1/L2/L3 nodes and relevant edges. In `full` mode it is returned as `prependContext`. In `index` mode a short index is written into the user message instead.
+| Mechanism | Purpose |
+|---|---|
+| Cache | Avoid repeated recall work for same session/mode/query. |
+| Timeout | Bound hook latency. |
+| Circuit breaker | Skip recall temporarily after repeated timeouts. |
+| Bounded maps | Avoid unbounded cache/circuit status growth. |
+| Independent log | Keep routine GM diagnostics out of the main host log. |
+| `/gm status` | Show resolved state and last recall/eligibility information. |
 
-## Runtime resilience
+## File Reference
 
-`before_prompt_build` recall is protected by:
+| File | Purpose |
+|---|---|
+| `index.ts` | Entry, hooks, config normalization, commands, tools, status/debug. |
+| `src/types.ts` | Types and defaults. |
+| `src/store/db.ts` | SQLite migrations and indexes. |
+| `src/store/store.ts` | Store APIs. |
+| `src/recaller/recall.ts` | Recall implementation. |
+| `src/format/assemble.ts` | Context rendering. |
+| `src/extractor/extract.ts` | LLM graph extraction. |
+| `src/engine/induction.ts` | Topic/session induction. |
+| `src/graph/dedup.ts` | Incremental dedup. |
+| `src/graph/maintenance.ts` | Retention + dedup + PageRank orchestration. |
+| `src/logger.ts` | Async independent logger. |
 
-- mode-aware in-memory cache;
-- timeout wrapper;
-- per-session circuit breaker;
-- bounded circuit/cache maps;
-- status/debug lines.
+## Future Architecture Work
 
-The timeout bounds hook latency but does not cancel synchronous database or in-flight recall work. Future cooperative deadlines should check budget inside vector scan, graph walk, PPR, and assembly stages.
+Known next-level improvements:
 
-## Logging
-
-Routine Graph Memory info/debug output can be written to an independent daily file (`/tmp/openclaw/graph-memory-YYYY-MM-DD.log` by default). Warnings and errors remain visible in the OpenClaw host log.
+- cooperative recall deadline checks inside vector scan, graph walk, and PPR;
+- unified database transaction/session queue;
+- indexed/vector-extension-backed search to avoid full vector scans;
+- incremental or less frequent PageRank refresh;
+- stronger provenance rendering in recalled context.

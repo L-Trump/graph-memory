@@ -4,6 +4,18 @@ All notable changes to Graph Memory should be documented in this file.
 
 This project follows a lightweight changelog format inspired by [Keep a Changelog](https://keepachangelog.com/) and uses semantic versioning where practical.
 
+## [Unreleased]
+
+### Changed
+
+- Reworked README and README_CN into product-grade documentation modeled after mature OpenClaw memory plugins: motivation, capability matrix, quick start, AI-safe install notes, recommended config, architecture, core features, tools, operations, troubleshooting, FAQ, glossary, and safety guidance.
+- Expanded architecture, configuration, diagnostics, and agent-tool docs into operator/developer deep dives.
+
+### Added
+
+- Added OpenClaw integration playbook for safe runtime deployment and smoke testing.
+- Added release checklist for source, tests, docs, runtime safety, and post-deployment verification.
+
 ## [3.0.0] - 2026-06-16
 
 ### Added
