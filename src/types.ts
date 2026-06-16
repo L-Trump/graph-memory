@@ -220,6 +220,12 @@ export interface GmConfig {
   };
   /** 向量去重阈值，余弦相似度超过此值视为重复 (0-1) */
   dedupThreshold: number;
+  /** 每次维护最多合并的向量重复节点数；0 表示仅检测不合并，默认 200 */
+  dedupMaxMergesPerRun?: number;
+  /** 每次维护最多检测的重复向量对数；0 表示不限制，默认 1000 */
+  dedupMaxPairsPerRun?: number;
+  /** 每次维护最多处理的新增/变更向量数；0 表示回退到全量扫描，默认 200 */
+  dedupMaxPendingVectorsPerRun?: number;
   /** PageRank 阻尼系数 */
   pagerankDamping: number;
   /** PageRank 迭代次数 */
@@ -271,6 +277,9 @@ export const DEFAULT_CONFIG: GmConfig = {
   recallMaxDepth: 2,
   freshTailCount: 10,
   dedupThreshold: 0.90,
+  dedupMaxMergesPerRun: 200,
+  dedupMaxPairsPerRun: 1000,
+  dedupMaxPendingVectorsPerRun: 200,
   pagerankDamping: 0.85,
   pagerankIterations: 20,
   extractionRecentTurns: 3,

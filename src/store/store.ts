@@ -593,28 +593,88 @@ export function saveVector(db: DatabaseSyncInstance, nodeId: string, content: st
   const hash = createHash("md5").update(content).digest("hex");
   const f32 = new Float32Array(vec);
   const blob = new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength);
-  db.prepare(`INSERT INTO gm_vectors (node_id, content_hash, embedding) VALUES (?,?,?)
-    ON CONFLICT(node_id) DO UPDATE SET content_hash=excluded.content_hash, embedding=excluded.embedding`)
-    .run(nodeId, hash, blob);
+  const now = Date.now();
+  db.prepare(`INSERT INTO gm_vectors (node_id, content_hash, embedding, updated_at, dedup_checked_at) VALUES (?,?,?,?,0)
+    ON CONFLICT(node_id) DO UPDATE SET content_hash=excluded.content_hash, embedding=excluded.embedding, updated_at=excluded.updated_at, dedup_checked_at=0
+    WHERE gm_vectors.content_hash != excluded.content_hash`)
+    .run(nodeId, hash, blob, now);
 }
 
 export function getVectorHash(db: DatabaseSyncInstance, nodeId: string): string | null {
   return (db.prepare("SELECT content_hash FROM gm_vectors WHERE node_id=?").get(nodeId) as any)?.content_hash ?? null;
 }
 
-/** 获取所有向量（供去重/聚类用） */
-export function getAllVectors(db: DatabaseSyncInstance): Array<{ nodeId: string; embedding: Float32Array }> {
-  const rows = db.prepare(`
-    SELECT v.node_id, v.embedding FROM gm_vectors v
-    JOIN gm_nodes n ON n.id = v.node_id WHERE n.status = 'active'
-  `).all() as any[];
+export type VectorRow = { nodeId: string; type: GmNode["type"]; embedding: Float32Array; updatedAt: number; dedupCheckedAt: number };
+
+function vectorRowsFromSql(rows: any[]): VectorRow[] {
   return rows.map(r => {
     const raw = r.embedding as Uint8Array;
     return {
       nodeId: r.node_id,
+      type: r.type,
       embedding: new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4),
+      updatedAt: r.updated_at ?? 0,
+      dedupCheckedAt: r.dedup_checked_at ?? 0,
     };
   });
+}
+
+/** 获取所有向量（供去重/聚类用） */
+export function getAllVectors(db: DatabaseSyncInstance): VectorRow[] {
+  const rows = db.prepare(`
+    SELECT v.node_id, n.type, v.embedding, COALESCE(v.updated_at, n.updated_at, 0) AS updated_at, COALESCE(v.dedup_checked_at, 0) AS dedup_checked_at FROM gm_vectors v
+    JOIN gm_nodes n ON n.id = v.node_id WHERE n.status = 'active'
+    ORDER BY n.type, v.node_id
+  `).all() as any[];
+  return vectorRowsFromSql(rows);
+}
+
+/** 获取需要增量去重的向量（新增或 embedding 更新后未检查） */
+export function countPendingDedupVectors(db: DatabaseSyncInstance): number {
+  return (db.prepare(`
+    SELECT COUNT(*) AS c FROM gm_vectors v
+    JOIN gm_nodes n ON n.id = v.node_id
+    WHERE n.status = 'active' AND COALESCE(v.dedup_checked_at, 0) < COALESCE(v.updated_at, n.updated_at, 0)
+  `).get() as any)?.c ?? 0;
+}
+
+export function getPendingDedupVectors(db: DatabaseSyncInstance, limit: number): VectorRow[] {
+  const cappedLimit = Math.max(0, Math.floor(limit));
+  if (cappedLimit === 0) return [];
+  const rows = db.prepare(`
+    SELECT v.node_id, n.type, v.embedding, COALESCE(v.updated_at, n.updated_at, 0) AS updated_at, COALESCE(v.dedup_checked_at, 0) AS dedup_checked_at FROM gm_vectors v
+    JOIN gm_nodes n ON n.id = v.node_id
+    WHERE n.status = 'active' AND COALESCE(v.dedup_checked_at, 0) < COALESCE(v.updated_at, n.updated_at, 0)
+    ORDER BY v.dedup_checked_at ASC, COALESCE(v.updated_at, n.updated_at, 0) ASC, v.node_id ASC
+    LIMIT ?
+  `).all(cappedLimit) as any[];
+  return vectorRowsFromSql(rows);
+}
+
+/** 获取同类型已检查活跃向量候选，排除当前 pending 节点集合 */
+export function getDedupCandidateVectorsByType(db: DatabaseSyncInstance, type: GmNode["type"], excludeNodeIds: string[] = []): VectorRow[] {
+  const exclude = new Set(excludeNodeIds);
+  const rows = db.prepare(`
+    SELECT v.node_id, n.type, v.embedding, COALESCE(v.updated_at, n.updated_at, 0) AS updated_at, COALESCE(v.dedup_checked_at, 0) AS dedup_checked_at FROM gm_vectors v
+    JOIN gm_nodes n ON n.id = v.node_id
+    WHERE n.status = 'active' AND n.type = ?
+      AND COALESCE(v.dedup_checked_at, 0) >= COALESCE(v.updated_at, n.updated_at, 0)
+    ORDER BY v.node_id ASC
+  `).all(type) as any[];
+  return vectorRowsFromSql(rows).filter(row => !exclude.has(row.nodeId));
+}
+
+export function markVectorsDedupChecked(db: DatabaseSyncInstance, nodeIds: string[], checkedAt = Date.now()): void {
+  if (nodeIds.length === 0) return;
+  const stmt = db.prepare("UPDATE gm_vectors SET dedup_checked_at=? WHERE node_id=?");
+  db.exec("BEGIN");
+  try {
+    for (const nodeId of nodeIds) stmt.run(checkedAt, nodeId);
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
 }
 
 export type ScoredNode = { node: GmNode; score: number };

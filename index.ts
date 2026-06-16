@@ -344,6 +344,9 @@ function normalizeRuntimeConfig(raw: Record<string, any>): GmConfig {
     recallCacheTtlMs: clampNumber(raw.recallCacheTtlMs, DEFAULT_CONFIG.recallCacheTtlMs ?? 15_000, 0, 120_000),
     recallCircuitBreakerMaxTimeouts: clampNumber(raw.recallCircuitBreakerMaxTimeouts, DEFAULT_CONFIG.recallCircuitBreakerMaxTimeouts ?? 3, 1, 20),
     recallCircuitBreakerCooldownMs: clampNumber(raw.recallCircuitBreakerCooldownMs, DEFAULT_CONFIG.recallCircuitBreakerCooldownMs ?? 60_000, 1_000, 600_000),
+    dedupMaxMergesPerRun: clampNumber(raw.dedupMaxMergesPerRun, DEFAULT_CONFIG.dedupMaxMergesPerRun ?? 200, 0, 100_000),
+    dedupMaxPairsPerRun: clampNumber(raw.dedupMaxPairsPerRun, DEFAULT_CONFIG.dedupMaxPairsPerRun ?? 1000, 0, 10_000_000),
+    dedupMaxPendingVectorsPerRun: clampNumber(raw.dedupMaxPendingVectorsPerRun, DEFAULT_CONFIG.dedupMaxPendingVectorsPerRun ?? 200, 0, 100_000),
     statusDebugEnabled: raw.statusDebugEnabled !== false,
   };
 }
@@ -1912,9 +1915,17 @@ ${suggestionsText}
             ? `retention_messages=${result.retention.messagesDeleted}, retention_recalled=${result.retention.recalledDeleted}, `
             : "";
           gmLog.info(
-            `[graph-memory] maintenance: ${result.durationMs}ms, ` +
+            `[graph-memory] maintenance: duration=${result.durationMs}ms, ` +
             retentionText +
-            `dedup=${result.dedup.merged}, ` +
+            `dedup_mode=${result.dedup.incremental ? "incremental" : "full"}, ` +
+            `dedup_ms=${result.dedupDurationMs}, ` +
+            `dedup_pending_before=${result.dedup.pendingBefore}, ` +
+            `dedup_pending_after=${result.dedup.pendingAfter}, ` +
+            `dedup_checked=${result.dedup.checkedVectors}, ` +
+            `dedup_comparisons=${result.dedup.comparisons}, ` +
+            `dedup_pairs=${result.dedup.pairs.length}, ` +
+            `dedup_merged=${result.dedup.merged}, ` +
+            `pagerank_ms=${result.pagerankDurationMs}, ` +
             `top_pr=${result.pagerank.topK.slice(0, 3).map((n: any) => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
           );
         } catch (err) {
@@ -2261,10 +2272,22 @@ ${suggestionsText}
                 `  protected sessions：${result.retention.protectedSessionCount}，cutoff：${new Date(result.retention.cutoff).toISOString()}`,
               ]
             : [];
+          gmLog.info(
+            `[graph-memory] gm_maintain: duration=${result.durationMs}ms, ` +
+            `dedup_mode=${result.dedup.incremental ? "incremental" : "full"}, ` +
+            `dedup_ms=${result.dedupDurationMs}, ` +
+            `dedup_pending_before=${result.dedup.pendingBefore}, ` +
+            `dedup_pending_after=${result.dedup.pendingAfter}, ` +
+            `dedup_checked=${result.dedup.checkedVectors}, ` +
+            `dedup_comparisons=${result.dedup.comparisons}, ` +
+            `dedup_pairs=${result.dedup.pairs.length}, ` +
+            `dedup_merged=${result.dedup.merged}, ` +
+            `pagerank_ms=${result.pagerankDurationMs}`,
+          );
           const text = [
             `图维护完成（${result.durationMs}ms）`,
             ...retentionLines,
-            `去重：发现 ${result.dedup.pairs.length} 对相似节点，合并 ${result.dedup.merged} 对`,
+            `去重：mode=${result.dedup.incremental ? "incremental" : "full"}，pending ${result.dedup.pendingBefore} → ${result.dedup.pendingAfter}，checked ${result.dedup.checkedVectors}，comparisons ${result.dedup.comparisons}，发现 ${result.dedup.pairs.length} 对，合并 ${result.dedup.merged} 对（${result.dedupDurationMs}ms）`,
             ...(result.dedup.pairs.length > 0
               ? result.dedup.pairs.slice(0, 5).map(p =>
                   `  "${p.nameA}" ≈ "${p.nameB}" (${(p.similarity * 100).toFixed(1)}%)`)

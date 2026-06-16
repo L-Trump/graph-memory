@@ -24,6 +24,8 @@ export interface MaintenanceResult {
   dedup: DedupResult;
   pagerank: GlobalPageRankResult;
   durationMs: number;
+  dedupDurationMs: number;
+  pagerankDurationMs: number;
 }
 
 export type MaintenanceOptions = {
@@ -52,18 +54,24 @@ export async function runMaintenance(
   invalidateGraphCache();
 
   // 1. 去重（chunked async，每 YIELD_EVERY 次比较后让出主线程）
+  const dedupStart = Date.now();
   const dedupResult = await dedup(db, cfg);
+  const dedupDurationMs = Date.now() - dedupStart;
 
   // 去重可能合并了节点，再清一次缓存
   if (dedupResult.merged > 0) invalidateGraphCache();
 
   // 2. 全局 PageRank（基线）
+  const pagerankStart = Date.now();
   const pagerankResult = computeGlobalPageRank(db, cfg);
+  const pagerankDurationMs = Date.now() - pagerankStart;
 
   return {
     retention,
     dedup: dedupResult,
     pagerank: pagerankResult,
     durationMs: Date.now() - start,
+    dedupDurationMs,
+    pagerankDurationMs,
   };
 }

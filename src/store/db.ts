@@ -38,6 +38,7 @@ export function getDb(dbPath: string): DatabaseSyncInstance {
   }
 
   _db = new DatabaseSync(resolved);
+  _db.exec("PRAGMA busy_timeout = 5000");
   _db.exec("PRAGMA journal_mode = WAL");
   _db.exec("PRAGMA foreign_keys = ON");
   migrate(_db);
@@ -80,6 +81,7 @@ function recreateNodeIndexes(db: DatabaseSyncInstance): void {
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_nodes_name ON gm_nodes(name);
     CREATE INDEX IF NOT EXISTS ix_gm_nodes_type_status ON gm_nodes(type, status);
+    CREATE INDEX IF NOT EXISTS ix_gm_nodes_status_rank ON gm_nodes(status, pagerank DESC, validated_count DESC, updated_at DESC);
     CREATE INDEX IF NOT EXISTS ix_gm_nodes_community ON gm_nodes(community_id);
   `);
 }
@@ -87,7 +89,7 @@ function recreateNodeIndexes(db: DatabaseSyncInstance): void {
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes, m12_recalled, m13_access_tracking, m14_session_type, m15_retention_indexes];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_edge_flexible, m8_flags, m9_topic_nodes, m10_belief, m11_scopes, m12_recalled, m13_access_tracking, m14_session_type, m15_retention_indexes, m16_maintenance_indexes];
 
 function m11_scopes(db: DatabaseSyncInstance): void {
   try {
@@ -235,12 +237,71 @@ function m14_session_type(db: DatabaseSyncInstance): void {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
   }
+  ensureMaintenanceSchema(db);
+}
+
+function ensureMaintenanceSchema(db: DatabaseSyncInstance): void {
+  // Defensive guard for dev databases that may have recorded an earlier m16
+  // before dedup tracking was merged into it. No-op for fresh/v15 migrations.
+  if (!tableHasColumn(db, "gm_vectors", "dedup_checked_at")) {
+    db.exec("ALTER TABLE gm_vectors ADD COLUMN dedup_checked_at INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!tableHasColumn(db, "gm_vectors", "updated_at")) {
+    db.exec("ALTER TABLE gm_vectors ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0");
+    db.exec("UPDATE gm_vectors SET updated_at = COALESCE((SELECT updated_at FROM gm_nodes WHERE gm_nodes.id = gm_vectors.node_id), 0) WHERE updated_at = 0");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_dedup_state (
+      key        TEXT PRIMARY KEY,
+      value      INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_vectors_dedup_pending ON gm_vectors(dedup_checked_at, updated_at, node_id);
+  `);
 }
 
 function m15_retention_indexes(db: DatabaseSyncInstance): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS ix_gm_msg_retention ON gm_messages(created_at, session_id);
     CREATE INDEX IF NOT EXISTS ix_gm_recalled_retention ON gm_recalled(created_at, session_id);
+  `);
+}
+
+function tableHasColumn(db: DatabaseSyncInstance, table: string, column: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
+  return rows.some(row => row.name === column);
+}
+
+function m16_maintenance_indexes(db: DatabaseSyncInstance): void {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS ix_gm_nodes_status_rank ON gm_nodes(status, pagerank DESC, validated_count DESC, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS ix_gm_nodes_status_type ON gm_nodes(status, type);
+
+    CREATE TABLE IF NOT EXISTS gm_dedup_state (
+      key        TEXT PRIMARY KEY,
+      value      INTEGER NOT NULL
+    );
+  `);
+
+  // Edge names were introduced by m7_edge_flexible. Keep this migration
+  // schema-aware so partially migrated or legacy test databases fail softly
+  // instead of aborting on "no such column: name".
+  if (tableHasColumn(db, "gm_edges", "name")) {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS ix_gm_edges_from_to_name ON gm_edges(from_id, to_id, name);
+      CREATE INDEX IF NOT EXISTS ix_gm_edges_to_from_name ON gm_edges(to_id, from_id, name);
+    `);
+  }
+
+  if (!tableHasColumn(db, "gm_vectors", "dedup_checked_at")) {
+    db.exec("ALTER TABLE gm_vectors ADD COLUMN dedup_checked_at INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!tableHasColumn(db, "gm_vectors", "updated_at")) {
+    db.exec("ALTER TABLE gm_vectors ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0");
+    db.exec("UPDATE gm_vectors SET updated_at = COALESCE((SELECT updated_at FROM gm_nodes WHERE gm_nodes.id = gm_vectors.node_id), 0) WHERE updated_at = 0");
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS ix_gm_vectors_dedup_pending ON gm_vectors(dedup_checked_at, updated_at, node_id);
   `);
 }
 
@@ -264,6 +325,7 @@ function m1_core(db: DatabaseSyncInstance): void {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_nodes_name ON gm_nodes(name);
     CREATE INDEX IF NOT EXISTS ix_gm_nodes_type_status ON gm_nodes(type, status);
+    CREATE INDEX IF NOT EXISTS ix_gm_nodes_status_rank ON gm_nodes(status, pagerank DESC, validated_count DESC, updated_at DESC);
     CREATE INDEX IF NOT EXISTS ix_gm_nodes_community ON gm_nodes(community_id);
 
     CREATE TABLE IF NOT EXISTS gm_edges (

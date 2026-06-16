@@ -154,6 +154,24 @@
         "default": 0.9,
         "description": "向量去重阈值：余弦相似度超过此值视为重复节点 (0-1)"
       },
+      "dedupMaxMergesPerRun": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 200,
+        "description": "每次维护最多合并的重复节点数；0 表示只检测不合并，避免单次维护长时间锁库"
+      },
+      "dedupMaxPairsPerRun": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 1000,
+        "description": "每次维护最多返回/处理的重复向量对数；0 表示不限制"
+      },
+      "dedupMaxPendingVectorsPerRun": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 200,
+        "description": "每次维护最多处理的新增/变更向量数；0 表示回退到全量扫描"
+      },
       "pagerankDamping": {
         "type": "number",
         "default": 0.85,
@@ -462,6 +480,18 @@
     "statusDebugEnabled": {
       "label": "Status Debug Lines",
       "help": "Show Graph Memory status lines in /status when verbose/trace is enabled."
+    },
+    "dedupMaxMergesPerRun": {
+      "label": "Dedup Max Merges Per Run",
+      "help": "Cap vector dedup merges during one maintenance pass to avoid long DB locks."
+    },
+    "dedupMaxPairsPerRun": {
+      "label": "Dedup Max Pairs Per Run",
+      "help": "Cap duplicate pairs produced by one maintenance pass; 0 disables the cap."
+    },
+    "dedupMaxPendingVectorsPerRun": {
+      "label": "Dedup Max Pending Vectors Per Run",
+      "help": "Cap new/changed vectors checked during one incremental dedup pass; 0 falls back to full scan."
     },
     "independentLogFile.enabled": {
       "label": "Independent Log File",
