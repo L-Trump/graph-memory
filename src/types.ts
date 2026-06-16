@@ -279,7 +279,7 @@ export const DEFAULT_CONFIG: GmConfig = {
   dedupThreshold: 0.90,
   dedupMaxMergesPerRun: 200,
   dedupMaxPairsPerRun: 1000,
-  dedupMaxPendingVectorsPerRun: 200,
+  dedupMaxPendingVectorsPerRun: 2000,
   pagerankDamping: 0.85,
   pagerankIterations: 20,
   extractionRecentTurns: 3,

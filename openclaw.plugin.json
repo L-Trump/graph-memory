@@ -169,7 +169,7 @@
       "dedupMaxPendingVectorsPerRun": {
         "type": "integer",
         "minimum": 0,
-        "default": 200,
+        "default": 2000,
         "description": "每次维护最多处理的新增/变更向量数；0 表示回退到全量扫描"
       },
       "pagerankDamping": {

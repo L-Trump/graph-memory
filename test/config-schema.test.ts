@@ -46,7 +46,7 @@ describe("graph-memory manifest config schema", () => {
     expect(props.statusDebugEnabled).toMatchObject({ type: "boolean", default: true });
     expect(props.dedupMaxMergesPerRun).toMatchObject({ type: "integer", minimum: 0, default: 200 });
     expect(props.dedupMaxPairsPerRun).toMatchObject({ type: "integer", minimum: 0, default: 1000 });
-    expect(props.dedupMaxPendingVectorsPerRun).toMatchObject({ type: "integer", minimum: 0, default: 200 });
+    expect(props.dedupMaxPendingVectorsPerRun).toMatchObject({ type: "integer", minimum: 0, default: 2000 });
 
     expect(props.independentLogFile).toMatchObject({
       type: "object",
