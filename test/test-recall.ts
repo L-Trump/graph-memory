@@ -14,7 +14,7 @@ const db = getDb("/tmp/gm-test-integration.db");
 const embedFn = await createEmbedFn({ apiKey: embCfg.apiKey, baseURL: embCfg.baseURL, model: embCfg.model, dimensions: embCfg.dimensions });
 if (!embedFn) { console.error("no embed fn"); process.exit(1); }
 
-const recaller = new Recaller(db, { dbPath: "/tmp/gm-test-integration.db", recallMaxNodes: 50, recallMaxDepth: 1, compactTurnCount: 6, freshTailCount: 10, dedupThreshold: 0.90, pagerankDamping: 0.85, pagerankIterations: 20, extractionRecentTurns: 3 });
+const recaller = new Recaller(db, { dbPath: "/tmp/gm-test-integration.db", recallMaxNodes: 50, recallMaxDepth: 1, compactTurnCount: 6, dedupThreshold: 0.90, pagerankDamping: 0.85, pagerankIterations: 20, extractionRecentTurns: 3 });
 recaller.setEmbedFn(embedFn);
 
 const result = await recaller.recallV2("npm 安装 graph-memory 知识图谱");

@@ -134,6 +134,18 @@
         "default": 6,
         "description": "每隔多少 agent_end 轮执行周期性 topic/session 归纳和轻量 PageRank；compaction hooks 也会标记 active nodes 供压缩后补回"
       },
+      "compactActiveNodesEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "compaction 后是否将当前 session 的 compact-active nodes 注入 stable 层；默认关闭，适合需要跨压缩保留活跃图谱上下文的长会话。"
+      },
+      "compactActiveNodesMax": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10000,
+        "default": 100,
+        "description": "compact-active nodes 注入 stable 层的最大数量；仅在 compactActiveNodesEnabled=true 时生效。"
+      },
       "recallMaxNodes": {
         "type": "integer",
         "default": 15,
@@ -143,11 +155,6 @@
         "type": "integer",
         "default": 2,
         "description": "图遍历深度（从种子节点出发走几跳）"
-      },
-      "freshTailCount": {
-        "type": "integer",
-        "default": 10,
-        "description": "(deprecated) 已改为按用户轮次切分，此参数不再使用"
       },
       "dedupThreshold": {
         "type": "number",
@@ -504,6 +511,14 @@
     "independentLogFile.maxFileBytes": {
       "label": "Independent Log Max Bytes",
       "help": "Size threshold for log rotation."
+    },
+    "compactActiveNodesEnabled": {
+      "label": "Compact Active Nodes",
+      "help": "After compaction, re-inject active session graph nodes into the stable context layer."
+    },
+    "compactActiveNodesMax": {
+      "label": "Compact Active Nodes Max",
+      "help": "Maximum number of compact-active nodes to inject when enabled."
     }
   },
   "configContracts": {

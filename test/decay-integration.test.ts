@@ -95,7 +95,7 @@ describe("Decay Integration — recall with decay scoring", () => {
       compactTurnCount: 6,
       recallMaxNodes: 45,
       recallMaxDepth: 2,
-      freshTailCount: 10,
+
       dedupThreshold: 0.90,
       pagerankDamping: 0.85,
       pagerankIterations: 5,

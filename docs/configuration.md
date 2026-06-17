@@ -110,8 +110,9 @@ Cache key includes session, `autoRecallMode`, history query, and prompt query.
 | `autoRecallMode` | `full` / `index` | `full` | `full` returns dynamic `prependContext`; `index` writes a compact recall index into the user message. |
 | `recallMaxNodes` | integer | `15` | Approximate recalled node budget across L1/L2/L3. |
 | `recallMaxDepth` | integer | `2` | Graph walk depth from seeds. Higher values cost more. |
-| `freshTailCount` | integer | see manifest | Recent conversation tail considered for context building. |
 | `compactTurnCount` | integer | `6` | Periodic induction/maintenance cadence in turns. |
+| `compactActiveNodesEnabled` | boolean | `false` | After compaction, re-inject compact-active session nodes into the stable layer. |
+| `compactActiveNodesMax` | integer | `100` | Maximum compact-active nodes injected when the feature is enabled. |
 
 ## Storage and Models
 

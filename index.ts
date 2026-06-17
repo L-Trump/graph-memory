@@ -348,6 +348,8 @@ function normalizeRuntimeConfig(raw: Record<string, any>): GmConfig {
     dedupMaxPairsPerRun: clampNumber(raw.dedupMaxPairsPerRun, DEFAULT_CONFIG.dedupMaxPairsPerRun ?? 1000, 0, 10_000_000),
     dedupMaxPendingVectorsPerRun: clampNumber(raw.dedupMaxPendingVectorsPerRun, DEFAULT_CONFIG.dedupMaxPendingVectorsPerRun ?? 200, 0, 100_000),
     statusDebugEnabled: raw.statusDebugEnabled !== false,
+    compactActiveNodesEnabled: raw.compactActiveNodesEnabled === true,
+    compactActiveNodesMax: clampNumber(raw.compactActiveNodesMax, DEFAULT_CONFIG.compactActiveNodesMax ?? 100, 0, 10_000),
   };
 }
 
@@ -1524,7 +1526,7 @@ ${suggestionsText}
         ...getScopeHotNodes(db, getScopesForSession(db, sessionKey ?? sessionId)).map(n => n.id),
       ]);
       let sessionNodes = getBySession(db, sessionId).filter(n => !stableIds.has(n.id));
-      const maxCompactActiveNodes = Math.max(0, cfg.compactActiveNodesMax ?? DEFAULT_CONFIG.compactActiveNodesMax ?? 100);
+      const maxCompactActiveNodes = Math.max(0, cfg.compactActiveNodesMax ?? 100);
 
       // ── Active nodes 数量裁剪：compact 时一次性确定，避免 before_prompt_build 每轮裁剪造成缓存不稳定 ────────
       if (sessionNodes.length > maxCompactActiveNodes) {

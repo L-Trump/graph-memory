@@ -211,7 +211,6 @@ export interface GmConfig {
   compactTurnCount: number;
   recallMaxNodes: number;
   recallMaxDepth: number;
-  freshTailCount: number;
   embedding?: EmbeddingConfig;
   llm?: {
     apiKey?: string;
@@ -275,7 +274,6 @@ export const DEFAULT_CONFIG: GmConfig = {
   compactTurnCount: 6,
   recallMaxNodes: 15,
   recallMaxDepth: 2,
-  freshTailCount: 10,
   dedupThreshold: 0.90,
   dedupMaxMergesPerRun: 200,
   dedupMaxPairsPerRun: 1000,
