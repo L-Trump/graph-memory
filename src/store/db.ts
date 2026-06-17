@@ -86,6 +86,22 @@ function recreateNodeIndexes(db: DatabaseSyncInstance): void {
   `);
 }
 
+function ensureNodeFts(db: DatabaseSyncInstance): void {
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS gm_nodes_fts USING fts5(
+        name,
+        description,
+        content,
+        content=gm_nodes,
+        content_rowid=rowid
+      );
+    `);
+  } catch {
+    // FTS5 may be unavailable; keep LIKE fallback behavior.
+  }
+}
+
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
@@ -184,10 +200,15 @@ function m14_session_type(db: DatabaseSyncInstance): void {
     return; // already migrated
   }
 
-  db.exec("PRAGMA foreign_keys = OFF");
-  db.exec("PRAGMA legacy_alter_table = ON");
+  addColumnIfMissing(db, "gm_nodes", "flags", "flags TEXT NOT NULL DEFAULT '[]'");
+  addColumnIfMissing(db, "gm_nodes", "belief", "belief REAL NOT NULL DEFAULT 0.5");
+  addColumnIfMissing(db, "gm_nodes", "success_count", "success_count INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "gm_nodes", "failure_count", "failure_count INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "gm_nodes", "last_signal_at", "last_signal_at INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "gm_nodes", "access_count", "access_count INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "gm_nodes", "last_accessed_at", "last_accessed_at INTEGER NOT NULL DEFAULT 0");
 
-  try {
+  withNodeRebuildPragmas(db, () => {
     // 0. Clean up possible residue from an interrupted previous migration
     db.exec("DROP TABLE IF EXISTS gm_nodes_new");
 
@@ -216,8 +237,22 @@ function m14_session_type(db: DatabaseSyncInstance): void {
       )
     `);
 
-    // 2. Copy data
-    db.exec("INSERT INTO gm_nodes_new SELECT * FROM gm_nodes");
+    // 2. Copy data with explicit columns so partial legacy schemas stay migratable
+    db.exec(`
+      INSERT INTO gm_nodes_new (
+        id, type, name, description, content, status, validated_count,
+        source_sessions, community_id, pagerank, created_at, updated_at, flags,
+        belief, success_count, failure_count, last_signal_at, access_count, last_accessed_at
+      )
+      SELECT
+        id, type, name, COALESCE(description, ''), content,
+        COALESCE(status, 'active'), COALESCE(validated_count, 1),
+        COALESCE(source_sessions, '[]'), community_id, COALESCE(pagerank, 0),
+        created_at, updated_at, COALESCE(flags, '[]'),
+        COALESCE(belief, 0.5), COALESCE(success_count, 0), COALESCE(failure_count, 0),
+        COALESCE(last_signal_at, 0), COALESCE(access_count, 0), COALESCE(last_accessed_at, 0)
+      FROM gm_nodes
+    `);
 
     // 3. Drop old table
     db.exec("DROP TABLE gm_nodes");
@@ -228,16 +263,14 @@ function m14_session_type(db: DatabaseSyncInstance): void {
     // 5. Recreate indexes and FTS triggers
     recreateNodeIndexes(db);
     recreateNodeFtsTriggers(db);
-  } finally {
-    db.exec("PRAGMA foreign_keys = ON");
-  }
+  });
 }
 
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
   }
-  ensureMaintenanceSchema(db);
+  ensureFinalSchema(db);
 }
 
 function ensureMaintenanceSchema(db: DatabaseSyncInstance): void {
@@ -260,15 +293,174 @@ function ensureMaintenanceSchema(db: DatabaseSyncInstance): void {
 }
 
 function m15_retention_indexes(db: DatabaseSyncInstance): void {
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS ix_gm_msg_retention ON gm_messages(created_at, session_id);
-    CREATE INDEX IF NOT EXISTS ix_gm_recalled_retention ON gm_recalled(created_at, session_id);
-  `);
+  if (tableExists(db, "gm_messages")) {
+    db.exec("CREATE INDEX IF NOT EXISTS ix_gm_msg_retention ON gm_messages(created_at, session_id)");
+  }
+  if (tableExists(db, "gm_recalled")) {
+    db.exec("CREATE INDEX IF NOT EXISTS ix_gm_recalled_retention ON gm_recalled(created_at, session_id)");
+  }
 }
 
 function tableHasColumn(db: DatabaseSyncInstance, table: string, column: string): boolean {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
   return rows.some(row => row.name === column);
+}
+
+function tableExists(db: DatabaseSyncInstance, table: string): boolean {
+  const row = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','virtual table') AND name=?").get(table) as any;
+  return Boolean(row?.name);
+}
+
+function addColumnIfMissing(db: DatabaseSyncInstance, table: string, column: string, definition: string): void {
+  if (!tableExists(db, table) || tableHasColumn(db, table, column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+}
+
+function pragmaNumber(db: DatabaseSyncInstance, name: string): number {
+  const row = db.prepare(`PRAGMA ${name}`).get() as Record<string, number> | undefined;
+  return Number(row?.[name] ?? 0);
+}
+
+function restorePragma(db: DatabaseSyncInstance, name: string, value: number): void {
+  db.exec(`PRAGMA ${name} = ${value ? "ON" : "OFF"}`);
+}
+
+function withNodeRebuildPragmas(db: DatabaseSyncInstance, fn: () => void): void {
+  const foreignKeys = pragmaNumber(db, "foreign_keys");
+  const legacyAlterTable = pragmaNumber(db, "legacy_alter_table");
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec("PRAGMA legacy_alter_table = ON");
+  try {
+    fn();
+  } finally {
+    restorePragma(db, "legacy_alter_table", legacyAlterTable);
+    restorePragma(db, "foreign_keys", foreignKeys);
+  }
+}
+
+function ensureFinalSchema(db: DatabaseSyncInstance): void {
+  if (!tableExists(db, "gm_nodes")) return;
+
+  addColumnIfMissing(db, "gm_nodes", "flags", "flags TEXT NOT NULL DEFAULT '[]'");
+  addColumnIfMissing(db, "gm_nodes", "belief", "belief REAL NOT NULL DEFAULT 0.5");
+  addColumnIfMissing(db, "gm_nodes", "success_count", "success_count INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "gm_nodes", "failure_count", "failure_count INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "gm_nodes", "last_signal_at", "last_signal_at INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "gm_nodes", "access_count", "access_count INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "gm_nodes", "last_accessed_at", "last_accessed_at INTEGER NOT NULL DEFAULT 0");
+  recreateNodeIndexes(db);
+  ensureNodeFts(db);
+  if (tableExists(db, "gm_nodes_fts")) recreateNodeFtsTriggers(db);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_edges (
+      id          TEXT PRIMARY KEY,
+      from_id     TEXT NOT NULL,
+      to_id       TEXT NOT NULL,
+      name        TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      session_id  TEXT NOT NULL,
+      created_at  INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS gm_messages (
+      id          TEXT PRIMARY KEY,
+      session_id  TEXT NOT NULL,
+      turn_index  INTEGER NOT NULL,
+      role        TEXT NOT NULL,
+      content     TEXT NOT NULL,
+      extracted   INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS gm_signals (
+      id          TEXT PRIMARY KEY,
+      session_id  TEXT NOT NULL,
+      turn_index  INTEGER NOT NULL,
+      type        TEXT NOT NULL,
+      data        TEXT NOT NULL DEFAULT '{}',
+      processed   INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS gm_vectors (
+      node_id          TEXT PRIMARY KEY REFERENCES gm_nodes(id),
+      content_hash     TEXT NOT NULL,
+      embedding        BLOB NOT NULL,
+      updated_at       INTEGER NOT NULL DEFAULT 0,
+      dedup_checked_at INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS gm_communities (
+      id          TEXT PRIMARY KEY,
+      summary     TEXT NOT NULL,
+      node_count  INTEGER NOT NULL DEFAULT 0,
+      embedding   BLOB,
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS gm_scopes (
+      scope_name  TEXT NOT NULL,
+      session_id  TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (scope_name, session_id)
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_scopes_session ON gm_scopes(session_id);
+
+    CREATE TABLE IF NOT EXISTS gm_recalled (
+      id            TEXT PRIMARY KEY,
+      session_id    TEXT NOT NULL,
+      turn_index   INTEGER NOT NULL,
+      node_id      TEXT NOT NULL,
+      node_name    TEXT NOT NULL,
+      node_type    TEXT NOT NULL,
+      tier         TEXT NOT NULL,
+      semantic     REAL,
+      ppr          REAL,
+      combined     REAL,
+      created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_session ON gm_recalled(session_id, turn_index);
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_node ON gm_recalled(node_id);
+    CREATE INDEX IF NOT EXISTS ix_gm_recalled_retention ON gm_recalled(created_at, session_id);
+
+    CREATE TABLE IF NOT EXISTS gm_belief_signals (
+      id TEXT PRIMARY KEY,
+      node_id TEXT NOT NULL,
+      node_name TEXT NOT NULL,
+      signal_type TEXT NOT NULL,
+      weight REAL NOT NULL DEFAULT 1.0,
+      context TEXT NOT NULL DEFAULT '{}',
+      session_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ix_belief_sig_node ON gm_belief_signals(node_id, created_at);
+    CREATE INDEX IF NOT EXISTS ix_belief_sig_session ON gm_belief_signals(session_id);
+  `);
+
+  if (tableExists(db, "gm_messages")) {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS ix_gm_msg_session ON gm_messages(session_id, turn_index);
+      CREATE INDEX IF NOT EXISTS ix_gm_msg_retention ON gm_messages(created_at, session_id);
+    `);
+  }
+  if (tableExists(db, "gm_signals")) {
+    db.exec("CREATE INDEX IF NOT EXISTS ix_gm_sig_session ON gm_signals(session_id, processed)");
+  }
+  if (tableExists(db, "gm_edges")) {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS ix_gm_edges_from ON gm_edges(from_id);
+      CREATE INDEX IF NOT EXISTS ix_gm_edges_to ON gm_edges(to_id);
+    `);
+    if (tableHasColumn(db, "gm_edges", "name")) {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS ix_gm_edges_from_to_name ON gm_edges(from_id, to_id, name);
+        CREATE INDEX IF NOT EXISTS ix_gm_edges_to_from_name ON gm_edges(to_id, from_id, name);
+      `);
+    }
+  }
+  if (tableExists(db, "gm_vectors")) ensureMaintenanceSchema(db);
 }
 
 function m16_maintenance_indexes(db: DatabaseSyncInstance): void {
@@ -381,20 +573,8 @@ function m3_signals(db: DatabaseSyncInstance): void {
 // ─── FTS5 全文索引 ───────────────────────────────────────────
 
 function m4_fts5(db: DatabaseSyncInstance): void {
-  try {
-    db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS gm_nodes_fts USING fts5(
-        name,
-        description,
-        content,
-        content=gm_nodes,
-        content_rowid=rowid
-      );
-    `);
-    recreateNodeFtsTriggers(db);
-  } catch {
-    // FTS5 不可用时静默降级到 LIKE 搜索
-  }
+  ensureNodeFts(db);
+  if (tableExists(db, "gm_nodes_fts")) recreateNodeFtsTriggers(db);
 }
 
 // ─── 向量存储 ────────────────────────────────────────────────
@@ -500,10 +680,9 @@ function m9_topic_nodes(db: DatabaseSyncInstance): void {
     return; // already migrated
   }
 
-  db.exec("PRAGMA foreign_keys = OFF");
-  db.exec("PRAGMA legacy_alter_table = ON");
+  addColumnIfMissing(db, "gm_nodes", "flags", "flags TEXT NOT NULL DEFAULT '[]'");
 
-  try {
+  withNodeRebuildPragmas(db, () => {
     db.exec("DROP TABLE IF EXISTS gm_nodes_old");
     db.exec(`
       ALTER TABLE gm_nodes RENAME TO gm_nodes_old;
@@ -524,12 +703,19 @@ function m9_topic_nodes(db: DatabaseSyncInstance): void {
         flags           TEXT NOT NULL DEFAULT '[]'
       );
 
-      INSERT INTO gm_nodes SELECT * FROM gm_nodes_old;
+      INSERT INTO gm_nodes (
+        id, type, name, description, content, status, validated_count,
+        source_sessions, community_id, pagerank, created_at, updated_at, flags
+      )
+      SELECT
+        id, type, name, COALESCE(description, ''), content,
+        COALESCE(status, 'active'), COALESCE(validated_count, 1),
+        COALESCE(source_sessions, '[]'), community_id, COALESCE(pagerank, 0),
+        created_at, updated_at, COALESCE(flags, '[]')
+      FROM gm_nodes_old;
       DROP TABLE gm_nodes_old;
     `);
     recreateNodeIndexes(db);
     recreateNodeFtsTriggers(db);
-  } finally {
-    db.exec("PRAGMA foreign_keys = ON");
-  }
+  });
 }

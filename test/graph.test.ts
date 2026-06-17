@@ -541,6 +541,165 @@ describe("runMaintenance", () => {
     }
   });
 
+
+  it("legacy node rebuild migrations preserve PRAGMA state and tolerate missing optional columns", () => {
+    resetDb();
+    const dir = mkdtempSync(join(tmpdir(), "gm-m14-rebuild-test-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      PRAGMA foreign_keys = OFF;
+      PRAGMA legacy_alter_table = OFF;
+      CREATE TABLE _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL);
+      INSERT INTO _migrations (v, at) VALUES (13, 1);
+      CREATE TABLE gm_nodes (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT','KNOWLEDGE','STATUS','TOPIC')),
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        validated_count INTEGER NOT NULL DEFAULT 1,
+        source_sessions TEXT NOT NULL DEFAULT '[]',
+        community_id TEXT,
+        pagerank REAL NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        flags TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE gm_edges (
+        id TEXT PRIMARY KEY,
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE gm_vectors (
+        node_id TEXT PRIMARY KEY REFERENCES gm_nodes(id),
+        content_hash TEXT NOT NULL,
+        embedding BLOB NOT NULL
+      );
+      INSERT INTO gm_nodes (id, type, name, content, created_at, updated_at)
+      VALUES ('n1', 'TOPIC', 'legacy-topic', 'content', 1, 1);
+    `);
+    legacy.close();
+
+    const migrated = getDb(dbPath);
+    try {
+      const schema = (migrated.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='gm_nodes'").get() as any).sql as string;
+      expect(schema).toContain("'SESSION'");
+      const node = migrated.prepare("SELECT type, belief, access_count, last_accessed_at FROM gm_nodes WHERE id='n1'").get() as any;
+      expect(node.type).toBe("TOPIC");
+      expect(node.belief).toBe(0.5);
+      expect(node.access_count).toBe(0);
+      expect(node.last_accessed_at).toBe(0);
+      const fk = migrated.prepare("PRAGMA foreign_keys").get() as any;
+      const legacyAlter = migrated.prepare("PRAGMA legacy_alter_table").get() as any;
+      expect(fk.foreign_keys).toBe(1);
+      expect(legacyAlter.legacy_alter_table).toBe(0);
+    } finally {
+      resetDb();
+    }
+  });
+
+  it("final schema guard repairs partially recorded migrations", () => {
+    resetDb();
+    const dir = mkdtempSync(join(tmpdir(), "gm-final-schema-guard-test-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const partial = new DatabaseSync(dbPath);
+    partial.exec(`
+      CREATE TABLE _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL);
+      INSERT INTO _migrations (v, at) VALUES (16, 1);
+      CREATE TABLE gm_nodes (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        validated_count INTEGER NOT NULL DEFAULT 1,
+        source_sessions TEXT NOT NULL DEFAULT '[]',
+        community_id TEXT,
+        pagerank REAL NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE gm_edges (
+        id TEXT PRIMARY KEY,
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE gm_vectors (
+        node_id TEXT PRIMARY KEY REFERENCES gm_nodes(id),
+        content_hash TEXT NOT NULL,
+        embedding BLOB NOT NULL
+      );
+    `);
+    partial.close();
+
+    const migrated = getDb(dbPath);
+    try {
+      const nodeColumns = migrated.prepare("PRAGMA table_info(gm_nodes)").all() as Array<{ name: string }>;
+      expect(nodeColumns.map(col => col.name)).toEqual(expect.arrayContaining([
+        "flags", "belief", "success_count", "failure_count", "last_signal_at", "access_count", "last_accessed_at",
+      ]));
+      for (const name of ["gm_scopes", "gm_recalled", "gm_belief_signals", "gm_dedup_state"]) {
+        const row = migrated.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name) as any;
+        expect(row?.name).toBe(name);
+      }
+      for (const name of ["ix_gm_edges_from_to_name", "ix_gm_edges_to_from_name", "ix_gm_vectors_dedup_pending"]) {
+        const row = migrated.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name=?").get(name) as any;
+        expect(row?.name).toBe(name);
+      }
+    } finally {
+      resetDb();
+    }
+  });
+
+
+  it("final schema guard repairs recorded migrations even when gm_vectors is missing", () => {
+    resetDb();
+    const dir = mkdtempSync(join(tmpdir(), "gm-final-schema-no-vectors-test-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const partial = new DatabaseSync(dbPath);
+    partial.exec(`
+      CREATE TABLE _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL);
+      INSERT INTO _migrations (v, at) VALUES (16, 1);
+      CREATE TABLE gm_nodes (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        validated_count INTEGER NOT NULL DEFAULT 1,
+        source_sessions TEXT NOT NULL DEFAULT '[]',
+        community_id TEXT,
+        pagerank REAL NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    partial.close();
+
+    const migrated = getDb(dbPath);
+    try {
+      const vectors = migrated.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='gm_vectors'").get() as any;
+      expect(vectors?.name).toBe("gm_vectors");
+      const index = migrated.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='ix_gm_vectors_dedup_pending'").get() as any;
+      expect(index?.name).toBe("ix_gm_vectors_dedup_pending");
+      expect(() => migrated.prepare("INSERT INTO gm_nodes (id, type, name, content, created_at, updated_at) VALUES ('n1','TASK','fts-safe','content',1,1)").run()).not.toThrow();
+    } finally {
+      resetDb();
+    }
+  });
+
   it("test schema includes maintenance indexes", () => {
     const rows = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('ix_gm_nodes_status_rank','ix_gm_nodes_status_type','ix_gm_edges_from_to_name','ix_gm_edges_to_from_name')").all() as any[];
     expect(rows.map(r => r.name).sort()).toEqual([
