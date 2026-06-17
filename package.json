@@ -2,12 +2,37 @@
   "name": "graph-memory",
   "version": "3.0.0",
   "description": "Knowledge Graph Memory Engine for OpenClaw — precise recall with Personalized PageRank, access decay, vector dedup, and retention maintenance",
+  "author": "adoresever <Wywelljob@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/adoresever/graph-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/adoresever/graph-memory/issues"
+  },
+  "homepage": "https://github.com/adoresever/graph-memory#readme",
+  "keywords": [
+    "openclaw",
+    "memory",
+    "knowledge-graph",
+    "pagerank",
+    "personalized-pagerank",
+    "embedding",
+    "sqlite",
+    "fts5",
+    "agent-memory"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit --allowImportingTsExtensions"
   },
   "dependencies": {
     "@photostructure/sqlite": "^1.0.0",
