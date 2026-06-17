@@ -143,6 +143,17 @@ export function createTestDb(): DatabaseSyncInstance {
     );
   `);
 
+  // m11: scopes
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_scopes (
+      scope_name  TEXT NOT NULL,
+      session_id  TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (scope_name, session_id)
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_scopes_session ON gm_scopes(session_id);
+  `);
+
   // m12: recalled 记录
   db.exec(`
     CREATE TABLE IF NOT EXISTS gm_recalled (

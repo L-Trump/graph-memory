@@ -22,6 +22,30 @@ function uid(p: string): string {
   return `${p}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
+
+let transactionCounter = 0;
+
+/**
+ * Composable SQLite transaction wrapper.
+ *
+ * SQLite SAVEPOINT works both outside and inside an existing transaction, so
+ * callers can safely compose store helpers without tripping over nested BEGIN.
+ */
+export function withTransaction<T>(db: DatabaseSyncInstance, fn: () => T): T {
+  const name = `gm_tx_${Date.now()}_${transactionCounter++}`;
+  db.exec(`SAVEPOINT ${name}`);
+  try {
+    const result = fn();
+    db.exec(`RELEASE SAVEPOINT ${name}`);
+    return result;
+  } catch (err) {
+    try { db.exec(`ROLLBACK TO SAVEPOINT ${name}`); } finally {
+      try { db.exec(`RELEASE SAVEPOINT ${name}`); } catch {}
+    }
+    throw err;
+  }
+}
+
 function toNode(r: any): GmNode {
   return {
     id: r.id, type: r.type, name: r.name,
@@ -202,16 +226,11 @@ export function mergeNodes(db: DatabaseSyncInstance, keepId: string, mergeId: st
 /** 批量更新 PageRank 分数 */
 export function updatePageranks(db: DatabaseSyncInstance, scores: Map<string, number>): void {
   const stmt = db.prepare("UPDATE gm_nodes SET pagerank=? WHERE id=?");
-  db.exec("BEGIN");
-  try {
+  withTransaction(db, () => {
     for (const [id, score] of scores) {
       stmt.run(score, id);
     }
-    db.exec("COMMIT");
-  } catch (e) {
-    db.exec("ROLLBACK");
-    throw e;
-  }
+  });
 }
 
 // ─── 边 CRUD ─────────────────────────────────────────────────
@@ -515,32 +534,33 @@ export function cleanupInactiveSessionHistory(
   const cutoff = now - retentionDays * 86_400_000;
   const protectedSessions = [...new Set(protectedSessionIds.filter(Boolean))];
 
-  db.exec("BEGIN");
+  let messagesDeleted = 0;
+  let recalledDeleted = 0;
   try {
-    prepareProtectedSessionTempTable(db, protectedSessions);
-    const messagesDeleted = deleteInactiveSessionRows(db, "gm_messages", cutoff, maxDeletePerRun);
-    const remainingBudget = Math.max(0, maxDeletePerRun - messagesDeleted);
-    const recalledDeleted = remainingBudget > 0
-      ? deleteInactiveSessionRows(db, "gm_recalled", cutoff, remainingBudget)
-      : 0;
-    db.exec("DROP TABLE IF EXISTS temp.gm_protected_sessions");
-    db.exec("COMMIT");
-
-    if (opts.vacuum && (messagesDeleted > 0 || recalledDeleted > 0)) {
-      db.exec("VACUUM");
-    }
-
-    return {
-      cutoff,
-      protectedSessionCount: protectedSessions.length,
-      messagesDeleted,
-      recalledDeleted,
-    };
+    withTransaction(db, () => {
+      prepareProtectedSessionTempTable(db, protectedSessions);
+      messagesDeleted = deleteInactiveSessionRows(db, "gm_messages", cutoff, maxDeletePerRun);
+      const remainingBudget = Math.max(0, maxDeletePerRun - messagesDeleted);
+      recalledDeleted = remainingBudget > 0
+        ? deleteInactiveSessionRows(db, "gm_recalled", cutoff, remainingBudget)
+        : 0;
+      db.exec("DROP TABLE IF EXISTS temp.gm_protected_sessions");
+    });
   } catch (err) {
-    try { db.exec("ROLLBACK"); } catch {}
     try { db.exec("DROP TABLE IF EXISTS temp.gm_protected_sessions"); } catch {}
     throw err;
   }
+
+  if (opts.vacuum && (messagesDeleted > 0 || recalledDeleted > 0)) {
+    db.exec("VACUUM");
+  }
+
+  return {
+    cutoff,
+    protectedSessionCount: protectedSessions.length,
+    messagesDeleted,
+    recalledDeleted,
+  };
 }
 
 // ─── 信号 CRUD ───────────────────────────────────────────────
@@ -675,14 +695,9 @@ export function getDedupCandidateVectorsByType(db: DatabaseSyncInstance, type: G
 export function markVectorsDedupChecked(db: DatabaseSyncInstance, nodeIds: string[], checkedAt = Date.now()): void {
   if (nodeIds.length === 0) return;
   const stmt = db.prepare("UPDATE gm_vectors SET dedup_checked_at=? WHERE node_id=?");
-  db.exec("BEGIN");
-  try {
+  withTransaction(db, () => {
     for (const nodeId of nodeIds) stmt.run(checkedAt, nodeId);
-    db.exec("COMMIT");
-  } catch (e) {
-    db.exec("ROLLBACK");
-    throw e;
-  }
+  });
 }
 
 export type ScoredNode = { node: GmNode; score: number };
@@ -961,8 +976,7 @@ export function getBeliefHistory(
  * scopeNames 为空数组时 = 清除该 session 的所有 scope。
  */
 export function setScopesForSession(db: DatabaseSyncInstance, sessionId: string, scopeNames: string[]): void {
-  db.exec("BEGIN");
-  try {
+  withTransaction(db, () => {
     db.prepare("DELETE FROM gm_scopes WHERE session_id = ?").run(sessionId);
     const now = Date.now();
     for (const name of scopeNames) {
@@ -972,11 +986,7 @@ export function setScopesForSession(db: DatabaseSyncInstance, sessionId: string,
         ).run(name.trim(), sessionId, now);
       }
     }
-    db.exec("COMMIT");
-  } catch (e) {
-    db.exec("ROLLBACK");
-    throw e;
-  }
+  });
 }
 
 /**
@@ -1180,16 +1190,11 @@ export function recordNodeAccessBatch(
     WHERE id = ?
   `);
 
-  db.exec("BEGIN");
-  try {
+  withTransaction(db, () => {
     for (const id of nodeIds) {
       stmt.run(now, id);
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  });
 }
 
 /**

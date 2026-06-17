@@ -15,7 +15,8 @@ import {
   saveMessage, getMessages, getUnextracted, getRecentExtractedMessages, markExtracted,
   saveSignal, pendingSignals, markSignalsDone,
   getStats, saveVector, vectorSearch, vectorSearchWithScore, getAllVectors,
-  setNodeFlags,
+  setNodeFlags, withTransaction, updatePageranks, markVectorsDedupChecked,
+  recordNodeAccessBatch, setScopesForSession,
 } from "../src/store/store.ts";
 
 let db: DatabaseSyncInstance;
@@ -349,6 +350,68 @@ describe("getStats", () => {
     expect(stats.byType["SKILL"]).toBe(1);
     expect(stats.byType["TASK"]).toBe(1);
     expect(stats.totalEdges).toBe(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// composable transactions
+// ═══════════════════════════════════════════════════════════════
+
+describe("withTransaction", () => {
+  it("composes store helpers inside an outer transaction", () => {
+    const node = insertNode(db, { name: "tx-node" });
+    saveVector(db, node, "tx-vector", [1, 0, 0]);
+
+    withTransaction(db, () => {
+      updatePageranks(db, new Map([[node, 0.42]]));
+      markVectorsDedupChecked(db, [node], 1234);
+      recordNodeAccessBatch(db, [node], 5678);
+      setScopesForSession(db, "session-tx", ["scope-a", "scope-b"]);
+    });
+
+    const row = db.prepare("SELECT pagerank, access_count, last_accessed_at FROM gm_nodes WHERE id=?").get(node) as any;
+    expect(row.pagerank).toBeCloseTo(0.42);
+    expect(row.access_count).toBe(1);
+    expect(row.last_accessed_at).toBe(5678);
+    const vector = db.prepare("SELECT dedup_checked_at FROM gm_vectors WHERE node_id=?").get(node) as any;
+    expect(vector.dedup_checked_at).toBe(1234);
+    expect(db.prepare("SELECT COUNT(*) AS c FROM gm_scopes WHERE session_id='session-tx'").get() as any).toMatchObject({ c: 2 });
+  });
+
+  it("rolls back nested helper changes on outer transaction failure", () => {
+    const node = insertNode(db, { name: "tx-rollback-node" });
+    saveVector(db, node, "tx-vector", [1, 0, 0]);
+
+    expect(() => withTransaction(db, () => {
+      updatePageranks(db, new Map([[node, 0.99]]));
+      markVectorsDedupChecked(db, [node], 4321);
+      throw new Error("boom");
+    })).toThrow("boom");
+
+    const row = db.prepare("SELECT pagerank FROM gm_nodes WHERE id=?").get(node) as any;
+    expect(row.pagerank).toBe(0);
+    const vector = db.prepare("SELECT dedup_checked_at FROM gm_vectors WHERE node_id=?").get(node) as any;
+    expect(vector.dedup_checked_at).toBe(0);
+  });
+
+  it("rolls back only the inner savepoint when an inner transaction fails and is caught", () => {
+    const keep = insertNode(db, { name: "tx-keep" });
+    const inner = insertNode(db, { name: "tx-inner" });
+
+    withTransaction(db, () => {
+      updatePageranks(db, new Map([[keep, 0.25]]));
+      try {
+        withTransaction(db, () => {
+          updatePageranks(db, new Map([[inner, 0.75]]));
+          throw new Error("inner");
+        });
+      } catch {
+        // outer transaction should continue after rolling back the inner savepoint
+      }
+    });
+
+    expect((db.prepare("SELECT pagerank FROM gm_nodes WHERE id=?").get(keep) as any).pagerank).toBeCloseTo(0.25);
+    expect((db.prepare("SELECT pagerank FROM gm_nodes WHERE id=?").get(inner) as any).pagerank).toBe(0);
   });
 });
 
