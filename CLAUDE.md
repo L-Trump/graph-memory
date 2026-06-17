@@ -212,7 +212,7 @@ Important defaults:
 - `decayEnabled = true`
 - `debugContextPreview = false`
 - `retention = { enabled: true, retentionDays: 30, maxDeletePerRun: 20000, vacuum: false }`
-- `freshTailCount` remains as a deprecated/unused compatibility field.
+- `freshTailCount` has been removed; do not reintroduce deprecated config fields without a runtime use case.
 
 ## Testing notes
 
