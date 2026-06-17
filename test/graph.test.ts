@@ -99,6 +99,36 @@ describe("Personalized PageRank", () => {
     const { scores } = personalizedPageRank(db, ["fake-id"], ["fake-id"], cfg);
     expect(scores.size).toBe(0);
   });
+
+  it("graph cache is scoped per database instance", () => {
+    const db1 = createTestDb();
+    const db2 = createTestDb();
+    invalidateGraphCache();
+
+    const a1 = insertNode(db1, { name: "db1-seed" });
+    const b1 = insertNode(db1, { name: "db1-neighbor" });
+    insertEdge(db1, { fromId: a1, toId: b1 });
+
+    const a2 = insertNode(db2, { name: "db2-seed" });
+    const b2 = insertNode(db2, { name: "db2-neighbor" });
+    insertEdge(db2, { fromId: a2, toId: b2 });
+
+    const scores1 = personalizedPageRank(db1, [a1], [a1, b1], cfg).scores;
+    const scores2 = personalizedPageRank(db2, [a2], [a2, b2], cfg).scores;
+
+    expect(scores1.get(a1)).toBeGreaterThan(0);
+    expect(scores1.has(a2)).toBe(false);
+    expect(scores2.get(a2)).toBeGreaterThan(0);
+    expect(scores2.has(a1)).toBe(false);
+  });
+
+  it("cooperatively aborts when PageRank deadline has passed", () => {
+    const a = insertNode(db, { name: "deadline-seed" });
+    const b = insertNode(db, { name: "deadline-neighbor" });
+    insertEdge(db, { fromId: a, toId: b });
+
+    expect(() => personalizedPageRank(db, [a], [a, b], cfg, { deadlineAt: Date.now() - 1 })).toThrow(/deadline/);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════

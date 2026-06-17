@@ -41,9 +41,12 @@ interface GraphStructure {
   N: number;
   /** 缓存时间 */
   cachedAt: number;
+  /** 全局失效 epoch，避免 WeakMap 无法 clear 的问题 */
+  epoch: number;
 }
 
-let _cached: GraphStructure | null = null;
+const graphCache = new WeakMap<DatabaseSyncInstance, GraphStructure>();
+let graphCacheEpoch = 0;
 const CACHE_TTL = 30_000; // 30 秒缓存
 
 /**
@@ -51,7 +54,8 @@ const CACHE_TTL = 30_000; // 30 秒缓存
  * compact 会新增节点/边，但 30 秒内的查询共享同一份图结构没问题
  */
 function loadGraph(db: DatabaseSyncInstance): GraphStructure {
-  if (_cached && Date.now() - _cached.cachedAt < CACHE_TTL) return _cached;
+  const cached = graphCache.get(db);
+  if (cached && cached.epoch === graphCacheEpoch && Date.now() - cached.cachedAt < CACHE_TTL) return cached;
 
   const nodeRows = db.prepare(
     "SELECT id FROM gm_nodes WHERE status='active'"
@@ -69,13 +73,18 @@ function loadGraph(db: DatabaseSyncInstance): GraphStructure {
     adj.get(e.to_id)!.push(e.from_id);
   }
 
-  _cached = { nodeIds, adj, N: nodeIds.size, cachedAt: Date.now() };
-  return _cached;
+  const graph = { nodeIds, adj, N: nodeIds.size, cachedAt: Date.now(), epoch: graphCacheEpoch };
+  graphCache.set(db, graph);
+  return graph;
 }
 
-/** 图结构变化时清除缓存（compact/finalize 后调用） */
-export function invalidateGraphCache(): void {
-  _cached = null;
+/** 图结构变化时清除缓存（compact/finalize 后调用）。传 db 时只清该 DB；否则全局失效。 */
+export function invalidateGraphCache(db?: DatabaseSyncInstance): void {
+  if (db) {
+    graphCache.delete(db);
+    return;
+  }
+  graphCacheEpoch++;
 }
 
 // ─── 个性化 PageRank ─────────────────────────────────────────
@@ -83,6 +92,21 @@ export function invalidateGraphCache(): void {
 export interface PPRResult {
   /** nodeId → 个性化分数 */
   scores: Map<string, number>;
+}
+
+export interface PageRankDeadlineOptions {
+  /** Absolute epoch ms deadline checked between PageRank iterations and large loops. */
+  deadlineAt?: number;
+  signal?: AbortSignal;
+  checkEvery?: number;
+}
+
+function checkPageRankDeadline(options?: PageRankDeadlineOptions): void {
+  if (!options) return;
+  if (options.signal?.aborted) throw new Error("graph-memory PageRank aborted");
+  if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) {
+    throw new Error("graph-memory PageRank deadline exceeded");
+  }
 }
 
 /**
@@ -101,7 +125,9 @@ export function personalizedPageRank(
   seedIds: string[],
   candidateIds: string[],
   cfg: GmConfig,
+  options?: PageRankDeadlineOptions,
 ): PPRResult {
+  checkPageRankDeadline(options);
   const graph = loadGraph(db);
   const { nodeIds, adj, N } = graph;
   const damping = cfg.pagerankDamping;
@@ -126,7 +152,9 @@ export function personalizedPageRank(
   }
 
   // 迭代
+  const checkEvery = Math.max(1, Math.floor(options?.checkEvery ?? 256));
   for (let i = 0; i < iterations; i++) {
+    checkPageRankDeadline(options);
     const newRank = new Map<string, number>();
 
     // teleport 分量：回到种子节点
@@ -135,7 +163,9 @@ export function personalizedPageRank(
     }
 
     // 传播分量：从邻居获得权重
+    let propagated = 0;
     for (const [nodeId, neighbors] of adj) {
+      if (propagated++ % checkEvery === 0) checkPageRankDeadline(options);
       if (neighbors.length === 0) continue;
       const contrib = (rank.get(nodeId) || 0) / neighbors.length;
       if (contrib === 0) continue;
@@ -146,7 +176,9 @@ export function personalizedPageRank(
 
     // dangling nodes 的分数传播回种子节点（不是均匀分配到所有节点）
     let danglingSum = 0;
+    let danglingChecked = 0;
     for (const id of nodeIds) {
+      if (danglingChecked++ % checkEvery === 0) checkPageRankDeadline(options);
       const neighbors = adj.get(id);
       if (!neighbors || neighbors.length === 0) {
         danglingSum += rank.get(id) || 0;
@@ -161,6 +193,8 @@ export function personalizedPageRank(
 
     rank = newRank;
   }
+
+  checkPageRankDeadline(options);
 
   // 只返回候选节点的分数
   const result = new Map<string, number>();

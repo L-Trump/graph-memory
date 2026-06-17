@@ -14,7 +14,7 @@ import {
   searchNodes, topNodes, graphWalk, getBySession,
   saveMessage, getMessages, getUnextracted, getRecentExtractedMessages, markExtracted,
   saveSignal, pendingSignals, markSignalsDone,
-  getStats, saveVector, vectorSearch, getAllVectors,
+  getStats, saveVector, vectorSearch, vectorSearchWithScore, getAllVectors,
   setNodeFlags,
 } from "../src/store/store.ts";
 
@@ -349,6 +349,31 @@ describe("getStats", () => {
     expect(stats.byType["SKILL"]).toBe(1);
     expect(stats.byType["TASK"]).toBe(1);
     expect(stats.totalEdges).toBe(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// vector search
+// ═══════════════════════════════════════════════════════════════
+
+describe("vector search", () => {
+  it("returns the same top-K ordering without full sorting", () => {
+    const x = insertNode(db, { name: "vec-x" });
+    const y = insertNode(db, { name: "vec-y" });
+    const z = insertNode(db, { name: "vec-z" });
+    saveVector(db, x, "x", [1, 0, 0]);
+    saveVector(db, y, "y", [0.9, 0.1, 0]);
+    saveVector(db, z, "z", [0, 1, 0]);
+
+    const results = vectorSearchWithScore(db, [1, 0, 0], 2, -1);
+    expect(results.map(r => r.node.name)).toEqual(["vec-x", "vec-y"]);
+    expect(results[0].score).toBeGreaterThanOrEqual(results[1].score);
+  });
+
+  it("checks cooperative deadline before scanning vectors", () => {
+    const x = insertNode(db, { name: "vec-deadline" });
+    saveVector(db, x, "x", [1, 0, 0]);
+    expect(() => vectorSearchWithScore(db, [1, 0, 0], 1, -1, { deadlineAt: Date.now() - 1 })).toThrow(/deadline/);
   });
 });
 

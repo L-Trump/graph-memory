@@ -601,10 +601,11 @@ export function saveVector(db: DatabaseSyncInstance, nodeId: string, content: st
   const f32 = new Float32Array(vec);
   const blob = new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength);
   const now = Date.now();
-  db.prepare(`INSERT INTO gm_vectors (node_id, content_hash, embedding, updated_at, dedup_checked_at) VALUES (?,?,?,?,0)
+  const result = db.prepare(`INSERT INTO gm_vectors (node_id, content_hash, embedding, updated_at, dedup_checked_at) VALUES (?,?,?,?,0)
     ON CONFLICT(node_id) DO UPDATE SET content_hash=excluded.content_hash, embedding=excluded.embedding, updated_at=excluded.updated_at, dedup_checked_at=0
     WHERE gm_vectors.content_hash != excluded.content_hash`)
-    .run(nodeId, hash, blob, now);
+    .run(nodeId, hash, blob, now) as any;
+  if ((result?.changes ?? 0) > 0) invalidateVectorNormCache(db, nodeId);
 }
 
 export function getVectorHash(db: DatabaseSyncInstance, nodeId: string): string | null {
@@ -686,9 +687,89 @@ export function markVectorsDedupChecked(db: DatabaseSyncInstance, nodeIds: strin
 
 export type ScoredNode = { node: GmNode; score: number };
 
-export function vectorSearchWithScore(db: DatabaseSyncInstance, queryVec: number[], limit: number, minScore = 0.35): ScoredNode[] {
+export interface SearchDeadlineOptions {
+  /** Absolute epoch ms deadline. When reached, expensive scan loops throw before doing more work. */
+  deadlineAt?: number;
+  /** Optional AbortSignal for cooperative cancellation by callers that can provide one. */
+  signal?: AbortSignal;
+  /** How often to check deadline/signal in large synchronous loops. Defaults to 256 rows. */
+  checkEvery?: number;
+}
+
+function checkSearchDeadline(options?: SearchDeadlineOptions): void {
+  if (!options) return;
+  if (options.signal?.aborted) throw new Error("graph-memory search aborted");
+  if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) {
+    throw new Error("graph-memory search deadline exceeded");
+  }
+}
+
+const vectorNormCache = new WeakMap<DatabaseSyncInstance, Map<string, { updatedAt: number; norm: number }>>();
+
+function invalidateVectorNormCache(db: DatabaseSyncInstance, nodeId: string): void {
+  vectorNormCache.get(db)?.delete(nodeId);
+}
+
+function getVectorNorm(db: DatabaseSyncInstance, nodeId: string, updatedAt: number, v: Float32Array): number {
+  let byNode = vectorNormCache.get(db);
+  if (!byNode) {
+    byNode = new Map();
+    vectorNormCache.set(db, byNode);
+  }
+  const cached = byNode.get(nodeId);
+  if (cached && cached.updatedAt === updatedAt) return cached.norm;
+  let sum = 0;
+  for (let i = 0; i < v.length; i++) sum += v[i] * v[i];
+  const norm = Math.sqrt(sum);
+  byNode.set(nodeId, { updatedAt, norm });
+  return norm;
+}
+
+function heapSwap<T>(heap: T[], i: number, j: number): void {
+  const tmp = heap[i];
+  heap[i] = heap[j];
+  heap[j] = tmp;
+}
+
+function heapPushScored(heap: ScoredNode[], item: ScoredNode): void {
+  heap.push(item);
+  let i = heap.length - 1;
+  while (i > 0) {
+    const p = Math.floor((i - 1) / 2);
+    if (heap[p].score <= heap[i].score) break;
+    heapSwap(heap, p, i);
+    i = p;
+  }
+}
+
+function heapReplaceRootScored(heap: ScoredNode[], item: ScoredNode): void {
+  heap[0] = item;
+  let i = 0;
+  while (true) {
+    const l = i * 2 + 1;
+    const r = l + 1;
+    let smallest = i;
+    if (l < heap.length && heap[l].score < heap[smallest].score) smallest = l;
+    if (r < heap.length && heap[r].score < heap[smallest].score) smallest = r;
+    if (smallest === i) break;
+    heapSwap(heap, i, smallest);
+    i = smallest;
+  }
+}
+
+export function vectorSearchWithScore(
+  db: DatabaseSyncInstance,
+  queryVec: number[],
+  limit: number,
+  minScore = 0.35,
+  options?: SearchDeadlineOptions,
+): ScoredNode[] {
+  const cappedLimit = Math.max(0, Math.floor(limit));
+  if (cappedLimit === 0) return [];
+  checkSearchDeadline(options);
+
   const rows = db.prepare(`
-    SELECT v.node_id, v.embedding, n.*
+    SELECT v.node_id, v.embedding, COALESCE(v.updated_at, n.updated_at, 0) AS vector_updated_at, n.*
     FROM gm_vectors v JOIN gm_nodes n ON n.id = v.node_id
     WHERE n.status = 'active'
   `).all() as any[];
@@ -696,24 +777,34 @@ export function vectorSearchWithScore(db: DatabaseSyncInstance, queryVec: number
   if (!rows.length) return [];
 
   const q = new Float32Array(queryVec);
-  const qNorm = Math.sqrt(q.reduce((s, x) => s + x * x, 0));
+  let qNormSq = 0;
+  for (let i = 0; i < q.length; i++) qNormSq += q[i] * q[i];
+  const qNorm = Math.sqrt(qNormSq);
   if (qNorm === 0) return [];
 
-  return rows
-    .map(row => {
-      const raw = row.embedding as Uint8Array;
-      const v = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
-      let dot = 0, vNorm = 0;
-      const len = Math.min(v.length, q.length);
-      for (let i = 0; i < len; i++) {
-        dot += v[i] * q[i];
-        vNorm += v[i] * v[i];
-      }
-      return { score: dot / (Math.sqrt(vNorm) * qNorm + 1e-9), node: toNode(row) };
-    })
-    .filter(s => s.score > minScore)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+  const heap: ScoredNode[] = [];
+  const checkEvery = Math.max(1, Math.floor(options?.checkEvery ?? 256));
+  checkSearchDeadline(options);
+
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    if (rowIndex % checkEvery === 0) checkSearchDeadline(options);
+    const row = rows[rowIndex];
+    const raw = row.embedding as Uint8Array;
+    const v = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+    let dot = 0;
+    const len = Math.min(v.length, q.length);
+    for (let i = 0; i < len; i++) dot += v[i] * q[i];
+    const vNorm = getVectorNorm(db, row.node_id, row.vector_updated_at ?? 0, v);
+    const score = dot / (vNorm * qNorm + 1e-9);
+    if (score <= minScore) continue;
+
+    const item = { score, node: toNode(row) };
+    if (heap.length < cappedLimit) heapPushScored(heap, item);
+    else if (score > heap[0].score) heapReplaceRootScored(heap, item);
+  }
+
+  checkSearchDeadline(options);
+  return heap.sort((a, b) => b.score - a.score);
 }
 
 /** 兼容旧接口 */

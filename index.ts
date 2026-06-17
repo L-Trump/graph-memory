@@ -1258,7 +1258,11 @@ ${suggestionsText}
           recallDebug = `mode=${autoRecallMode} cache=miss circuit=open`;
         } else {
           try {
-            res = await withTimeout(parallelRecall(recaller, historyQuery, promptQuery), cfg.recallTimeoutMs ?? 1500);
+            const recallTimeoutMs = cfg.recallTimeoutMs ?? 1500;
+            res = await withTimeout(
+              parallelRecall(recaller, historyQuery, promptQuery, { deadlineAt: Date.now() + recallTimeoutMs }),
+              recallTimeoutMs,
+            );
             recallStatus = res.nodes.length ? "ok" : "empty";
             recallDebug = `mode=${autoRecallMode} cache=miss elapsed=${Date.now() - recallStartedAt}ms`;
             resetGmRecallCircuit(statusSessionKey ?? sid);
@@ -3359,6 +3363,7 @@ async function parallelRecall(
   recaller: Recaller,
   historyQuery: string,
   promptQuery: string,
+  options?: { deadlineAt?: number; signal?: AbortSignal },
 ): Promise<{ nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }> {
   const tierPriority = (tier: string): number => {
     const p: Record<string, number> = { scope_hot: 6, hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
@@ -3366,8 +3371,8 @@ async function parallelRecall(
   };
 
   const [historyRes, promptRes] = await Promise.all([
-    recaller.recallV2(historyQuery),
-    recaller.recallV2(promptQuery),
+    recaller.recallV2(historyQuery, options),
+    recaller.recallV2(promptQuery, options),
   ]);
 
   // ── 节点去重（按 name，保留更高 tier）──────────────────────

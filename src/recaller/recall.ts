@@ -36,6 +36,7 @@ import {
   searchNodes, vectorSearchWithScore,
   graphWalk,
   saveVector, getVectorHash, findById, findByName,
+  type SearchDeadlineOptions,
 } from "../store/store.ts";
 import { personalizedPageRank } from "../graph/pagerank.ts";
 import { combinedScore, type Scored } from "./score.ts";
@@ -212,6 +213,13 @@ export class Recaller {
     };
   }
 
+  private isRecallDeadlineExceeded(options?: SearchDeadlineOptions): boolean {
+    return Boolean(
+      options?.signal?.aborted ||
+      (options?.deadlineAt !== undefined && Date.now() >= options.deadlineAt),
+    );
+  }
+
   setEmbedFn(fn: EmbedFn): void {
     this.embed = fn;
     this.embedReady = true;
@@ -245,12 +253,12 @@ export class Recaller {
   /**
    * 召回入口：当前只运行 precise-only 路径，然后应用组合评分、PPR、分层和衰减。
    */
-  async recallV2(query: string): Promise<RecallResultV2> {
+  async recallV2(query: string, options?: SearchDeadlineOptions): Promise<RecallResultV2> {
     const timing = this.createRecallTimingLogger("recallV2", query);
     const limit = this.cfg.recallMaxNodes;
     timing("start", `limit=${limit} embedReady=${this.embedReady}`);
 
-    const precise = await this.recallPreciseV2(query, limit);
+    const precise = await this.recallPreciseV2(query, limit, options);
     timing("precise-complete", `nodes=${precise.nodes.length} edges=${precise.edges.length} tokens=${precise.tokenEstimate}`);
     const merged = precise;
 
@@ -265,7 +273,7 @@ export class Recaller {
   /**
    * 精确召回（V2）：向量/FTS5 找种子 → 组合评分 → 三级分级
    */
-  private async recallPreciseV2(query: string, limit: number): Promise<RecallResultV2> {
+  private async recallPreciseV2(query: string, limit: number, options?: SearchDeadlineOptions): Promise<RecallResultV2> {
     const timing = this.createRecallTimingLogger("preciseV2", query);
     let seeds: GmNode[] = [];
     const semanticScores = new Map<string, number>(); // nodeId → 原始向量相似度
@@ -278,7 +286,7 @@ export class Recaller {
         const vec = await this.embed(query);
         timing("embed-query", `dims=${vec.length}`);
         // 语义种子：top k/3
-        const scored = vectorSearchWithScore(this.db, vec, Math.ceil(k / 3));
+        const scored = vectorSearchWithScore(this.db, vec, Math.ceil(k / 3), 0.35, options);
         timing("vector-search", `top=${Math.ceil(k / 3)} results=${scored.length} best=${scored[0]?.score?.toFixed?.(3) ?? "-"}`);
         seeds = scored.map(s => s.node);
         for (const s of scored) semanticScores.set(s.node.id, s.score);
@@ -342,6 +350,10 @@ export class Recaller {
         }
       } catch (err) {
         timing("embed-path-failed", `error=${String(err).replace(/\s+/g, " ").slice(0, 160)}`);
+        if (this.isRecallDeadlineExceeded(options)) {
+          timing("deadline-rethrow", "reason=embed-path-catch");
+          throw err;
+        }
         seeds = searchNodes(this.db, query, Math.ceil(limit / 3));
         timing("fts-fallback", `results=${seeds.length} reason=embed-path-error`);
       }
@@ -379,7 +391,7 @@ export class Recaller {
 
     // PPR
     const { scores: pprScores } = personalizedPageRank(
-      this.db, seedIds, candidateIds, this.cfg,
+      this.db, seedIds, candidateIds, this.cfg, options,
     );
     timing("personalized-pagerank", `seeds=${seedIds.length} candidates=${candidateIds.length} scores=${pprScores.size}`);
 
@@ -535,7 +547,10 @@ export class Recaller {
       const decayable = {
         id: node.id,
         type: node.type,
-        importance: 0.5, // will be set by decay engine from type
+        // Intentional baseline: recency half-life uses a uniform importance so NodeType
+        // differences do not over-dominate recall ranking. Type-specific decay still
+        // applies through beta, floor, and intrinsic weighting in decay.ts.
+        importance: 0.5,
         belief: access?.belief ?? node.belief ?? 0.5,
         accessCount: access?.accessCount ?? 0,
         createdAt: node.createdAt,
