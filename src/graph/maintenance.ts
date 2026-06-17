@@ -13,7 +13,7 @@
  * 注意：个性化 PPR 不在这里跑，它在 recall 时实时计算。
  */
 
-import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
+import type { DatabaseSyncInstance } from "@photostructure/sqlite";
 import type { GmConfig } from "../types.ts";
 import { computeGlobalPageRank, invalidateGraphCache, type GlobalPageRankResult } from "./pagerank.ts";
 import { dedup, type DedupResult } from "./dedup.ts";

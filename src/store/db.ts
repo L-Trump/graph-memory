@@ -5,7 +5,7 @@
  * Email: Wywelljob@gmail.com
  */
 
-export { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
+export type { DatabaseSyncInstance } from "@photostructure/sqlite";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { mkdirSync } from "fs";
 import { homedir } from "os";

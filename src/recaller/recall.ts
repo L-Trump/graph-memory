@@ -28,7 +28,7 @@
  * 默认权重：α=0.5（语义） β=0.4（PPR） γ=0.1（PageRank） KEYWORD_WEIGHT=0.4
  */
 
-import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
+import type { DatabaseSyncInstance } from "@photostructure/sqlite";
 import { createHash } from "crypto";
 import type { GmConfig, RecallResult, GmNode, GmEdge } from "../types.ts";
 import type { EmbedFn } from "../engine/embed.ts";

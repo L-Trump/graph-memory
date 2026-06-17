@@ -5,7 +5,7 @@
  * Email: Wywelljob@gmail.com
  */
 
-import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
+import type { DatabaseSyncInstance } from "@photostructure/sqlite";
 import { createHash } from "crypto";
 import type { GmNode, GmEdge, EdgeType, NodeType, Signal } from "../types.ts";
 

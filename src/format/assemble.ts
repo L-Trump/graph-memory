@@ -23,7 +23,7 @@
  *   无 description → <e name="..." from="..." to="..."/>
  */
 
-import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
+import type { DatabaseSyncInstance } from "@photostructure/sqlite";
 import type { GmNode, GmEdge } from "../types.ts";
 import type { GmConfig } from "../types.ts";
 import type { TieredNode, RecallTier } from "../recaller/recall.ts";
