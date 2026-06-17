@@ -103,11 +103,23 @@ function edgeHasDescription(fromTier: RecallTier, toTier: RecallTier): boolean {
 
 function formatEdge(e: GmEdge, fromName: string, toName: string, hasDescription: boolean): string {
   if (hasDescription) {
-    return `    <e name="${escapeXml(e.name)}" from="${fromName}" to="${toName}">${escapeXml(e.description)}</e>`;
+    return `    <e name="${escapeXml(e.name)}" from="${escapeXml(fromName)}" to="${escapeXml(toName)}">${escapeXml(e.description)}</e>`;
   } else {
-    return `    <e name="${escapeXml(e.name)}" from="${fromName}" to="${toName}"/>`;
+    return `    <e name="${escapeXml(e.name)}" from="${escapeXml(fromName)}" to="${escapeXml(toName)}"/>`;
   }
 }
+
+function isAssembleDebugEnabled(cfg?: GmConfig | null, explicit = false): boolean {
+  return Boolean(
+    explicit ||
+    cfg?.debugContextPreview ||
+    process.env.GM_DEBUG === "1" ||
+    process.env.GM_DEBUG_CONTEXT_PREVIEW === "1" ||
+    process.env.GM_DEBUG_RUNTIME_HOOKS === "1" ||
+    process.env.GM_DEBUG_RECALL_TIMING === "1"
+  );
+}
+
 
 // ─── System Prompt 引导文字 ──────────────────────────────────
 
@@ -249,6 +261,8 @@ function renderKnowledgeGraph(params: {
   includeUpdated?: boolean;
   includeConfidence?: boolean;
   sortNodes?: boolean;
+  debug?: boolean;
+  cfg?: GmConfig | null;
 }): { xml: string | null; tokens: number; renderedEdges: number; rawEdges: number } {
   let passNodes = params.nodes.filter(n => n.tier !== "filtered");
   if (params.sortNodes) {
@@ -268,7 +282,11 @@ function renderKnowledgeGraph(params: {
   }
 
   const idToName = new Map<string, string>();
-  for (const n of passNodes) idToName.set(n.id, n.name);
+  const idToTier = new Map<string, RecallTier>();
+  for (const n of passNodes) {
+    idToName.set(n.id, n.name);
+    idToTier.set(n.id, n.tier);
+  }
 
   const xmlParts: string[] = [];
   for (const n of passNodes) {
@@ -285,7 +303,7 @@ function renderKnowledgeGraph(params: {
       xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}/>`);
     } else {
       const scopeAttr = tier === "scope_hot" ? ` scope_hot="true"` : "";
-      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}${scopeAttr}>\n${n.content.trim()}\n  </${tag}>`);
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${srcAttr}${tierAttr}${beliefAttr}${timeAttr}${scopeAttr}>\n${escapeXml(n.content.trim())}\n  </${tag}>`);
     }
   }
 
@@ -303,10 +321,8 @@ function renderKnowledgeGraph(params: {
   for (const e of candidateEdges) {
     if (seenEdgeIds.has(e.id)) continue;
 
-    const fromNode = passNodes.find(n => n.id === e.fromId);
-    const toNode = passNodes.find(n => n.id === e.toId);
-    const fromTier = (fromNode as any)?.tier as RecallTier ?? "filtered";
-    const toTier = (toNode as any)?.tier as RecallTier ?? "filtered";
+    const fromTier = idToTier.get(e.fromId) ?? "filtered";
+    const toTier = idToTier.get(e.toId) ?? "filtered";
 
     if (!shouldRenderEdge(fromTier, toTier)) continue;
     seenEdgeIds.add(e.id);
@@ -318,16 +334,18 @@ function renderKnowledgeGraph(params: {
   }
 
   const tierCount = (tier: string) => passNodes.filter(n => n.tier === tier).length;
-  console.log(
-    `[graph-memory] assemble${params.logLabel ? `:${params.logLabel}` : ""}: ` +
-    `scope_hot=${tierCount("scope_hot")} ` +
-    `hot=${tierCount("hot")} ` +
-    `active=${tierCount("active")} ` +
-    `L1=${tierCount("L1")} ` +
-    `L2=${tierCount("L2")} ` +
-    `L3=${tierCount("L3")} ` +
-    `renderedEdges=${seenEdgeIds.size} (raw=${params.edges.length})`
-  );
+  if (isAssembleDebugEnabled(params.cfg, params.debug)) {
+    console.log(
+      `[graph-memory] assemble${params.logLabel ? `:${params.logLabel}` : ""}: ` +
+      `scope_hot=${tierCount("scope_hot")} ` +
+      `hot=${tierCount("hot")} ` +
+      `active=${tierCount("active")} ` +
+      `L1=${tierCount("L1")} ` +
+      `L2=${tierCount("L2")} ` +
+      `L3=${tierCount("L3")} ` +
+      `renderedEdges=${seenEdgeIds.size} (raw=${params.edges.length})`
+    );
+  }
 
   const nodesXml = xmlParts.join("\n");
   const edgesXml = edgesXmlParts.length
@@ -380,6 +398,7 @@ export function assembleStableContext(
     includeUpdated: false,
     includeConfidence: false,
     sortNodes: true,
+    cfg,
   });
 
   const systemPrompt = buildSystemPromptAddition({
@@ -394,11 +413,13 @@ export function assembleStableContext(
   });
   const body = rendered.xml ? `${systemPrompt}\n\n<gm_memory>\n\n${rendered.xml}\n\n</gm_memory>` : systemPrompt;
 
-  console.log(
-    `[graph-memory] assemble tokens: stableSys=${Math.ceil(systemPrompt.length / 3)} ` +
-    `stableXml=${Math.ceil((rendered.xml ?? "").length / 3)} ` +
-    `total=${Math.ceil(body.length / 3)}`
-  );
+  if (isAssembleDebugEnabled(cfg)) {
+    console.log(
+      `[graph-memory] assemble tokens: stableSys=${Math.ceil(systemPrompt.length / 3)} ` +
+      `stableXml=${Math.ceil((rendered.xml ?? "").length / 3)} ` +
+      `total=${Math.ceil(body.length / 3)}`
+    );
+  }
 
   return {
     xml: rendered.xml,
@@ -412,6 +433,7 @@ export function renderRecallIndexContext(params: {
   recalledNodes: TieredNode[];
   stableNodeIds?: Set<string>;
   logLabel?: string;
+  debug?: boolean;
 }): { xml: string | null; context: string; tokens: number } {
   const stableNodeIds = params.stableNodeIds ?? new Set<string>();
   const passNodes = params.recalledNodes
@@ -435,12 +457,14 @@ export function renderRecallIndexContext(params: {
     }
   }
 
-  console.log(
-    `[graph-memory] assemble${params.logLabel ? `:${params.logLabel}` : ":recall-index"}: ` +
-    `L1=${passNodes.filter(n => n.tier === "L1").length} ` +
-    `L2=${passNodes.filter(n => n.tier === "L2").length} ` +
-    `edges=0`,
-  );
+  if (isAssembleDebugEnabled(null, params.debug)) {
+    console.log(
+      `[graph-memory] assemble${params.logLabel ? `:${params.logLabel}` : ":recall-index"}: ` +
+      `L1=${passNodes.filter(n => n.tier === "L1").length} ` +
+      `L2=${passNodes.filter(n => n.tier === "L2").length} ` +
+      `edges=0`,
+    );
+  }
 
   const guidance = [
     "<!--",
@@ -478,14 +502,17 @@ export function assembleDynamicContext(
     nodes: mergedNodes,
     edges: allEdges,
     logLabel: "dynamic",
+    cfg,
   });
 
   const context = rendered.xml ? `<gm_memory>\n\n${rendered.xml}\n\n</gm_memory>` : "";
 
-  console.log(
-    `[graph-memory] assemble tokens: dynamicXml=${Math.ceil((rendered.xml ?? "").length / 3)} ` +
-    `total=${Math.ceil(context.length / 3)}`
-  );
+  if (isAssembleDebugEnabled(cfg)) {
+    console.log(
+      `[graph-memory] assemble tokens: dynamicXml=${Math.ceil((rendered.xml ?? "").length / 3)} ` +
+      `total=${Math.ceil(context.length / 3)}`
+    );
+  }
 
   return {
     xml: rendered.xml,
@@ -556,7 +583,11 @@ export function buildExtractKnowledgeGraph(
 
   // ── id → name 映射 ──────────────────────────────────────
   const idToName = new Map<string, string>();
-  for (const { node } of passNodes) idToName.set(node.id, node.name);
+  const idToExtractTier = new Map<string, RecallTier>();
+  for (const { node, tier } of passNodes) {
+    idToName.set(node.id, node.name);
+    idToExtractTier.set(node.id, tier);
+  }
 
   // ── 构建节点 XML（统一渲染，不分社区）──────────────────────
   // L1: 完整 content；L2: description；L3: name
@@ -573,7 +604,7 @@ export function buildExtractKnowledgeGraph(
       xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${tierAttr}/>`);
     } else {
       // L1
-      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${tierAttr}>\n${n.content.trim()}\n  </${tag}>`);
+      xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description || "")}"${tierAttr}>\n${escapeXml(n.content.trim())}\n  </${tag}>`);
     }
   }
 
@@ -591,10 +622,8 @@ export function buildExtractKnowledgeGraph(
     if (seenEdgeIds.has(e.id)) continue;
     seenEdgeIds.add(e.id);
 
-    const fromEntry = passNodes.find(ep => ep.node.id === e.fromId);
-    const toEntry = passNodes.find(ep => ep.node.id === e.toId);
-    const fromTier = fromEntry?.tier ?? "filtered";
-    const toTier = toEntry?.tier ?? "filtered";
+    const fromTier = idToExtractTier.get(e.fromId) ?? "filtered";
+    const toTier = idToExtractTier.get(e.toId) ?? "filtered";
 
     // 至少一端为 L1/L2
     const hasL1L2 = (fromTier === "L1" || fromTier === "L2") || (toTier === "L1" || toTier === "L2");

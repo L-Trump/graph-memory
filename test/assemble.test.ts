@@ -114,6 +114,26 @@ describe("hot 节点渲染", () => {
     expect(xml).toContain('tier="hot"');
   });
 
+  it("full-content node bodies escape XML metacharacters", () => {
+    const id = insertNode(db, {
+      name: "xml-body",
+      type: "KNOWLEDGE",
+      description: "desc <tag> & quote",
+      content: 'Use <danger> & "quotes" safely',
+    });
+    const node = findById(db, id)!;
+
+    const { xml } = assembleStableContext(db, null!, {
+      hotNodes: [node],
+      hotEdges: [] as GmEdge[],
+      scopeHotNodes: [] as GmNode[],
+      scopeHotEdges: [] as GmEdge[],
+    });
+
+    expect(xml).toContain("Use &lt;danger&gt; &amp; &quot;quotes&quot; safely");
+    expect(xml).not.toContain("Use <danger> &");
+  });
+
 
   it("stable context 去掉 updated/confidence 并稳定排序", () => {
     const bId = insertNode(db, { name: "b-hot", type: "SKILL", description: "b desc", content: "b content" });
@@ -284,6 +304,35 @@ describe("分层 assemble", () => {
     expect(dynamic.context).toContain("dynamic-l1");
     expect(dynamic.context).not.toContain("compact-active");
     expect(dynamic.context).not.toContain("shared-hot");
+  });
+
+  it("dynamic edge endpoint attributes are XML escaped", () => {
+    const fromId = insertNode(db, { name: 'from-&-"quoted"', type: "KNOWLEDGE", content: "from content" });
+    const toId = insertNode(db, { name: "to-<tag>", type: "SKILL", content: "to content" });
+    const fromNode = findById(db, fromId)!;
+    const toNode = findById(db, toId)!;
+    const edge: GmEdge = {
+      id: "edge-xml-endpoint",
+      fromId,
+      toId,
+      name: "uses",
+      description: "edge desc",
+      sessionId: "test",
+      createdAt: Date.now(),
+    };
+
+    const dynamic = assembleDynamicContext(db, null!, {
+      recalledNodes: [
+        { ...fromNode, tier: "L1" as const, semanticScore: 1, pprScore: 0, pagerankScore: 0, combinedScore: 1 },
+        { ...toNode, tier: "L1" as const, semanticScore: 1, pprScore: 0, pagerankScore: 0, combinedScore: 1 },
+      ],
+      recalledEdges: [edge],
+    });
+
+    expect(dynamic.context).toContain('from="from-&amp;-&quot;quoted&quot;"');
+    expect(dynamic.context).toContain('to="to-&lt;tag&gt;"');
+    expect(dynamic.context).not.toContain('from="from-&-"quoted""');
+    expect(dynamic.context).not.toContain('to="to-<tag>"');
   });
 });
 

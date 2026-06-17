@@ -1378,6 +1378,7 @@ ${suggestionsText}
             recalledNodes: rec.nodes,
             stableNodeIds,
             logLabel: "recall-index",
+            debug: debugRuntimeHooks,
           })
           : { context: "", tokens: 0 };
         bpbTiming("prepare-output-mode", `mode=${autoRecallMode} appendChars=${append.length} prependChars=${prepend.length} indexTok=${recallIndex.tokens}`);
@@ -3213,8 +3214,8 @@ content hash 变化：${hashChanged} 个
               0.33,
             );
 
-            console.log('[GM_DREAM] seedFromRecalled:', seedFromRecalled?.nodeName, seedFromRecalled?.nodeId);
-            console.log('[GM_DREAM] seedFromCreated:', seedFromCreated?.name, seedFromCreated?.id);
+            logRuntimeDebug(`[GM_DREAM] seedFromRecalled: ${seedFromRecalled?.nodeName ?? '-'} ${seedFromRecalled?.nodeId ?? '-'}`);
+            logRuntimeDebug(`[GM_DREAM] seedFromCreated: ${seedFromCreated?.name ?? '-'} ${seedFromCreated?.id ?? '-'}`);
 
             if (!seedFromRecalled && !seedFromCreated) {
               return {
@@ -3230,14 +3231,14 @@ content hash 变化：${hashChanged} 个
 
             if (seedFromRecalled) {
               const result = await recaller.exploreSubgraph(seedFromRecalled.nodeId);
-              console.log('[GM_DREAM] recalled result: roots=', result.roots.length, 'nodes=', result.nodes.length);
+              logRuntimeDebug(`[GM_DREAM] recalled result: roots=${result.roots.length} nodes=${result.nodes.length}`);
               if (result.roots.length && result.nodes.length) {
                 const { seeds, subgraphs: sg } = buildSubgraphResult(
                   result.roots,
                   result.nodes,
                   result.edges,
                 );
-                console.log('[GM_DREAM] after build: allSeeds.length=', allSeeds.length, 'sg.length=', sg.length);
+                logRuntimeDebug(`[GM_DREAM] after build: allSeeds.length=${allSeeds.length} sg.length=${sg.length}`);
                 allSeeds.push(...seeds);
 
                 // ── 补充：带出种子节点最新 session 的所有节点 ─────────────
@@ -3266,10 +3267,10 @@ content hash 变化：${hashChanged} 个
 
             if (seedFromCreated) {
               const alreadySeedNames = new Set(allSeeds.map((r: any) => r.name));
-              console.log('[GM_DREAM] created alreadySeedNames:', Array.from(alreadySeedNames), 'checking:', seedFromCreated.name);
+              logRuntimeDebug(`[GM_DREAM] created alreadySeedNames=${Array.from(alreadySeedNames).join(',')} checking=${seedFromCreated.name}`);
               if (!alreadySeedNames.has(seedFromCreated.name)) {
                 const result = await recaller.exploreSubgraph(seedFromCreated.id);
-                console.log('[GM_DREAM] created result: roots=', result.roots.length, 'nodes=', result.nodes.length);
+                logRuntimeDebug(`[GM_DREAM] created result: roots=${result.roots.length} nodes=${result.nodes.length}`);
                 if (result.roots.length && result.nodes.length) {
                   const { seeds, subgraphs: sg } = buildSubgraphResult(
                     result.roots,

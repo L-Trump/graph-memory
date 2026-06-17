@@ -304,9 +304,10 @@ export function graphWalk(
 ): { nodes: GmNode[]; edges: GmEdge[] } {
   if (!seedIds.length) return { nodes: [], edges: [] };
 
-  const visited = new Set<string>(seedIds);
-  let frontier = new Set<string>(seedIds);
-  const nodeIdList: string[] = [...seedIds];
+  const seedSlice = maxNodes > 0 ? seedIds.slice(0, maxNodes) : [];
+  const visited = new Set<string>(seedSlice);
+  let frontier = new Set<string>(seedSlice);
+  const nodeIdList: string[] = [...seedSlice];
 
   for (let depth = 0; depth < maxDepth && frontier.size > 0; depth++) {
     if (visited.size >= maxNodes) break;
@@ -322,8 +323,14 @@ export function graphWalk(
 
     const nextFrontier = new Set<string>();
     for (const { from_id, to_id } of rows) {
-      if (!visited.has(to_id)) { visited.add(to_id); nextFrontier.add(to_id); nodeIdList.push(to_id); }
-      if (!visited.has(from_id)) { visited.add(from_id); nextFrontier.add(from_id); nodeIdList.push(from_id); }
+      if (!visited.has(to_id)) {
+        if (visited.size >= maxNodes) break;
+        visited.add(to_id); nextFrontier.add(to_id); nodeIdList.push(to_id);
+      }
+      if (!visited.has(from_id)) {
+        if (visited.size >= maxNodes) break;
+        visited.add(from_id); nextFrontier.add(from_id); nodeIdList.push(from_id);
+      }
     }
 
     frontier = nextFrontier;
@@ -396,7 +403,7 @@ export function getRecentExtractedMessages(
   const lastExtracted = db
     .prepare("SELECT MAX(turn_index) as maxTurn FROM gm_messages WHERE session_id=? AND extracted=1")
     .get(sid) as any;
-  if (!lastExtracted?.maxTurn) return [];
+  if (lastExtracted?.maxTurn == null) return [];
 
   // 向前取足够的已提取消息（每轮假设最多 20 条，recentTurns * 20 是安全上限）
   const rows = db

@@ -12,7 +12,7 @@ import {
   findByName, findById, upsertNode, upsertEdge, deprecate,
   mergeNodes, edgesFrom, edgesTo, allActiveNodes, allEdges,
   searchNodes, topNodes, graphWalk, getBySession,
-  saveMessage, getMessages, getUnextracted, markExtracted,
+  saveMessage, getMessages, getUnextracted, getRecentExtractedMessages, markExtracted,
   saveSignal, pendingSignals, markSignalsDone,
   getStats, saveVector, vectorSearch, getAllVectors,
   setNodeFlags,
@@ -278,6 +278,18 @@ describe("graphWalk", () => {
     expect(nodes).toHaveLength(0);
     expect(edges).toHaveLength(0);
   });
+
+  it("maxNodes cap is enforced inside a hub-heavy expansion", () => {
+    const seed = insertNode(db, { name: "hub-seed" });
+    for (let i = 0; i < 20; i++) {
+      const child = insertNode(db, { name: `hub-child-${i}` });
+      insertEdge(db, { fromId: seed, toId: child, name: "links" });
+    }
+
+    const { nodes } = graphWalk(db, [seed], 1, 5);
+    expect(nodes).toHaveLength(5);
+    expect(nodes.map(n => n.name)).toContain("hub-seed");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -297,6 +309,15 @@ describe("messages & signals", () => {
     unext = getUnextracted(db, "s1", 10);
     expect(unext).toHaveLength(1);
     expect(unext[0].turn_index).toBe(3);
+  });
+
+  it("getRecentExtractedMessages handles maxTurn 0", () => {
+    saveMessage(db, "s-turn0", 0, "user", "first turn");
+    markExtracted(db, "s-turn0", 0);
+
+    const recent = getRecentExtractedMessages(db, "s-turn0", 1);
+    expect(recent).toHaveLength(1);
+    expect(recent[0].turn_index).toBe(0);
   });
 
   it("saveSignal + pendingSignals + markSignalsDone", () => {
