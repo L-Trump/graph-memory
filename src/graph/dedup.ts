@@ -86,7 +86,13 @@ function bucketVectorsByType(vectors: VectorRow[]): Map<NodeType, VectorRow[]> {
  * 需要 embedding 才能工作，没有向量的节点会被跳过。
  * FTS5 名称完全匹配由 store.upsertNode 已处理，这里处理语义重复。
  */
-type DetectResult = { pairs: DuplicatePair[]; comparisons: number; checkedNodeIds: string[]; incremental: boolean };
+type DetectResult = {
+  pairs: DuplicatePair[];
+  comparisons: number;
+  checkedNodeIds: string[];
+  incremental: boolean;
+  exhaustedPairBudget: boolean;
+};
 
 async function collectPair(db: DatabaseSyncInstance, pairs: DuplicatePair[], left: VectorRow, right: VectorRow, sim: number): Promise<void> {
   const nodeA = findById(db, left.nodeId);
@@ -106,18 +112,30 @@ async function detectDuplicateDetails(db: DatabaseSyncInstance, cfg: GmConfig): 
   if (pendingLimit === 0) return detectDuplicateDetailsFull(db, cfg);
 
   const pending = getPendingDedupVectors(db, pendingLimit);
-  if (pending.length === 0) return { pairs: [], comparisons: 0, checkedNodeIds: [], incremental: true };
+  if (pending.length === 0) return { pairs: [], comparisons: 0, checkedNodeIds: [], incremental: true, exhaustedPairBudget: false };
 
   const threshold = cfg.dedupThreshold;
   const maxPairs = cfg.dedupMaxPairsPerRun ?? 1000;
   const pairs: DuplicatePair[] = [];
   const fullyCheckedIds: string[] = [];
   let comparisons = 0;
+  let exhaustedPairBudget = false;
   const YIELD_EVERY = 1000;
+
+  const collectIfBudgetAllows = async (left: VectorRow, right: VectorRow, sim: number): Promise<boolean> => {
+    if (sim < threshold) return true;
+    if (maxPairs !== 0 && pairs.length >= maxPairs) {
+      exhaustedPairBudget = true;
+      return false;
+    }
+    await collectPair(db, pairs, left, right, sim);
+    return true;
+  };
 
   for (const [type, bucketPending] of bucketVectorsByType(pending)) {
     const pendingIds = bucketPending.map(row => row.nodeId);
     const candidates = getDedupCandidateVectorsByType(db, type, pendingIds);
+    let bucketFullyChecked = true;
 
     // Compare pending vectors against each other, then against already checked
     // same-type active vectors. Unchecked backlog is left for later passes, so
@@ -126,9 +144,7 @@ async function detectDuplicateDetails(db: DatabaseSyncInstance, cfg: GmConfig): 
     for (let i = 0; i < bucketPending.length; i++) {
       for (let j = i + 1; j < bucketPending.length; j++) {
         const sim = cosineSim(bucketPending[i].embedding, bucketPending[j].embedding);
-        if (sim >= threshold && (maxPairs === 0 || pairs.length < maxPairs)) {
-          await collectPair(db, pairs, bucketPending[i], bucketPending[j], sim);
-        }
+        if (!(await collectIfBudgetAllows(bucketPending[i], bucketPending[j], sim))) bucketFullyChecked = false;
         comparisons++;
         if (comparisons % YIELD_EVERY === 0) await new Promise(r => setImmediate(r));
       }
@@ -137,22 +153,26 @@ async function detectDuplicateDetails(db: DatabaseSyncInstance, cfg: GmConfig): 
     for (const left of bucketPending) {
       for (const right of candidates) {
         const sim = cosineSim(left.embedding, right.embedding);
-        if (sim >= threshold && (maxPairs === 0 || pairs.length < maxPairs)) {
-          await collectPair(db, pairs, left, right, sim);
-        }
+        if (!(await collectIfBudgetAllows(left, right, sim))) bucketFullyChecked = false;
         comparisons++;
         if (comparisons % YIELD_EVERY === 0) await new Promise(r => setImmediate(r));
       }
-      fullyCheckedIds.push(left.nodeId);
     }
+
+    // If the pair budget prevented collecting one or more duplicate pairs in
+    // this bucket, none of this bucket's pending vectors can be considered fully
+    // checked: they must remain dirty so a later maintenance pass can finish
+    // duplicate handling. This is deliberately conservative and avoids
+    // permanently skipping pairs when dedupMaxPairsPerRun is small.
+    if (bucketFullyChecked) fullyCheckedIds.push(...pendingIds);
   }
 
-  return { pairs: pairs.sort((a, b) => b.similarity - a.similarity), comparisons, checkedNodeIds: fullyCheckedIds, incremental: true };
+  return { pairs: pairs.sort((a, b) => b.similarity - a.similarity), comparisons, checkedNodeIds: fullyCheckedIds, incremental: true, exhaustedPairBudget };
 }
 
 async function detectDuplicateDetailsFull(db: DatabaseSyncInstance, cfg: GmConfig): Promise<DetectResult> {
   const vectors = getAllVectors(db);
-  if (vectors.length < 2) return { pairs: [], comparisons: 0, checkedNodeIds: [], incremental: false };
+  if (vectors.length < 2) return { pairs: [], comparisons: 0, checkedNodeIds: [], incremental: false, exhaustedPairBudget: false };
 
   const threshold = cfg.dedupThreshold;
   const maxPairs = cfg.dedupMaxPairsPerRun ?? 1000;
@@ -175,7 +195,7 @@ async function detectDuplicateDetailsFull(db: DatabaseSyncInstance, cfg: GmConfi
     }
   }
 
-  return { pairs: pairs.sort((a, b) => b.similarity - a.similarity), comparisons, checkedNodeIds: vectors.map(row => row.nodeId), incremental: false };
+  return { pairs: pairs.sort((a, b) => b.similarity - a.similarity), comparisons, checkedNodeIds: vectors.map(row => row.nodeId), incremental: false, exhaustedPairBudget: false };
 }
 
 export async function detectDuplicates(db: DatabaseSyncInstance, cfg: GmConfig): Promise<DuplicatePair[]> {
@@ -196,12 +216,18 @@ export async function dedup(db: DatabaseSyncInstance, cfg: GmConfig): Promise<De
   const pairs = detected.pairs;
   let merged = 0;
   const maxMerges = cfg.dedupMaxMergesPerRun ?? 200;
+  const checkedNodeIds = new Set(detected.checkedNodeIds);
 
   // 已经被合并过的节点不再参与合并
   const consumed = new Set<string>();
 
   for (const pair of pairs) {
-    if (maxMerges >= 0 && merged >= maxMerges) break;
+    if (maxMerges === 0) continue;
+    if (maxMerges > 0 && merged >= maxMerges) {
+      checkedNodeIds.delete(pair.nodeA);
+      checkedNodeIds.delete(pair.nodeB);
+      continue;
+    }
     if (consumed.has(pair.nodeA) || consumed.has(pair.nodeB)) continue;
 
     const a = findById(db, pair.nodeA);
@@ -228,14 +254,14 @@ export async function dedup(db: DatabaseSyncInstance, cfg: GmConfig): Promise<De
     merged++;
   }
 
-  markVectorsDedupChecked(db, detected.checkedNodeIds);
+  markVectorsDedupChecked(db, Array.from(checkedNodeIds));
   const pendingAfter = countPendingDedupVectors(db);
 
   return {
     pairs,
     merged,
     comparisons: detected.comparisons,
-    checkedVectors: detected.checkedNodeIds.length,
+    checkedVectors: checkedNodeIds.size,
     incremental: detected.incremental,
     pendingBefore,
     pendingAfter,

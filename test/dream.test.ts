@@ -27,6 +27,17 @@ describe("gm_explore — exploreSubgraph", () => {
     expect(result.edges).toHaveLength(0);
   });
 
+  it("支持按精确节点名称探索子图", async () => {
+    const nodeId = insertNode(db, { name: "按名称探索节点", type: "SKILL" });
+    const result = await recaller.exploreSubgraph("按名称探索节点");
+
+    expect(result.roots).toHaveLength(1);
+    expect(result.roots[0].id).toBe(nodeId);
+    expect(result.roots[0].name).toBe("按名称探索节点");
+    expect(result.nodes.map((n: any) => n.id)).toContain(nodeId);
+  });
+
+
   it("有连接的节点返回邻居子图", async () => {
     const id1 = insertNode(db, { name: "节点甲", type: "SKILL" });
     const id2 = insertNode(db, { name: "节点乙", type: "KNOWLEDGE" });

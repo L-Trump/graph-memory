@@ -35,7 +35,7 @@ import type { EmbedFn } from "../engine/embed.ts";
 import {
   searchNodes, vectorSearchWithScore,
   graphWalk,
-  saveVector, getVectorHash, findById,
+  saveVector, getVectorHash, findById, findByName,
 } from "../store/store.ts";
 import { personalizedPageRank } from "../graph/pagerank.ts";
 import { combinedScore, type Scored } from "./score.ts";
@@ -597,7 +597,9 @@ export class Recaller {
     const limit = maxNodes ?? this.cfg.recallMaxNodes;
 
     // ── 1. 找到种子节点 ──────────────────────────────────────
-    const seedNode = findById(this.db, seedName);
+    // gm_explore 的公开参数是 nodeName；保留 findById fallback 兼容旧的
+    // gm_dream/测试调用方传 node id 的用法。
+    const seedNode = findByName(this.db, seedName) ?? findById(this.db, seedName);
     if (!seedNode) {
       return { roots: [], nodes: [], edges: [], pprScores: {} };
     }

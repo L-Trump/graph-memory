@@ -335,7 +335,7 @@ describe("Vector Dedup", () => {
     expect(result.comparisons).toBe(3);
   });
 
-  it("dedup incremental pair cap still makes forward progress on duplicate-heavy pending batch", async () => {
+  it("dedup incremental pair cap leaves affected pending vectors dirty", async () => {
     const vec = Array.from({ length: 64 }, (_, i) => Math.sin(i * 0.1));
     for (let i = 0; i < 3; i++) {
       const node = insertNode(db, { name: `incremental-cap-${i}`, type: "SKILL" });
@@ -352,17 +352,51 @@ describe("Vector Dedup", () => {
 
     expect(first.incremental).toBe(true);
     expect(first.pairs).toHaveLength(1);
-    expect(first.checkedVectors).toBe(3);
+    expect(first.checkedVectors).toBe(0);
+    expect(first.pendingAfter).toBe(3);
 
     const second = await dedup(db, {
       ...cfg,
       dedupThreshold: 0.9,
       dedupMaxMergesPerRun: 0,
-      dedupMaxPairsPerRun: 1,
+      dedupMaxPairsPerRun: 0,
       dedupMaxPendingVectorsPerRun: 3,
     });
-    expect(second.checkedVectors).toBe(0);
-    expect(second.comparisons).toBe(0);
+    expect(second.pairs.length).toBeGreaterThan(1);
+    expect(second.checkedVectors).toBe(3);
+    expect(second.pendingAfter).toBe(0);
+  });
+
+  it("dedup merge budget leaves unmerged duplicate pairs eligible for next run", async () => {
+    for (let i = 0; i < 2; i++) {
+      const a = insertNode(db, { name: `merge-budget-pending-${i}-a`, type: "SKILL", validatedCount: 2 });
+      const b = insertNode(db, { name: `merge-budget-pending-${i}-b`, type: "SKILL", validatedCount: 1 });
+      const vec = Array.from({ length: 64 }, (_, j) => Math.sin(j * 0.1 + i));
+      saveVector(db, a, `merge budget ${i} a`, vec);
+      saveVector(db, b, `merge budget ${i} b`, vec);
+    }
+
+    const first = await dedup(db, {
+      ...cfg,
+      dedupThreshold: 0.9,
+      dedupMaxMergesPerRun: 1,
+      dedupMaxPairsPerRun: 0,
+      dedupMaxPendingVectorsPerRun: 4,
+    });
+
+    expect(first.merged).toBe(1);
+    expect(first.checkedVectors).toBeLessThan(4);
+    expect(first.pendingAfter).toBeGreaterThan(0);
+
+    const second = await dedup(db, {
+      ...cfg,
+      dedupThreshold: 0.9,
+      dedupMaxMergesPerRun: 1,
+      dedupMaxPairsPerRun: 0,
+      dedupMaxPendingVectorsPerRun: 4,
+    });
+    expect(second.merged).toBe(1);
+    expect(second.pendingAfter).toBe(0);
   });
 
   it("dedup pair budget caps returned candidate pairs", async () => {
