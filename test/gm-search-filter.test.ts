@@ -7,58 +7,7 @@
 import { describe, it, expect } from "vitest";
 import { createTestDb } from "./helpers.ts";
 
-// ─────────────────────────────────────────────────────────────────
-// 辅助：从 index.ts 复制的 gm_search 过滤+渲染逻辑
-// ─────────────────────────────────────────────────────────────────
-function filterAndFormat(res: { nodes: any[]; edges: any[] }) {
-  const displayNodes = res.nodes.filter((n) => n.tier !== "filtered");
-  const nodeMap = new Map(displayNodes.map((n) => [n.id, n]));
-
-  const lines = displayNodes.map((n) => {
-    const tierLabel =
-      n.tier === "hot" ? "【🔥HOT】" :
-      n.tier === "L1" ? "【L1-完整】" :
-      n.tier === "L2" ? "【L2-描述】" :
-      "【L3-名称】";
-    const hotFlag = n.flags?.includes("hot") ? " 🔥" : "";
-    const scores: string[] = [];
-    if (n.semanticScore != null) scores.push(`语义=${n.semanticScore.toFixed(3)}`);
-    if (n.pprScore != null) scores.push(`PPR=${n.pprScore.toFixed(3)}`);
-    if (n.combinedScore != null) scores.push(`综合=${n.combinedScore.toFixed(3)}`);
-    const scoreStr = scores.length ? ` (${scores.join(", ")})` : "";
-    // L1: 完整内容，L2: description，L3/hot: 仅名字
-    let contentPart = "";
-    if (n.tier === "L1") {
-      contentPart = `\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
-    } else if (n.tier === "L2") {
-      contentPart = n.description ? `\n描述: ${n.description}` : "";
-    }
-    return `${tierLabel} [${n.type}] ${n.name}${hotFlag}${scoreStr}${contentPart}`;
-  });
-
-  const filteredEdges = res.edges.filter(
-    (e) => nodeMap.has(e.fromId) && nodeMap.has(e.toId),
-  );
-  const edgeLines = filteredEdges.map((e) => {
-    const from = nodeMap.get(e.fromId)?.name ?? e.fromId;
-    const to = nodeMap.get(e.toId)?.name ?? e.toId;
-    return `  ${from} --[${e.name}]--> ${to}: ${e.description}`;
-  });
-
-  const text = [
-    `找到 ${displayNodes.length} 个节点：\n`,
-    ...lines,
-    ...(edgeLines.length ? ["\n关系：", ...edgeLines] : []),
-  ].join("\n\n");
-
-  const tieredInfo = displayNodes.map((n) => ({
-    id: n.id, type: n.type, name: n.name,
-    description: n.description, content: n.content,
-    tier: n.tier,
-  }));
-
-  return { displayNodes, lines, text, filteredEdges, count: displayNodes.length, tieredInfo };
-}
+import { formatGmSearchResult as filterAndFormat } from "../src/tools/search-format.ts";
 
 // ─────────────────────────────────────────────────────────────────
 // 模拟 RecallResult

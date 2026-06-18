@@ -13,52 +13,12 @@ import {
   getRecentlyCreatedNodes,
   findById,
 } from "../src/store/store.ts";
+import { buildSubgraphResult, exponentialDecayPick } from "../src/tools/dream.ts";
 
 const TEST_DB = "/tmp/gm-test.db";
 const describeRealDb = process.env.RUN_GM_REAL_DB_TESTS === "1" ? describe : describe.skip;
 
 type DreamNode = { id: string; name: string; type: string; description?: string; content?: string; tier?: string };
-type DreamEdge = { fromId: string; toId: string };
-
-function buildSubgraphResult(roots: DreamNode[], nodes: DreamNode[], edges: DreamEdge[]) {
-  const tieredNodes = nodes.filter(n => n.tier === "L1");
-  const nodeIds = new Set(tieredNodes.map(n => n.id));
-  const subgraphEdges = edges.filter(e => nodeIds.has(e.fromId) && nodeIds.has(e.toId));
-
-  return {
-    seeds: roots.map(r => ({
-      id: r.id,
-      name: r.name,
-      type: r.type,
-      description: r.description ?? "",
-      content: (r.content ?? "").slice(0, 200),
-    })),
-    subgraphs: roots.map(root => ({ seed: root.name, nodes: tieredNodes, edges: subgraphEdges })),
-  };
-}
-
-function exponentialDecayPick<T extends Record<string, unknown>>(
-  candidates: T[],
-  timeField: keyof T,
-  lambda = 0.33,
-): T | null {
-  if (!candidates.length) return null;
-  const now = Date.now();
-  const msPerDay = 86_400_000;
-  const withWeights = candidates.map(c => {
-    const t = Number(c[timeField]) || 0;
-    const days = Math.max(0, (now - t) / msPerDay);
-    return { item: c, weight: Math.exp(-lambda * days) };
-  });
-  const total = withWeights.reduce((sum, w) => sum + w.weight, 0);
-  if (total <= 0) return candidates[0];
-  let r = Math.random() * total;
-  for (const { item, weight } of withWeights) {
-    r -= weight;
-    if (r <= 0) return item;
-  }
-  return withWeights[withWeights.length - 1].item;
-}
 
 describeRealDb("gm_dream real DB smoke", () => {
   it("recent recalled and created pools have candidates", () => {
@@ -123,7 +83,7 @@ describeRealDb("gm_dream real DB smoke", () => {
 
       const rootsById = new Map<string, DreamNode>();
       const nodes: DreamNode[] = [];
-      const edges: DreamEdge[] = [];
+      const edges: any[] = [];
       for (const id of [recalledPick!.nodeId, createdPick!.id]) {
         const sub = await recaller.exploreSubgraph(id);
         for (const root of sub.roots) rootsById.set(root.id, root);

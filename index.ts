@@ -32,6 +32,7 @@ import {
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Recaller, type TieredNode } from "./src/recaller/recall.ts";
+import { parallelRecall } from "./src/recaller/parallel.ts";
 import { Extractor } from "./src/extractor/extract.ts";
 import { assembleStableContext, assembleDynamicContext, renderRecallIndexContext, buildExtractKnowledgeGraph } from "./src/format/assemble.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
@@ -40,6 +41,8 @@ import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pageran
 import { induceTopics, induceSession } from "./src/engine/induction.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
 import { createGraphMemoryLogger } from "./src/logger.ts";
+import { formatGmSearchResult } from "./src/tools/search-format.ts";
+import { buildSubgraphResult, exponentialDecayPick, formatSubgraphForLLM } from "./src/tools/dream.ts";
 
 // ─── 从 OpenClaw config 读 provider/model ────────────────────
 
@@ -1995,105 +1998,11 @@ ${suggestionsText}
             recordNodeAccessBatch(db, l1NodeIds);
           }
 
-          // 过滤掉 filtered 节点
-          const displayNodes = res.nodes.filter((n: any) => n.tier !== "filtered");
-          const nodeMap = new Map(displayNodes.map((n: any) => [n.id, n]));
-
-          const normalizeDisplayScores = (values: Array<number | null | undefined>): Array<number | null> => {
-            const numeric = values.filter((v): v is number => typeof v === "number" && Number.isFinite(v));
-            if (numeric.length === 0) return values.map(() => null);
-            const min = Math.min(...numeric);
-            const max = Math.max(...numeric);
-            return values.map((v) => {
-              if (typeof v !== "number" || !Number.isFinite(v)) return null;
-              if (max === min) return 1;
-              return (v - min) / (max - min);
-            });
-          };
-          // 语义分数展示原始值；PPR/PR 的原始绝对值不直观，展示时按本次结果集归一化。
-          const normalizedPprScores = normalizeDisplayScores(displayNodes.map((n: any) => n.pprScore));
-          const normalizedPagerankScores = normalizeDisplayScores(displayNodes.map((n: any) => n.pagerankScore));
-
-          const lines = displayNodes.map((n: any, i: number) => {
-            const tierLabel = n.tier === "hot" ? "【🔥HOT】" : n.tier === "L1" ? "【L1-完整】" : n.tier === "L2" ? "【L2-描述】" : "【L3-名称】";
-            const hotFlag = n.flags?.includes("hot") ? " 🔥" : "";
-            const scores = [];
-            if (n.semanticScore != null) scores.push(`语义=${n.semanticScore.toFixed(3)}`);
-            const displayPpr = normalizedPprScores[i];
-            const displayPagerank = normalizedPagerankScores[i];
-            if (displayPpr != null) scores.push(`PPR=${displayPpr.toFixed(3)}`);
-            if (displayPagerank != null) scores.push(`PR=${displayPagerank.toFixed(3)}`);
-            if (n.combinedScore != null) scores.push(`综合=${n.combinedScore.toFixed(3)}`);
-            if (n.belief != null) scores.push(`置信度=${n.belief.toFixed(3)}`);
-            const scoreStr = scores.length ? ` (${scores.join(", ")})` : "";
-            // L1: 完整内容，L2: description，L3/hot: 仅名字
-            let contentPart = "";
-            if (n.tier === "L1") {
-              contentPart = `\n${n.description || ""}\n${(n.content || "").slice(0, 300)}`;
-            } else if (n.tier === "L2") {
-              contentPart = n.description ? `\n描述: ${n.description}` : "";
-            }
-            return `${tierLabel} [${n.type}] ${n.name}${hotFlag}${scoreStr}${contentPart}`;
-          });
-
-          const filteredEdges = res.edges.filter(
-            (e: any) => nodeMap.has(e.fromId) && nodeMap.has(e.toId),
-          );
-          const edgeLines = filteredEdges.map((e: any) => {
-            const from = nodeMap.get(e.fromId)?.name ?? e.fromId;
-            const to = nodeMap.get(e.toId)?.name ?? e.toId;
-            return `  ${from} --[${e.name}]--> ${to}: ${e.description}`;
-          });
-
-          const text = [
-            `找到 ${displayNodes.length} 个节点：\n`,
-            ...lines,
-            ...(edgeLines.length ? ["\n关系：", ...edgeLines] : []),
-          ].join("\n\n");
-
-          // 返回完整 TieredNode 信息（已过滤 filtered）
-          const tieredInfo = displayNodes.map((n: any, i: number) => {
-            // Get belief info if available
-            let belief: number | null = null;
-            let successCount: number | null = null;
-            let failureCount: number | null = null;
-            try {
-              const bRow = db.prepare("SELECT belief, success_count, failure_count FROM gm_nodes WHERE id=?").get(n.id) as any;
-              if (bRow) {
-                belief = bRow.belief ?? null;
-                successCount = bRow.success_count ?? null;
-                failureCount = bRow.failure_count ?? null;
-              }
-            } catch { /* belief not available */ }
-
-            return {
-              id: n.id,
-              type: n.type,
-              name: n.name,
-              description: n.description,
-              content: n.content,
-              status: n.status,
-              flags: n.flags ?? [],
-              validatedCount: n.validatedCount,
-              pagerank: n.pagerank,
-              createdAt: n.createdAt,
-              updatedAt: n.updatedAt,
-              tier: n.tier,
-              semanticScore: n.semanticScore ?? null,
-              pprScore: n.pprScore ?? null,
-              pagerankScore: n.pagerankScore ?? null,
-              displayPprScore: normalizedPprScores[i],
-              displayPagerankScore: normalizedPagerankScores[i],
-              combinedScore: n.combinedScore ?? null,
-              belief,
-              successCount,
-              failureCount,
-            };
-          });
+          const formatted = formatGmSearchResult(res, { db });
 
           return {
-            content: [{ type: "text", text }],
-            details: { count: displayNodes.length, query, tieredInfo },
+            content: [{ type: "text", text: formatted.text }],
+            details: { count: formatted.count, query, tieredInfo: formatted.tieredInfo },
           };
         },
       }),
@@ -3000,93 +2909,6 @@ content hash 变化：${hashChanged} 个
     );
 
     // ── gm_explore ──────────────────────────────────────────
-    // 把子图格式化成对 LLM 友好的文字描述
-    function formatSubgraphForLLM(seeds: any[], subgraphs: any[]): string {
-      const lines: string[] = [];
-
-      for (const sg of subgraphs) {
-        lines.push(`== 关联记忆 ==`);
-
-        // 种子节点（锚点）
-        const seed = seeds.find((s: any) => s.name === sg.seed);
-        const lastAccessed = seed?.lastAccessedAt
-          ? new Date(seed.lastAccessedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
-          : "从未";
-        lines.push(`【种子】${seed?.name || sg.seed}`);
-        lines.push(`  类型: ${seed?.type || "?"} | 置信度: ${(seed?.belief ?? 0.5).toFixed(3)} | 访问: ${lastAccessed}`);
-        if (seed?.description) lines.push(`  简介: ${seed.description}`);
-        lines.push(`  内容: ${seed?.content || "(无)"}`);
-        lines.push("");
-
-        // 关联节点（排除种子自身）：L1层节点 + active节点（来自同session）
-        const relatedNodes = sg.nodes.filter((n: any) => n.id !== seed?.id && (n.tier === "L1" || n.tier === "active"));
-
-        for (const n of relatedNodes) {
-          const lastAccessed = n.lastAccessedAt
-            ? new Date(n.lastAccessedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
-            : "从未";
-          lines.push(`【关联】${n.name}`);
-          lines.push(`  类型: ${n.type} | 置信度: ${(n.belief ?? 0.5).toFixed(3)} | 访问: ${lastAccessed}`);
-          if (n.description) lines.push(`  简介: ${n.description}`);
-          lines.push(`  内容: ${n.content || "(无)"}`);
-          lines.push("");
-        }
-
-        if (sg.edges.length > 0) {
-          lines.push(`--- 关联 (${sg.edges.length} 条) ---`);
-          for (const e of sg.edges) {
-            const fromName = e.fromName || e.fromId;
-            const toName = e.toName || e.toId;
-            const desc = e.description ? ` — ${e.description}` : "";
-            lines.push(`  ${fromName} --[${e.name}]--> ${toName}${desc}`);
-          }
-          lines.push("");
-        }
-      }
-
-      return lines.join("\n").trim();
-    }
-
-    function buildSubgraphResult(
-      roots: any[],
-      nodes: any[],
-      edges: any[],
-    ): { seeds: any[]; subgraphs: any[] } {
-      // 只保留 L1 节点，排除 L2/L3/filtered
-      const tieredNodes = nodes.filter((n: any) => n.tier === "L1");
-      // 过滤出两端都在 tieredNodes 中的边
-      const nodeIds = new Set(tieredNodes.map((n: any) => n.id));
-      const filteredEdges = edges.filter(
-        (e: any) => nodeIds.has(e.fromId) && nodeIds.has(e.toId),
-      );
-
-      // 返回所有 L1/L2/L3 节点（图孤立但语义相关的节点也需要被梦到）
-      const allNodes = tieredNodes;
-      const allNodeIds = new Set(allNodes.map((n: any) => n.id));
-      // 边：只保留两端都在 allNodes 中的
-      const subgraphEdges = filteredEdges.filter(
-        (e: any) => allNodeIds.has(e.fromId) && allNodeIds.has(e.toId),
-      );
-
-      const subgraphs = roots.map((root: any) => {
-        return { seed: root.name, nodes: allNodes, edges: subgraphEdges };
-      });
-
-      return {
-        seeds: roots.map((r: any) => ({
-          id: r.id,
-          name: r.name,
-          type: r.type,
-          description: r.description ?? "",
-          content: r.content ?? "",
-          lastAccessedAt: r.lastAccessedAt ?? 0,
-          accessCount: r.accessCount ?? 0,
-          combinedScore: r.combinedScore ?? 1.0, // 种子节点固定为1.0
-        })),
-        subgraphs,
-      };
-    }
-
     api.registerTool(
       (_ctx: any) => ({
         name: "gm_explore",
@@ -3162,29 +2984,6 @@ content hash 变化：${hashChanged} 个
     );
 
     // ── gm_dream ──────────────────────────────────────────────
-    function exponentialDecayPick<T extends Record<string, unknown>>(
-      candidates: T[],
-      timeField: keyof T,
-      lambda = 0.33,
-    ): T | null {
-      if (!candidates.length) return null;
-      const now = Date.now();
-      const MS_PER_DAY = 86_400_000;
-      const withWeights = candidates.map(c => {
-        const t = Number(c[timeField]) ?? 0;
-        const days = Math.max(0, (now - t) / MS_PER_DAY);
-        return { item: c, weight: Math.exp(-lambda * days) };
-      });
-      const totalWeight = withWeights.reduce((s, w) => s + w.weight, 0);
-      if (totalWeight <= 0) return candidates[0];
-      let r = Math.random() * totalWeight;
-      for (const { item, weight } of withWeights) {
-        r -= weight;
-        if (r <= 0) return item;
-      }
-      return withWeights[withWeights.length - 1].item;
-    }
-
     api.registerTool(
       (_ctx: any) => ({
         name: "gm_dream",
@@ -3353,56 +3152,6 @@ function estimateMsgTokens(msg: any): number {
 
 const DEFAULT_KEEP_TURNS = 5;  // assemble 阶段保留最近 5 轮
 const RECALL_KEEP_TURNS = 2;   // recall 阶段只取最近 2 轮
-
-/**
- * 并行召回两次（历史消息 + 当前 prompt），去重合并结果
- * 节点按 name 去重，保留更高 tier 的节点
- * 边按 (from, to, name) 去重
- */
-async function parallelRecall(
-  recaller: Recaller,
-  historyQuery: string,
-  promptQuery: string,
-  options?: { deadlineAt?: number; signal?: AbortSignal },
-): Promise<{ nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }> {
-  const tierPriority = (tier: string): number => {
-    const p: Record<string, number> = { scope_hot: 6, hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
-    return p[tier] ?? 0;
-  };
-
-  const [historyRes, promptRes] = await Promise.all([
-    recaller.recallV2(historyQuery, options),
-    recaller.recallV2(promptQuery, options),
-  ]);
-
-  // ── 节点去重（按 name，保留更高 tier）──────────────────────
-  const nodesMap = new Map<string, TieredNode>();
-  for (const n of [...historyRes.nodes, ...promptRes.nodes]) {
-    const existing = nodesMap.get(n.name);
-    if (!existing || tierPriority(n.tier) > tierPriority(existing.tier)) {
-      nodesMap.set(n.name, n);
-    }
-  }
-
-  // ── 边去重（按 from+to+name）──────────────────────────────
-  const edgesSet = new Set<string>();
-  const mergedEdges: any[] = [];
-  for (const e of [...historyRes.edges, ...promptRes.edges]) {
-    const key = `${e.fromId}-${e.toId}-${e.name}`;
-    if (!edgesSet.has(key)) {
-      edgesSet.add(key);
-      mergedEdges.push(e);
-    }
-  }
-
-  // ── 合并 pprScores（取更高值）────────────────────────────
-  const pprScores: Record<string, number> = { ...historyRes.pprScores };
-  for (const [k, v] of Object.entries(promptRes.pprScores ?? {})) {
-    if (!pprScores[k] || v > pprScores[k]) pprScores[k] = v;
-  }
-
-  return { nodes: Array.from(nodesMap.values()), edges: mergedEdges, pprScores };
-}
 
 /**
  * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema

@@ -1,51 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import type { TieredNode } from "../src/recaller/recall.ts";
-
-// ── 引用 index.ts 中尚未 export 的 parallelRecall（临时方案：内联复制测试）─────────
-/** 临时复制的 parallelRecall（与 index.ts 同步修改，验证通过后替换） */
-async function parallelRecall(
-  recaller: any,
-  historyQuery: string,
-  promptQuery: string,
-): Promise<{ nodes: TieredNode[]; edges: any[]; pprScores: Record<string, number> }> {
-  const tierPriority = (tier: string): number => {
-    const p: Record<string, number> = { scope_hot: 6, hot: 5, active: 4, L1: 3, L2: 2, L3: 1, filtered: 0 };
-    return p[tier] ?? 0;
-  };
-
-  const [historyRes, promptRes] = await Promise.all([
-    recaller.recallV2(historyQuery),
-    recaller.recallV2(promptQuery),
-  ]);
-
-  // 节点去重（按 name，保留更高 tier）
-  const nodesMap = new Map<string, TieredNode>();
-  for (const n of [...historyRes.nodes, ...promptRes.nodes]) {
-    const existing = nodesMap.get(n.name);
-    if (!existing || tierPriority(n.tier) > tierPriority(existing.tier)) {
-      nodesMap.set(n.name, n);
-    }
-  }
-
-  // 边去重（按 from+to+name）
-  const edgesSet = new Set<string>();
-  const mergedEdges: any[] = [];
-  for (const e of [...historyRes.edges, ...promptRes.edges]) {
-    const key = `${e.from}-${e.to}-${e.name}`;
-    if (!edgesSet.has(key)) {
-      edgesSet.add(key);
-      mergedEdges.push(e);
-    }
-  }
-
-  // 合并 pprScores（取更高值）
-  const pprScores: Record<string, number> = { ...historyRes.pprScores };
-  for (const [k, v] of Object.entries(promptRes.pprScores ?? {})) {
-    if (!pprScores[k] || (v as number) > pprScores[k]) pprScores[k] = v as number;
-  }
-
-  return { nodes: Array.from(nodesMap.values()), edges: mergedEdges, pprScores };
-}
+import { parallelRecall } from "../src/recaller/parallel.ts";
 
 describe("parallelRecall 去重合并", () => {
   // ── Mock recaller ───────────────────────────────────────────────
