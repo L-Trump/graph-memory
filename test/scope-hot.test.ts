@@ -173,12 +173,6 @@ describe("assemble with scope_hot tier", () => {
     expect(xml).toContain('tier="scope_hot"');
   });
 
-  // Skipped: edge insertion triggers a migration edge case in test environment
-  // The core scope_hot node rendering is verified by tests above
-  it.skip("scope_hot edges are included in output", () => {
-    // This test verifies edge rendering but the migration system has edge cases
-    // in the test environment. Edge functionality is exercised in integration tests.
-  });
 
   // ── setNodeFlags 追加模式验证 ────────────────────────────────
   it("setNodeFlags appends hot without removing other flags", () => {

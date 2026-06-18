@@ -1,53 +1,41 @@
 /**
- * graph-memory — gm_dream 真实数据库隔离测试
- * 使用 /tmp/gm-test.db（真实数据库副本）进行测试
+ * graph-memory — gm_dream real DB smoke tests
+ *
+ * Gated by RUN_GM_REAL_DB_TESTS=1 because it expects a prepared copy at
+ * /tmp/gm-test.db. Standard `npm test` keeps this suite skipped.
  */
-import { describe, it } from "vitest";
+import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "@photostructure/sqlite";
 import { Recaller } from "../src/recaller/recall.ts";
 import { DEFAULT_CONFIG } from "../src/types.ts";
 import {
   getRecentlyRecalledNodes,
   getRecentlyCreatedNodes,
+  findById,
 } from "../src/store/store.ts";
 
+const TEST_DB = "/tmp/gm-test.db";
 const describeRealDb = process.env.RUN_GM_REAL_DB_TESTS === "1" ? describe : describe.skip;
 
-describeRealDb("gm_dream 真实数据库脚本测试", () => {
-  it("runs against /tmp/gm-test.db", async () => {
-// ─── 加载真实数据库副本 ─────────────────────────────────────────
-const TEST_DB_PATH = "/tmp/gm-test.db";
-const db = new DatabaseSync(`file:${TEST_DB_PATH}?mode=ro`, { readOnly: true });
-// 重新打开为读写以便某些操作（如 access_count 更新）
-const dbRw = new DatabaseSync(TEST_DB_PATH);
+type DreamNode = { id: string; name: string; type: string; description?: string; content?: string; tier?: string };
+type DreamEdge = { fromId: string; toId: string };
 
-console.log("=== gm_dream 隔离测试（真实数据库副本）===\n");
+function buildSubgraphResult(roots: DreamNode[], nodes: DreamNode[], edges: DreamEdge[]) {
+  const tieredNodes = nodes.filter(n => n.tier === "L1");
+  const nodeIds = new Set(tieredNodes.map(n => n.id));
+  const subgraphEdges = edges.filter(e => nodeIds.has(e.fromId) && nodeIds.has(e.toId));
 
-// ─── 1. 检查池状态 ──────────────────────────────────────────────
-console.log("【1. 记忆池状态】");
-const POOL_HOURS = 168; // 7天
-const POOL_SIZE = 50;
-
-const recalledPool = getRecentlyRecalledNodes(dbRw, POOL_HOURS, POOL_SIZE);
-const createdPool = getRecentlyCreatedNodes(dbRw, POOL_HOURS, POOL_SIZE);
-
-console.log(`  池A（最近召回，7天内）: ${recalledPool.length} 条记录`);
-console.log(`  池B（最近创建，7天内）: ${createdPool.length} 条记录`);
-
-// 去重
-const recalledDedup = new Map<string, typeof recalledPool[0]>();
-for (const r of recalledPool) {
-  if (!recalledDedup.has(r.nodeId)) recalledDedup.set(r.nodeId, r);
+  return {
+    seeds: roots.map(r => ({
+      id: r.id,
+      name: r.name,
+      type: r.type,
+      description: r.description ?? "",
+      content: (r.content ?? "").slice(0, 200),
+    })),
+    subgraphs: roots.map(root => ({ seed: root.name, nodes: tieredNodes, edges: subgraphEdges })),
+  };
 }
-const createdDedup = new Map<string, typeof createdPool[0]>();
-for (const c of createdPool) {
-  if (!createdDedup.has(c.id)) createdDedup.set(c.id, c);
-}
-console.log(`  池A去重后: ${recalledDedup.size} 个独立节点`);
-console.log(`  池B去重后: ${createdDedup.size} 个独立节点`);
-
-// ─── 2. 指数衰减采样测试 ────────────────────────────────────────
-console.log("\n【2. 指数衰减采样（lambda=0.33）】");
 
 function exponentialDecayPick<T extends Record<string, unknown>>(
   candidates: T[],
@@ -56,15 +44,15 @@ function exponentialDecayPick<T extends Record<string, unknown>>(
 ): T | null {
   if (!candidates.length) return null;
   const now = Date.now();
-  const MS_PER_DAY = 86_400_000;
-  const withWeights = candidates.map((c) => {
-    const t = Number(c[timeField]) ?? 0;
-    const days = Math.max(0, (now - t) / MS_PER_DAY);
+  const msPerDay = 86_400_000;
+  const withWeights = candidates.map(c => {
+    const t = Number(c[timeField]) || 0;
+    const days = Math.max(0, (now - t) / msPerDay);
     return { item: c, weight: Math.exp(-lambda * days) };
   });
-  const totalWeight = withWeights.reduce((s, w) => s + w.weight, 0);
-  if (totalWeight <= 0) return candidates[0];
-  let r = Math.random() * totalWeight;
+  const total = withWeights.reduce((sum, w) => sum + w.weight, 0);
+  if (total <= 0) return candidates[0];
+  let r = Math.random() * total;
   for (const { item, weight } of withWeights) {
     r -= weight;
     if (r <= 0) return item;
@@ -72,130 +60,84 @@ function exponentialDecayPick<T extends Record<string, unknown>>(
   return withWeights[withWeights.length - 1].item;
 }
 
-// 多次采样看分布
-const SAMPLES = 5;
-const recalledCandidates = Array.from(recalledDedup.values());
-const createdCandidates = Array.from(createdDedup.values());
-
-console.log(`\n  池A（召回池）采样 ${SAMPLES} 次：`);
-for (let i = 0; i < SAMPLES; i++) {
-  const picked = exponentialDecayPick(recalledCandidates, "recalledAt" as keyof (typeof recalledCandidates)[0], 0.33);
-  if (picked) {
-    const days = (Date.now() - Number(picked.recalledAt)) / 86_400_000;
-    console.log(`    选中: ${picked.nodeName} (${days.toFixed(1)} 天前)`);
-  }
-}
-
-console.log(`\n  池B（创建池）采样 ${SAMPLES} 次：`);
-for (let i = 0; i < SAMPLES; i++) {
-  const picked = exponentialDecayPick(createdCandidates, "createdAt" as keyof (typeof createdCandidates)[0], 0.33);
-  if (picked) {
-    const days = (Date.now() - Number(picked.createdAt)) / 86_400_000;
-    console.log(`    选中: ${picked.name} (${days.toFixed(1)} 天前)`);
-  }
-}
-
-// ─── 3. exploreSubgraph + tier 过滤测试 ─────────────────────────
-console.log("\n【3. exploreSubgraph + tier 过滤】");
-const recaller = new Recaller(dbRw, { ...DEFAULT_CONFIG, recallMaxNodes: 45 });
-
-// 用池A的候选节点测试
-if (recalledCandidates.length > 0) {
-  // 取最近的3个节点分别测试
-  const testNodes = recalledCandidates.slice(0, Math.min(3, recalledCandidates.length));
-  for (const candidate of testNodes) {
-    console.log(`\n  锚点: ${candidate.nodeName} (${candidate.nodeType})`);
-    const result = await recaller.exploreSubgraph(candidate.nodeName);
-
-    const l1 = result.nodes.filter((n: any) => n.tier === "L1").length;
-    const l2 = result.nodes.filter((n: any) => n.tier === "L2").length;
-    const l3 = result.nodes.filter((n: any) => n.tier === "L3").length;
-    const filtered = result.nodes.filter((n: any) => n.tier === "filtered").length;
-    console.log(`    召回节点: L1=${l1} L2=${l2} L3=${l3} filtered=${filtered} 总计=${result.nodes.length}`);
-    console.log(`    边数: ${result.edges.length}`);
-
-    if (result.nodes.length > 0) {
-      const sampleNode = result.nodes[0];
-      console.log(`    示例节点: ${sampleNode.name} [${sampleNode.type}] tier=${sampleNode.tier}`);
+describeRealDb("gm_dream real DB smoke", () => {
+  it("recent recalled and created pools have candidates", () => {
+    const db = new DatabaseSync(TEST_DB);
+    try {
+      const recalled = getRecentlyRecalledNodes(db, 168, 50);
+      const created = getRecentlyCreatedNodes(db, 168, 50);
+      expect(recalled.length).toBeGreaterThan(0);
+      expect(created.length).toBeGreaterThan(0);
+    } finally {
+      db.close();
     }
-  }
-} else {
-  console.log("  池A为空，跳过 exploreSubgraph 测试");
-}
-
-// ─── 4. buildSubgraphResult tier 过滤测试 ───────────────────────
-console.log("\n【4. buildSubgraphResult tier 过滤验证】");
-
-function buildSubgraphResult(
-  roots: any[],
-  nodes: any[],
-  edges: any[],
-): { seeds: any[]; subgraphs: any[] } {
-  // 只保留 L1/L2/L3 节点，排除 filtered
-  const tieredNodes = nodes.filter((n: any) => n.tier !== "filtered");
-  const nodeIds = new Set(tieredNodes.map((n: any) => n.id));
-  const filteredEdges = edges.filter(
-    (e: any) => nodeIds.has(e.fromId) && nodeIds.has(e.toId),
-  );
-
-  const subgraphs = roots.map((root: any) => {
-    const rootId = root.id;
-    const subgraphNodes = tieredNodes.filter(
-      (n: any) =>
-        n.id === rootId ||
-        filteredEdges.some(
-          (e: any) =>
-            (e.fromId === rootId && e.toId === n.id) ||
-            (e.toId === rootId && e.fromId === n.id),
-        ),
-    );
-    const subgraphNodeIds = new Set(subgraphNodes.map((n: any) => n.id));
-    const subgraphEdges = filteredEdges.filter(
-      (e: any) => subgraphNodeIds.has(e.fromId) && subgraphNodeIds.has(e.toId),
-    );
-    return { seed: root.name, nodes: subgraphNodes, edges: subgraphEdges };
   });
 
-  return {
-    seeds: roots.map((r: any) => ({
-      id: r.id,
-      name: r.name,
-      type: r.type,
-      description: r.description ?? "",
-      content: (r.content ?? "").slice(0, 200),
-    })),
-    subgraphs,
-  };
-}
+  it("exploreSubgraph can recall nodes for a known seed id", async () => {
+    const db = new DatabaseSync(TEST_DB);
+    try {
+      const recaller = new Recaller(db, { ...DEFAULT_CONFIG, recallMaxNodes: 45 });
+      const seedId = "n-1775085785709-xgcg9";
+      expect(findById(db, seedId)).not.toBeNull();
 
-if (recalledCandidates.length > 0) {
-  const seedName = recalledCandidates[0].nodeName;
-  const result = await recaller.exploreSubgraph(seedName);
-
-  if (result.nodes.length > 0) {
-    const { seeds, subgraphs } = buildSubgraphResult(result.roots, result.nodes, result.edges);
-
-    console.log(`  种子: ${seeds[0]?.name}`);
-    for (const sg of subgraphs) {
-      const l1 = sg.nodes.filter((n: any) => n.tier === "L1").length;
-      const l2 = sg.nodes.filter((n: any) => n.tier === "L2").length;
-      const l3 = sg.nodes.filter((n: any) => n.tier === "L3").length;
-      const filtered = sg.nodes.filter((n: any) => n.tier === "filtered").length;
-      console.log(`    子图节点: L1=${l1} L2=${l2} L3=${l3} filtered=${filtered} 总计=${sg.nodes.length}`);
-      console.log(`    子图边数: ${sg.edges.length}`);
-
-      // 验证：确认没有 filtered 节点
-      if (filtered > 0) {
-        console.log(`    ⚠️ 警告：仍有 ${filtered} 个 filtered 节点！`);
-      } else {
-        console.log(`    ✓ 验证通过：无 filtered 节点`);
-      }
+      const result = await recaller.exploreSubgraph(seedId);
+      expect(result.roots.length).toBeGreaterThan(0);
+      expect(result.nodes.length).toBeGreaterThan(0);
+    } finally {
+      db.close();
     }
-  }
-}
+  });
 
-console.log("\n=== 测试完成 ===");
-db.close();
-dbRw.close();
+  it("buildSubgraphResult filters to L1 nodes and internal edges", () => {
+    const roots = [{ id: "root", name: "root", type: "TASK", tier: "L1" }];
+    const nodes = [
+      { id: "a", name: "a", type: "TASK", tier: "L1" },
+      { id: "b", name: "b", type: "SKILL", tier: "L1" },
+      { id: "c", name: "c", type: "EVENT", tier: "filtered" },
+    ];
+    const edges = [
+      { fromId: "a", toId: "b" },
+      { fromId: "a", toId: "c" },
+    ];
+
+    const result = buildSubgraphResult(roots, nodes, edges);
+    expect(result.seeds.map(s => s.name)).toEqual(["root"]);
+    expect(result.subgraphs[0].nodes.map(n => n.id)).toEqual(["a", "b"]);
+    expect(result.subgraphs[0].edges).toEqual([{ fromId: "a", toId: "b" }]);
+  });
+
+  it("samples one recalled and one created anchor then explores both", async () => {
+    const db = new DatabaseSync(TEST_DB);
+    try {
+      const recaller = new Recaller(db, { ...DEFAULT_CONFIG, recallMaxNodes: 45 });
+      const recalledPool = getRecentlyRecalledNodes(db, 168, 50);
+      const createdPool = getRecentlyCreatedNodes(db, 168, 50);
+
+      const recalledDedup = new Map<string, typeof recalledPool[0]>();
+      for (const r of recalledPool) if (!recalledDedup.has(r.nodeId)) recalledDedup.set(r.nodeId, r);
+
+      const recalledPick = exponentialDecayPick(Array.from(recalledDedup.values()), "recalledAt");
+      const createdPick = exponentialDecayPick(createdPool, "createdAt");
+      expect(recalledPick).not.toBeNull();
+      expect(createdPick).not.toBeNull();
+
+      const rootsById = new Map<string, DreamNode>();
+      const nodes: DreamNode[] = [];
+      const edges: DreamEdge[] = [];
+      for (const id of [recalledPick!.nodeId, createdPick!.id]) {
+        const sub = await recaller.exploreSubgraph(id);
+        for (const root of sub.roots) rootsById.set(root.id, root);
+        nodes.push(...sub.nodes);
+        edges.push(...sub.edges);
+      }
+
+      const roots = Array.from(rootsById.values());
+      const result = buildSubgraphResult(roots, nodes, edges);
+      expect(result.seeds.length).toBeGreaterThan(0);
+      expect(result.seeds.length).toBeLessThanOrEqual(2);
+      expect(result.subgraphs.length).toBe(result.seeds.length);
+    } finally {
+      db.close();
+    }
   });
 });

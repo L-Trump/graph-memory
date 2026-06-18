@@ -1,8 +1,8 @@
-import { getDb } from "../src/store/db.ts";
-import { Recaller } from "../src/recaller/recall.ts";
-import { createEmbedFn } from "../src/engine/embed.ts";
-import { assembleDynamicContext } from "../src/format/assemble.ts";
-import { DEFAULT_CONFIG } from "../src/types.ts";
+import { getDb } from "../../src/store/db.ts";
+import { Recaller } from "../../src/recaller/recall.ts";
+import { createEmbedFn } from "../../src/engine/embed.ts";
+import { assembleDynamicContext } from "../../src/format/assemble.ts";
+import { DEFAULT_CONFIG } from "../../src/types.ts";
 import { readFileSync } from "fs";
 
 const cfg = JSON.parse(readFileSync("/home/ltrump/.openclaw/openclaw.json", "utf-8"));

@@ -2,7 +2,7 @@
  * test-advisory.ts — 记忆顾问机制测试
  *
  * 运行方式（从 graph-memory 目录）：
- *   npx tsx test/test-advisory.ts
+ *   npx tsx scripts/manual/test-advisory.ts
  *
  * 测试内容：
  * 1. parseExtract 对 advisorySuggestions 的解析（单元测试）
@@ -208,7 +208,7 @@ async function testExtractLLM() {
   }
 
   // 读取 extract.ts 的 EXTRACT_SYS
-  const extractSrc = readFileSync(join(__dirname, "../src/extractor/extract.ts"), "utf-8");
+  const extractSrc = readFileSync(join(__dirname, "../../src/extractor/extract.ts"), "utf-8");
   const promptMatch = extractSrc.match(/const EXTRACT_SYS = `([\s\S]*?)`;/);
   if (!promptMatch) { console.log("  ❌ 找不到 EXTRACT_SYS"); return { passed: 0, failed: 1, skipped: 0 }; }
   const systemPrompt = promptMatch[1];
@@ -316,7 +316,7 @@ async function testRunTurnExtract() {
   // 由于 graph-memory 依赖数据库，我们用更轻量的方式：
   // 直接调用 LLM extract，看输出是否包含 advisorySuggestions
 
-  const extractSrc = readFileSync(join(__dirname, "../src/extractor/extract.ts"), "utf-8");
+  const extractSrc = readFileSync(join(__dirname, "../../src/extractor/extract.ts"), "utf-8");
   const promptMatch = extractSrc.match(/const EXTRACT_SYS = `([\s\S]*?)`;/);
   const systemPrompt = promptMatch?.[1] ?? "";
 
