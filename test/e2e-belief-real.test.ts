@@ -27,6 +27,7 @@ import { buildExtractKnowledgeGraph } from "../src/format/assemble.ts";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { copySqliteDatabaseConsistently } from "./helpers.ts";
 
 // ─── Test DB ────────────────────────────────────────────────────
 
@@ -37,7 +38,7 @@ const PROD_DB = "/home/ltrump/.openclaw/graph-memory.db";
 beforeAll(() => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gm-e2e-"));
   testDbPath = path.join(tmp, "test.db");
-  fs.copyFileSync(PROD_DB, testDbPath);
+  copySqliteDatabaseConsistently(PROD_DB, testDbPath);
   testDb = new DatabaseSync(testDbPath);
 
   // 确保 belief + m13 migration schema 存在

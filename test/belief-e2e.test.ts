@@ -21,6 +21,7 @@ import { Recaller } from "../src/recaller/recall.ts";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { copySqliteDatabaseConsistently } from "./helpers.ts";
 
 const describeRealApi = process.env.RUN_GM_REAL_LLM_TESTS === "1" ? describe : describe.skip;
 
@@ -33,7 +34,7 @@ const PROD_DB_PATH = "/home/ltrump/.openclaw/graph-memory.db";
 beforeAll(() => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gm-test-"));
   testDbPath = path.join(tempDir, "graph-memory-test.db");
-  fs.copyFileSync(PROD_DB_PATH, testDbPath);
+  copySqliteDatabaseConsistently(PROD_DB_PATH, testDbPath);
 
   testDb = new DatabaseSync(testDbPath);
 

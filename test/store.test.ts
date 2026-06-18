@@ -7,7 +7,10 @@
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
-import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
+import { mkdtempSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+import { createTestDb, insertNode, insertEdge, copySqliteDatabaseConsistently } from "./helpers.ts";
 import {
   findByName, findById, upsertNode, upsertEdge, deprecate,
   mergeNodes, edgesFrom, edgesTo, allActiveNodes, allEdges,
@@ -350,6 +353,37 @@ describe("getStats", () => {
     expect(stats.byType["SKILL"]).toBe(1);
     expect(stats.byType["TASK"]).toBe(1);
     expect(stats.totalEdges).toBe(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// SQLite test copy helpers
+// ═══════════════════════════════════════════════════════════════
+
+describe("copySqliteDatabaseConsistently", () => {
+  it("copies a WAL-mode database as a readable standalone snapshot", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-wal-copy-test-"));
+    const srcPath = join(dir, "src.db");
+    const dstPath = join(dir, "dst.db");
+    const src = new DatabaseSync(srcPath);
+    try {
+      src.exec(`
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO items (value) VALUES ('from-wal');
+      `);
+      copySqliteDatabaseConsistently(srcPath, dstPath);
+    } finally {
+      src.close();
+    }
+
+    const dst = new DatabaseSync(dstPath);
+    try {
+      const row = dst.prepare("SELECT value FROM items WHERE id=1").get() as any;
+      expect(row.value).toBe("from-wal");
+    } finally {
+      dst.close();
+    }
   });
 });
 

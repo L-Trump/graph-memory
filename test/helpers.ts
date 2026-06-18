@@ -8,6 +8,44 @@
  */
 
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
+import { copyFileSync, existsSync, mkdirSync, rmSync } from "fs";
+import { dirname } from "path";
+
+
+function quoteSqlString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Copy an on-disk SQLite database into a consistent standalone snapshot.
+ *
+ * Runtime DBs may use WAL, so copying only the `.db` file can miss committed
+ * frames that still live in `-wal`. Prefer SQLite's `VACUUM INTO` snapshot; if
+ * that is unavailable for an environment, fall back to copying the db/wal/shm
+ * triplet together. This helper is intended for tests only.
+ */
+export function copySqliteDatabaseConsistently(srcPath: string, dstPath: string): void {
+  mkdirSync(dirname(dstPath), { recursive: true });
+  rmSync(dstPath, { force: true });
+  rmSync(`${dstPath}-wal`, { force: true });
+  rmSync(`${dstPath}-shm`, { force: true });
+
+  try {
+    const src = new DatabaseSync(srcPath);
+    try {
+      src.exec(`VACUUM INTO ${quoteSqlString(dstPath)}`);
+    } finally {
+      src.close();
+    }
+    return;
+  } catch {
+    copyFileSync(srcPath, dstPath);
+    for (const suffix of ["-wal", "-shm"]) {
+      const sidecar = `${srcPath}${suffix}`;
+      if (existsSync(sidecar)) copyFileSync(sidecar, `${dstPath}${suffix}`);
+    }
+  }
+}
 
 /**
  * 创建内存数据库 + 完整 migration
