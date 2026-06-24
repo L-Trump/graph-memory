@@ -105,10 +105,22 @@ export function allActiveNodes(db: DatabaseSyncInstance): GmNode[] {
   return (db.prepare("SELECT * FROM gm_nodes WHERE status='active'").all() as any[]).map(toNode);
 }
 
-/** 获取所有 hot 节点（非 deprecated 且 flags 包含 'hot'） */
+/** 获取所有 hot 节点（非 deprecated 且 flags JSON 数组包含完整的 'hot' flag） */
 export function getHotNodes(db: DatabaseSyncInstance): GmNode[] {
   return (db.prepare(
-    "SELECT * FROM gm_nodes WHERE status='active' AND flags LIKE '%\"hot\"%'"
+    `SELECT * FROM gm_nodes
+     WHERE status='active'
+       AND EXISTS (
+         SELECT 1
+         FROM json_each(
+           CASE
+             WHEN json_valid(gm_nodes.flags) THEN
+               CASE WHEN json_type(gm_nodes.flags) = 'array' THEN gm_nodes.flags ELSE '[]' END
+             ELSE '[]'
+           END
+         )
+         WHERE value = 'hot'
+       )`
   ).all() as any[]).map(toNode);
 }
 
@@ -609,7 +621,19 @@ export function getStats(db: DatabaseSyncInstance): {
     }
   }
   const hotNodes = (db.prepare(
-    "SELECT COUNT(*) as c FROM gm_nodes WHERE status='active' AND flags LIKE '%\"hot\"%'"
+    `SELECT COUNT(*) as c FROM gm_nodes
+     WHERE status='active'
+       AND EXISTS (
+         SELECT 1
+         FROM json_each(
+           CASE
+             WHEN json_valid(gm_nodes.flags) THEN
+               CASE WHEN json_type(gm_nodes.flags) = 'array' THEN gm_nodes.flags ELSE '[]' END
+             ELSE '[]'
+           END
+         )
+         WHERE value = 'hot'
+       )`
   ).get() as any).c;
   return { totalNodes, byType, totalEdges, byEdgeType, hotNodes };
 }
@@ -1001,16 +1025,27 @@ export function getScopesForSession(db: DatabaseSyncInstance, sessionId: string)
 
 /**
  * 获取拥有 scope_hot:xxx flag 的节点（匹配任一 given scopeNames）。
- * flags 存储为 JSON 数组 like `["hot", "scope_hot:gm开发"]`，
- * 所以匹配 `"scope_hot:xxx"` 这个完整的字符串即可。
+ * 使用 json_each 精确匹配 flags JSON 数组元素，避免 LIKE 误匹配并跳过 malformed JSON。
  */
 export function getScopeHotNodes(db: DatabaseSyncInstance, scopeNames: string[]): GmNode[] {
-  if (!scopeNames.length) return [];
-  const conditions = scopeNames.map(() => 'flags LIKE ?').join(' OR ');
-  const args = scopeNames.map(s => `%"scope_hot:${s}"%`);
+  const flags = scopeNames.map(s => `scope_hot:${s}`);
+  if (!flags.length) return [];
+  const placeholders = flags.map(() => "?").join(",");
   const rows = db.prepare(
-    `SELECT * FROM gm_nodes WHERE status='active' AND (${conditions})`
-  ).all(...args) as any[];
+    `SELECT * FROM gm_nodes
+     WHERE status='active'
+       AND EXISTS (
+         SELECT 1
+         FROM json_each(
+           CASE
+             WHEN json_valid(gm_nodes.flags) THEN
+               CASE WHEN json_type(gm_nodes.flags) = 'array' THEN gm_nodes.flags ELSE '[]' END
+             ELSE '[]'
+           END
+         )
+         WHERE value IN (${placeholders})
+       )`
+  ).all(...flags) as any[];
   return rows.map(toNode);
 }
 

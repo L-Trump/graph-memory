@@ -6,7 +6,7 @@ import { getDb, resetDb } from "../src/store/db.ts";
 import {
   upsertNode, setNodeFlags, upsertEdge, findByName,
   setScopesForSession, getScopesForSession, getScopeHotNodes, listScopes,
-  getEdgesForNodes,
+  getEdgesForNodes, getHotNodes, getStats,
 } from "../src/store/store.ts";
 import { assembleStableContext } from "../src/format/assemble.ts";
 import type { GmNode, GmEdge } from "../src/types.ts";
@@ -103,6 +103,51 @@ describe("scope_hot nodes", () => {
     const { node } = upsertNode(db, { type: "SKILL", name: "s-alone", description: "", content: "s" }, "s1");
     setNodeFlags(db, node.id, ["scope_hot:gm开发"]);
     expect(getScopeHotNodes(db, [])).toEqual([]);
+  });
+
+  it("uses exact JSON array flag matching, not LIKE substring matching", () => {
+    const { node: exact } = upsertNode(db, { type: "SKILL", name: "exact-scope", description: "", content: "" }, "s1");
+    const { node: suffix } = upsertNode(db, { type: "SKILL", name: "suffix-scope", description: "", content: "" }, "s1");
+    const { node: longer } = upsertNode(db, { type: "SKILL", name: "longer-scope", description: "", content: "" }, "s1");
+    setNodeFlags(db, exact.id, ["scope_hot:gm"]);
+    setNodeFlags(db, suffix.id, ["not_scope_hot:gm"]);
+    setNodeFlags(db, longer.id, ["scope_hot:gm开发"]);
+
+    expect(getScopeHotNodes(db, ["gm"]).map(n => n.name)).toEqual(["exact-scope"]);
+  });
+
+  it("skips malformed or non-array flags JSON instead of throwing", () => {
+    const { node: good } = upsertNode(db, { type: "SKILL", name: "good-json-flags", description: "", content: "" }, "s1");
+    const { node: bad } = upsertNode(db, { type: "SKILL", name: "bad-json-flags", description: "", content: "" }, "s1");
+    const { node: scalar } = upsertNode(db, { type: "SKILL", name: "scalar-json-flags", description: "", content: "" }, "s1");
+    const { node: object } = upsertNode(db, { type: "SKILL", name: "object-json-flags", description: "", content: "" }, "s1");
+    setNodeFlags(db, good.id, ["scope_hot:gm开发"]);
+    db.prepare("UPDATE gm_nodes SET flags=? WHERE id=?").run("not-json", bad.id);
+    db.prepare("UPDATE gm_nodes SET flags=? WHERE id=?").run('"scope_hot:gm开发"', scalar.id);
+    db.prepare("UPDATE gm_nodes SET flags=? WHERE id=?").run('{"flag":"scope_hot:gm开发"}', object.id);
+
+    expect(getScopeHotNodes(db, ["gm开发"]).map(n => n.name)).toEqual(["good-json-flags"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// 测试：hot flag 精确匹配
+// ─────────────────────────────────────────────────────────────────
+describe("hot nodes", () => {
+  it("getHotNodes and getStats use exact JSON array flag matching", () => {
+    const { node: hot } = upsertNode(db, { type: "KNOWLEDGE", name: "real-hot", description: "", content: "" }, "s1");
+    const { node: notHot } = upsertNode(db, { type: "KNOWLEDGE", name: "not-hot", description: "", content: "" }, "s1");
+    const { node: malformed } = upsertNode(db, { type: "KNOWLEDGE", name: "malformed-flags", description: "", content: "" }, "s1");
+    const { node: scalar } = upsertNode(db, { type: "KNOWLEDGE", name: "scalar-hot", description: "", content: "" }, "s1");
+    const { node: object } = upsertNode(db, { type: "KNOWLEDGE", name: "object-hot", description: "", content: "" }, "s1");
+    setNodeFlags(db, hot.id, ["hot"]);
+    setNodeFlags(db, notHot.id, ["not-hot"]);
+    db.prepare("UPDATE gm_nodes SET flags=? WHERE id=?").run("not-json", malformed.id);
+    db.prepare("UPDATE gm_nodes SET flags=? WHERE id=?").run('"hot"', scalar.id);
+    db.prepare("UPDATE gm_nodes SET flags=? WHERE id=?").run('{"flag":"hot"}', object.id);
+
+    expect(getHotNodes(db).map(n => n.name)).toEqual(["real-hot"]);
+    expect(getStats(db).hotNodes).toBe(1);
   });
 });
 
